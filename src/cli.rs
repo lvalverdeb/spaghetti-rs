@@ -172,6 +172,28 @@ pub fn run(args: Args) -> i32 {
         return 2;
     }
 
+    // A resolved-but-nonexistent path (e.g. a --package NAME=PATH typo, or a
+    // relative PATH resolved against the wrong cwd — the real case that
+    // surfaced this, in the Python original: `--package
+    // boti-dask=src/boti_dask` run from the workspace root instead of from
+    // inside boti-dask/) must not be confused with "scanned and found
+    // nothing wrong": scan_package() silently returns an empty ScanResult
+    // for a missing path (`!root.exists()`), which without this check
+    // reports a perfect A/100.0 grade — indistinguishable from a genuinely
+    // clean package that actually got scanned. Same fix as the Python port.
+    let missing: Vec<String> = selected
+        .iter()
+        .filter(|name| !registry[*name].exists())
+        .map(|name| format!("{name}={}", registry[name].display()))
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "error: package path(s) do not exist: {}",
+            missing.join(", ")
+        );
+        return 2;
+    }
+
     // Every package scanned concurrently — mirrors Python's
     // `review_packages_concurrently`, minus the `ProcessPoolExecutor`/
     // `boti.core.Agent` machinery that exists there only to get real
