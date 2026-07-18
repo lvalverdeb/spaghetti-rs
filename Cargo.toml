@@ -1,6 +1,6 @@
 [package]
 name = "spaghetti-detector-rs"
-version = "0.1.1"
+version = "1.0.3"
 edition = "2024"
 description = "Spaghetti-code and architectural-smell detector for Python projects (Rust port)"
 license = "MIT"
