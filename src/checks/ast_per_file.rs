@@ -1035,6 +1035,42 @@ pub fn check_excessive_decorators(
 
 // ── Rule: Lazy Class ──────────────────────────────────────────────────────────
 
+// Base class names (matched by their final Expr::Name/Expr::Attribute
+// component, not a resolved import) that already make a class a
+// declarative data container — flagging them as "lazy" and suggesting
+// "@dataclass" is nonsensical since they already fulfill that exact role.
+const LAZY_CLASS_EXEMPT_BASE_NAMES: &[&str] = &["BaseModel", "BaseSettings"];
+
+/// The name a decorator resolves to, e.g. "dataclass" for both `@dataclass`
+/// and `@dataclass(frozen=True)`.
+fn decorator_target_name(dec: &Expr) -> Option<String> {
+    let target = match dec {
+        Expr::Call(c) => c.func.as_ref(),
+        other => other,
+    };
+    match target {
+        Expr::Name(n) => Some(n.id.to_string()),
+        Expr::Attribute(a) => Some(a.attr.to_string()),
+        _ => None,
+    }
+}
+
+/// True if `node` already is a declarative data container: a pydantic
+/// BaseModel/BaseSettings subclass, or a @dataclass-decorated class. These
+/// already satisfy check_lazy_class's own suggested remedy, so they should
+/// never be flagged regardless of method count.
+fn is_lazy_class_exempt(node: &rustpython_ast::StmtClassDef) -> bool {
+    if base_names(&node.bases)
+        .iter()
+        .any(|b| LAZY_CLASS_EXEMPT_BASE_NAMES.contains(&b.as_str()))
+    {
+        return true;
+    }
+    node.decorator_list
+        .iter()
+        .any(|dec| decorator_target_name(dec).as_deref() == Some("dataclass"))
+}
+
 pub fn check_lazy_class(module: &Mod, source: &str, filepath: &Path, package: &str) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
 
@@ -1046,23 +1082,25 @@ pub fn check_lazy_class(module: &Mod, source: &str, filepath: &Path, package: &s
     }
     impl<'a> Visitor for LazyClassVisitor<'a> {
         fn visit_stmt_class_def(&mut self, node: rustpython_ast::StmtClassDef) {
-            let methods = node
-                .body
-                .iter()
-                .filter(|s| matches!(s, Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_)))
-                .count();
-            if methods < 2 {
-                self.issues.push(issue(
-                    self.filepath,
-                    self.line_index.line_number(node.range().start()),
-                    Severity::Info,
-                    "lazy-class",
-                    self.package,
-                    format!(
-                        "class '{}' has {methods} method(s) — consider a plain function or @dataclass",
-                        node.name
-                    ),
-                ));
+            if !is_lazy_class_exempt(&node) {
+                let methods = node
+                    .body
+                    .iter()
+                    .filter(|s| matches!(s, Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_)))
+                    .count();
+                if methods < 2 {
+                    self.issues.push(issue(
+                        self.filepath,
+                        self.line_index.line_number(node.range().start()),
+                        Severity::Info,
+                        "lazy-class",
+                        self.package,
+                        format!(
+                            "class '{}' has {methods} method(s) — consider a plain function or @dataclass",
+                            node.name
+                        ),
+                    ));
+                }
             }
             self.generic_visit_stmt_class_def(node);
         }
@@ -2189,6 +2227,79 @@ mod missing_else_tests {
         // hits — a 2+ statement if with no else/elif/terminator is flagged.
         let issues =
             issues_for("def f():\n    if x:\n        a = 1\n        b = 2\n    return a + b\n");
+        assert_eq!(issues.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod lazy_class_tests {
+    use super::check_lazy_class;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_lazy_class(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_zero_methods() {
+        let issues = issues_for("class C:\n    x = 1\n");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "lazy-class");
+        assert!(issues[0].message.contains("0 method"));
+    }
+
+    #[test]
+    fn flags_one_method() {
+        let issues = issues_for("class C:\n    def f(self):\n        pass\n");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("1 method"));
+    }
+
+    #[test]
+    fn allows_two_methods() {
+        let issues = issues_for(
+            "class C:\n    def f(self):\n        pass\n    def g(self):\n        pass\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_pydantic_base_model() {
+        let issues = issues_for("class C(BaseModel):\n    x: int = 1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_pydantic_base_model_qualified() {
+        let issues = issues_for("class C(pydantic.BaseModel):\n    x: int = 1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_pydantic_base_settings() {
+        let issues = issues_for("class C(BaseSettings):\n    x: int = 1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_dataclass_decorator() {
+        let issues = issues_for("@dataclass\nclass C:\n    x: int = 1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_dataclass_decorator_with_args() {
+        let issues = issues_for("@dataclass(frozen=True)\nclass C:\n    x: int = 1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_unrelated_base() {
+        // Sanity check: the pydantic/dataclass exemption must not swallow
+        // genuine hits — an unrelated base class doesn't grant an exemption.
+        let issues = issues_for("class C(SomeOtherBase):\n    x = 1\n");
         assert_eq!(issues.len(), 1);
     }
 }
