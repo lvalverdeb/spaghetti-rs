@@ -415,7 +415,14 @@ const NON_TRIVIAL_BODY_THRESHOLD: usize = 2;
 
 impl<'a> Visitor for MissingElseVisitor<'a> {
     fn visit_stmt_if(&mut self, node: rustpython_ast::StmtIf) {
-        if node.orelse.is_empty() && node.body.len() >= NON_TRIVIAL_BODY_THRESHOLD {
+        // Skipped when the if body's last statement already terminates
+        // control flow (return/raise/continue/break): the negative path is
+        // either "the rest of the function" or "the next loop iteration",
+        // and is not missing. Reuses is_unreachable_after from the
+        // dead-code rule, which defines the same set of terminators.
+        let is_terminated = node.body.last().is_some_and(is_unreachable_after);
+        if node.orelse.is_empty() && node.body.len() >= NON_TRIVIAL_BODY_THRESHOLD && !is_terminated
+        {
             self.issues.push(issue(
                 self.filepath,
                 self.line_index.line_number(node.range().start()),
@@ -2105,3 +2112,83 @@ pub const ALL_CHECKS: &[FileCheck] = &[
 pub type PkgRootCheck = fn(&Mod, &str, &Path, &str, &Path) -> Vec<Issue>;
 
 pub const PKG_ROOT_CHECKS: &[PkgRootCheck] = &[check_layer_violations, check_circular_imports];
+
+#[cfg(test)]
+mod missing_else_tests {
+    use super::check_missing_else;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_missing_else(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_nontrivial_if() {
+        let issues = issues_for("def f():\n    if x:\n        a = 1\n        b = 2\n");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "missing-else");
+    }
+
+    #[test]
+    fn allows_if_else() {
+        let issues = issues_for(
+            "def f():\n    if x:\n        a = 1\n        b = 2\n    else:\n        pass\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_single_statement_if() {
+        let issues = issues_for("def f():\n    if x:\n        a = 1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_if_elif() {
+        let issues = issues_for(
+            "def f():\n    if x:\n        a = 1\n        b = 2\n    elif y:\n        pass\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_guard_clause_return() {
+        let issues =
+            issues_for("def f():\n    if x:\n        a = 1\n        return\n    return a\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_guard_clause_raise() {
+        let issues =
+            issues_for("def f():\n    if x:\n        a = 1\n        raise ValueError(a)\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_loop_skip_continue() {
+        let issues = issues_for(
+            "def f():\n    for x in y:\n        if x in seen:\n            a = 1\n            continue\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_loop_skip_break() {
+        let issues = issues_for(
+            "def f():\n    for x in y:\n        if x is done:\n            a = 1\n            break\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_non_terminated_if() {
+        // Sanity check: the terminator narrowing must not swallow genuine
+        // hits — a 2+ statement if with no else/elif/terminator is flagged.
+        let issues =
+            issues_for("def f():\n    if x:\n        a = 1\n        b = 2\n    return a + b\n");
+        assert_eq!(issues.len(), 1);
+    }
+}
