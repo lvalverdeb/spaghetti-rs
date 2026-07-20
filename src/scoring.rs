@@ -93,6 +93,7 @@ fn fix_effort(rule: &str) -> f64 {
         "syntax-error" => 1.0,
         "dead-code" => 0.5,
         "magic-number" => 0.5,
+        "magic-string" => 0.5,
         "missing-else" => 0.5,
         "lazy-class" => 1.5,
         "deep-inheritance" => 3.0,

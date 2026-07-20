@@ -263,7 +263,13 @@ pub fn check_import_cycles_pkg(
                             Severity::Error,
                             "import-cycle",
                             pkg_name,
-                            format!("Circular import: {}", cycle.join(" \u{2192} ")),
+                            format!(
+                                "Circular import: {} — extract a shared abstraction (e.g. a \
+                                 typing.Protocol) both sides can depend on, and inject it \
+                                 instead of importing directly to break the cycle \
+                                 (Dependency Inversion Principle / Dependency Injection)",
+                                cycle.join(" \u{2192} ")
+                            ),
                         ));
                     }
                 }

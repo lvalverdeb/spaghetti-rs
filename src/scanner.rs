@@ -13,19 +13,12 @@
 
 use crate::checks::package_level::{self, ParsedFile};
 use crate::checks::{ast_per_file, text_per_file};
-use crate::models::{Issue, ScanResult, Severity};
+use crate::models::{Issue, ScanConfig, ScanResult, Severity};
 use crate::suppression::is_suppressed;
 use std::path::Path;
 use walkdir::WalkDir;
 
-pub fn scan_package(
-    package: &str,
-    root: &Path,
-    exclude: &[String],
-    min_duplicate_lines: usize,
-    twin_similarity: f64,
-    recursive: bool,
-) -> ScanResult {
+pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResult {
     let mut result = ScanResult::default();
     if !root.exists() {
         return result;
@@ -47,7 +40,7 @@ pub fn scan_package(
     // `scan_package(..., recursive=False)` in the Python port), so its own
     // directory's already-registered subdirectories aren't double-scanned.
     let walker = WalkDir::new(root).sort_by_file_name();
-    let walker = if recursive {
+    let walker = if config.recursive {
         walker
     } else {
         walker.max_depth(1)
@@ -61,7 +54,11 @@ pub fn scan_package(
         if path_str.contains("__pycache__") {
             continue;
         }
-        if exclude.iter().any(|pat| path_str.contains(pat.as_str())) {
+        if config
+            .exclude
+            .iter()
+            .any(|pat| path_str.contains(pat.as_str()))
+        {
             continue;
         }
 
@@ -111,12 +108,12 @@ pub fn scan_package(
     all_issues.extend(package_level::check_duplicate_functions_pkg(
         package,
         &parsed_files,
-        min_duplicate_lines,
+        config.min_duplicate_lines,
     ));
     all_issues.extend(package_level::check_sync_async_twins_pkg(
         package,
         &parsed_files,
-        twin_similarity,
+        config.twin_similarity,
     ));
 
     for mut issue in all_issues {
@@ -164,7 +161,13 @@ mod recursive_flag_tests {
         )
         .unwrap();
 
-        let result = scan_package("root", &root, &[], 5, 0.6, false);
+        let config = crate::models::ScanConfig {
+            exclude: vec![],
+            min_duplicate_lines: 5,
+            twin_similarity: 0.6,
+            recursive: false,
+        };
+        let result = scan_package("root", &root, &config);
 
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(result.files_scanned, 1);

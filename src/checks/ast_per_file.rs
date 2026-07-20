@@ -73,7 +73,8 @@ pub fn check_long_functions(
                 "long-function",
                 package,
                 format!(
-                    "{}() is {lines} lines (max {MAX_FUNCTION_LINES})",
+                    "{}() is {lines} lines (max {MAX_FUNCTION_LINES}) — extract logical \
+                     chunks into named helper functions (Extract Method)",
                     func.name
                 ),
             ));
@@ -197,7 +198,11 @@ pub fn check_excessive_params(
                 Severity::Warning,
                 "too-many-params",
                 package,
-                format!("{}() has {total} params (max {MAX_FUNC_PARAMS})", func.name),
+                format!(
+                    "{}() has {total} params (max {MAX_FUNC_PARAMS}) — consider a Parameter \
+                     Object (a dataclass or Pydantic model bundling the related fields) instead",
+                    func.name
+                ),
             ));
         }
     }
@@ -224,7 +229,8 @@ pub fn check_excessive_returns(
                 "excessive-returns",
                 package,
                 format!(
-                    "{}() has {n} return statements (max {MAX_RETURNS})",
+                    "{}() has {n} return statements (max {MAX_RETURNS}) — consider a Return \
+                     Object bundling the result and building it up to a single return",
                     func.name
                 ),
             ));
@@ -275,7 +281,9 @@ pub fn check_boolean_flag_params(
                 "boolean-flag-params",
                 package,
                 format!(
-                    "{}() has {} boolean flag params ({}) — combinations multiply branching",
+                    "{}() has {} boolean flag params ({}) — combinations multiply branching; \
+                     consider the Strategy pattern (inject the varying behavior as an object) \
+                     instead of flag-branching for it",
                     func.name,
                     flags.len(),
                     flags.join(", ")
@@ -306,7 +314,9 @@ pub fn check_deep_nesting(
                 "deep-nesting",
                 package,
                 format!(
-                    "{}() has nesting depth {depth} (max {MAX_NESTING_DEPTH})",
+                    "{}() has nesting depth {depth} (max {MAX_NESTING_DEPTH}) — use guard \
+                     clauses (invert the condition, exit early) to keep the happy path \
+                     unindented",
                     func.name
                 ),
             ));
@@ -786,7 +796,9 @@ pub fn check_global_mutations(
                         "global-mutable",
                         package,
                         format!(
-                            "Module-level mutable '{}' — consider encapsulating",
+                            "Module-level mutable '{}' — consider encapsulating it in a \
+                             class and injecting it where needed instead of reaching for \
+                             module-level global state (Dependency Injection)",
                             name.id
                         ),
                     ));
@@ -1206,7 +1218,10 @@ impl<'a> Visitor for MagicNumberVisitor<'a> {
                 Severity::Info,
                 "magic-number",
                 self.package,
-                format!("magic number {repr} — extract to a named constant"),
+                format!(
+                    "magic number {repr} — extract to a named constant, or an \
+                     enum.IntEnum if it's one of a fixed set of status/category codes"
+                ),
             ));
         }
     }
@@ -1234,6 +1249,110 @@ pub fn check_magic_numbers(
         issues.append(&mut visitor.issues);
     }
     issues
+}
+
+// ── Rule: Magic Strings ────────────────────────────────────────────────────────
+//
+// Mirrors Python's `check_magic_strings`: a whole-module (not per-function)
+// walk, since "scattered" comparisons of the same value across different
+// functions are exactly the signal this rule is after.
+
+// A string compared exactly once is an ordinary literal; it only looks like
+// an ad-hoc category/status code once the *same* value is compared in
+// multiple places, which is the actual "scattered, fragile equality check"
+// signal this rule is after.
+const MIN_MAGIC_STRING_OCCURRENCES: usize = 2;
+
+// Single characters ("_", "*", ".") are almost always punctuation/wildcard
+// tokens, never a category/status code — exclude them rather than flag
+// every AST-walking tool's inevitable comparisons against them.
+const MIN_MAGIC_STRING_LENGTH: usize = 2;
+
+fn string_operand(expr: &Expr) -> Option<&str> {
+    if let Expr::Constant(c) = expr
+        && let Constant::Str(s) = &c.value
+        && s.chars().count() >= MIN_MAGIC_STRING_LENGTH
+    {
+        Some(s.as_str())
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+struct MagicStringVisitor {
+    comparisons: Vec<(String, rustpython_ast::text_size::TextSize)>,
+}
+impl Visitor for MagicStringVisitor {
+    fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
+        walk_comprehension_children(self, node);
+    }
+    fn visit_arguments(&mut self, node: Arguments) {
+        walk_arguments_children(self, node);
+    }
+    fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
+        walk_keyword_children(self, node);
+    }
+    fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
+        walk_withitem_children(self, node);
+    }
+    fn visit_expr_compare(&mut self, node: rustpython_ast::ExprCompare) {
+        if node.ops.len() == 1
+            && matches!(
+                node.ops[0],
+                rustpython_ast::CmpOp::Eq | rustpython_ast::CmpOp::NotEq
+            )
+        {
+            let left = string_operand(&node.left);
+            let right = node.comparators.first().and_then(string_operand);
+            let pos = node.range().start();
+            match (left, right) {
+                (Some(v), None) => self.comparisons.push((v.to_string(), pos)),
+                (None, Some(v)) => self.comparisons.push((v.to_string(), pos)),
+                _ => {}
+            }
+        }
+        self.generic_visit_expr_compare(node);
+    }
+}
+
+pub fn check_magic_strings(
+    module: &Mod,
+    source: &str,
+    filepath: &Path,
+    package: &str,
+) -> Vec<Issue> {
+    let line_index = LineIndex::new(source);
+    let mut visitor = MagicStringVisitor::default();
+    for stmt in module_body(module) {
+        visitor.visit_stmt(stmt.clone());
+    }
+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for (value, _) in &visitor.comparisons {
+        *counts.entry(value.as_str()).or_insert(0) += 1;
+    }
+
+    visitor
+        .comparisons
+        .iter()
+        .filter(|(value, _)| counts[value.as_str()] >= MIN_MAGIC_STRING_OCCURRENCES)
+        .map(|(value, pos)| {
+            let count = counts[value.as_str()];
+            issue(
+                filepath,
+                line_index.line_number(*pos),
+                Severity::Info,
+                "magic-string",
+                package,
+                format!(
+                    "magic string '{value}' compared {count} times — consider a Value \
+                     Object that canonicalizes it once (e.g. a Pydantic model with a \
+                     @field_validator) instead of repeated string comparisons"
+                ),
+            )
+        })
+        .collect()
 }
 
 // ── Rule: Untyped Dict ────────────────────────────────────────────────────────
@@ -1355,7 +1474,10 @@ pub fn check_untyped_dicts(
                 Severity::Info,
                 "untyped-dict",
                 package,
-                "Bare 'dict' used in type hint — use dict[str, Any] or similar".to_string(),
+                "Bare 'dict' used in type hint — use dict[str, Any] or similar, a \
+                 dataclass/Pydantic model (a DTO) if the shape is fixed, or \
+                 typing.TypedDict if it must stay a plain dict at runtime"
+                    .to_string(),
             )
         })
         .collect()
@@ -1709,7 +1831,11 @@ pub fn check_layer_violations(
                     "layer-violation",
                     package,
                     format!(
-                        "Module '{rel_path_str}' imports '{imported}' — forbidden by layer rules"
+                        "Module '{rel_path_str}' imports '{imported}' — forbidden by layer \
+                         rules; depend on an abstraction (e.g. a typing.Protocol) the lower \
+                         layer implements, injected as a constructor/function parameter \
+                         instead of imported directly (Dependency Inversion Principle / \
+                         Dependency Injection)"
                     ),
                 ));
             }
@@ -1749,7 +1875,13 @@ pub fn check_transport_in_library(
                         Severity::Error,
                         "transport-in-library",
                         self.package,
-                        format!("Library imports transport module '{top}' — violates G9"),
+                        format!(
+                            "Library imports transport module '{top}' — violates G9; depend \
+                             on an abstraction (e.g. a typing.Protocol) instead of the \
+                             concrete transport, injected as a parameter rather than \
+                             imported directly (Dependency Inversion Principle / \
+                             Dependency Injection)"
+                        ),
                     ));
                 }
             }
@@ -1804,15 +1936,19 @@ pub fn check_circular_imports(
                     .iter())
             {
                 issues.push(issue(
-                        filepath,
-                        line_index.line_number(node.range().start()),
-                        Severity::Warning,
-                        "potential-circular-import",
-                        package,
-                        format!(
-                            "Child module imports parent '{module_name}' — potential circular dependency"
-                        ),
-                    ));
+                    filepath,
+                    line_index.line_number(node.range().start()),
+                    Severity::Warning,
+                    "potential-circular-import",
+                    package,
+                    format!(
+                        "Child module imports parent '{module_name}' — potential circular \
+                             dependency; extract a shared abstraction (e.g. a typing.Protocol) \
+                             both sides can depend on, and inject it instead of importing \
+                             directly to break the cycle (Dependency Inversion Principle / \
+                             Dependency Injection)"
+                    ),
+                ));
             }
         }
     }
@@ -1937,7 +2073,9 @@ pub fn check_deep_inheritance(
                 "deep-inheritance",
                 package,
                 format!(
-                    "class '{class_name}' has effective inheritance depth {total_depth} (max {MAX_INHERITANCE_DEPTH}) — use composition"
+                    "class '{class_name}' has effective inheritance depth {total_depth} (max \
+                     {MAX_INHERITANCE_DEPTH}) — use composition, e.g. the Strategy pattern, \
+                     instead of another inheritance level"
                 ),
             ));
         }
@@ -2211,6 +2349,7 @@ pub const ALL_CHECKS: &[FileCheck] = &[
     check_excessive_decorators,
     check_lazy_class,
     check_magic_numbers,
+    check_magic_strings,
     check_untyped_dicts,
     check_duplicate_branches,
     check_encapsulation_violations,
@@ -2305,6 +2444,77 @@ mod missing_else_tests {
         let issues =
             issues_for("def f():\n    if x:\n        a = 1\n        b = 2\n    return a + b\n");
         assert_eq!(issues.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod magic_string_tests {
+    use super::check_magic_strings;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_magic_strings(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_repeated_comparison() {
+        let issues = issues_for(
+            "def f(status):\n    if status == 'pending':\n        return 1\n\
+             def g(status):\n    if status == 'pending':\n        return 2\n",
+        );
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().all(|i| i.rule == "magic-string"));
+        assert!(issues.iter().all(|i| i.message.contains("'pending'")));
+        assert!(issues.iter().all(|i| i.message.contains("2 times")));
+    }
+
+    #[test]
+    fn allows_single_comparison() {
+        let issues = issues_for("def f(status):\n    if status == 'pending':\n        return 1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_empty_string() {
+        let issues = issues_for(
+            "def f(x):\n    if x == '':\n        return 1\n    if x == '':\n        return 2\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_literal_to_literal_comparison() {
+        let issues = issues_for(
+            "def f():\n    if 'a' == 'a':\n        pass\n    if 'a' == 'a':\n        pass\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_membership_checks() {
+        let issues = issues_for(
+            "def f(path):\n    if 'xx' in path:\n        pass\n    if 'xx' in path:\n        pass\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn flags_literal_on_left_side() {
+        let issues = issues_for(
+            "def f(status):\n    if 'pending' == status:\n        pass\n\
+             \n    if status == 'pending':\n        pass\n",
+        );
+        assert_eq!(issues.len(), 2);
+    }
+
+    #[test]
+    fn allows_single_char_string() {
+        let issues = issues_for(
+            "def f(x):\n    if x == '_':\n        pass\n    if x == '_':\n        pass\n",
+        );
+        assert!(issues.is_empty());
     }
 }
 

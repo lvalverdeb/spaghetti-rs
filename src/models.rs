@@ -45,6 +45,17 @@ pub fn display_path(path: &Path, workspace_root: Option<&Path>) -> String {
     path.display().to_string()
 }
 
+/// Parameter Object bundling `scan_package`'s tunable knobs — mirrors
+/// `models.py::ScanConfig`. Extracted so `scan_package`'s call sites share
+/// one shape instead of four separate values threaded through in parallel.
+#[derive(Debug, Clone)]
+pub struct ScanConfig {
+    pub exclude: Vec<String>,
+    pub min_duplicate_lines: usize,
+    pub twin_similarity: f64,
+    pub recursive: bool,
+}
+
 /// A single prioritized remediation action — mirrors `models.py`'s
 /// `RemediationStep`.
 #[derive(Debug, Clone)]

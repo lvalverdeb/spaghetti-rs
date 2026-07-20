@@ -4,7 +4,7 @@
 //! here since Rust has no GIL to work around, per the port proposal's §4.3).
 
 use crate::config;
-use crate::models::{Issue, ScanResult, display_path};
+use crate::models::{Issue, ScanConfig, ScanResult, Severity, display_path};
 use crate::scanner::scan_package;
 use clap::Parser;
 use rayon::prelude::*;
@@ -323,14 +323,13 @@ pub fn run(args: Args) -> i32 {
         .par_iter()
         .map(|name| {
             let root = &registry[name];
-            let result = scan_package(
-                name,
-                root,
-                &run_exclude,
-                args.min_duplicate_lines,
-                args.twin_similarity,
-                !non_recursive.contains(name),
-            );
+            let config = ScanConfig {
+                exclude: run_exclude.clone(),
+                min_duplicate_lines: args.min_duplicate_lines,
+                twin_similarity: args.twin_similarity,
+                recursive: !non_recursive.contains(name),
+            };
+            let result = scan_package(name, root, &config);
             (name.clone(), result)
         })
         .collect();
@@ -386,17 +385,31 @@ pub fn run(args: Args) -> i32 {
         render_text_report(&filtered, &total, workspace_root.as_deref());
     }
 
-    if total.issues.iter().any(|i| i.severity.as_str() == "error") {
+    if total.issues.iter().any(|i| i.severity == Severity::Error) {
         2
-    } else if total
-        .issues
-        .iter()
-        .any(|i| i.severity.as_str() == "warning")
-    {
+    } else if total.issues.iter().any(|i| i.severity == Severity::Warning) {
         1
     } else {
         0
     }
+}
+
+/// (errors, warnings, infos) — the report renders this same tally for
+/// several different issue slices.
+fn severity_counts(issues: &[&Issue]) -> (usize, usize, usize) {
+    let errors = issues
+        .iter()
+        .filter(|i| i.severity == Severity::Error)
+        .count();
+    let warnings = issues
+        .iter()
+        .filter(|i| i.severity == Severity::Warning)
+        .count();
+    let infos = issues
+        .iter()
+        .filter(|i| i.severity == Severity::Info)
+        .count();
+    (errors, warnings, infos)
 }
 
 fn render_text_report(filtered: &[&Issue], total: &ScanResult, workspace_root: Option<&Path>) {
@@ -408,27 +421,10 @@ fn render_text_report(filtered: &[&Issue], total: &ScanResult, workspace_root: O
     println!("  Lines scanned:     {}", total.total_lines);
     println!("  Functions scanned: {}", total.functions_scanned);
     println!("  Total issues:      {}", filtered.len());
-    println!(
-        "    Errors:          {}",
-        filtered
-            .iter()
-            .filter(|i| i.severity.as_str() == "error")
-            .count()
-    );
-    println!(
-        "    Warnings:        {}",
-        filtered
-            .iter()
-            .filter(|i| i.severity.as_str() == "warning")
-            .count()
-    );
-    println!(
-        "    Info:            {}",
-        filtered
-            .iter()
-            .filter(|i| i.severity.as_str() == "info")
-            .count()
-    );
+    let (errors, warnings, infos) = severity_counts(filtered);
+    println!("    Errors:          {errors}");
+    println!("    Warnings:        {warnings}");
+    println!("    Info:            {infos}");
     if total.suppressed > 0 {
         println!(
             "  Suppressed:        {} (inline spaghetti-ignore markers)",
@@ -453,10 +449,10 @@ fn render_text_report(filtered: &[&Issue], total: &ScanResult, workspace_root: O
                 .then(a.line.cmp(&b.line))
         });
         for issue in sorted_ignored {
-            let icon = match issue.severity.as_str() {
-                "error" => "✖",
-                "warning" => "⚠",
-                _ => "ℹ",
+            let icon = match issue.severity {
+                Severity::Error => "✖",
+                Severity::Warning => "⚠",
+                Severity::Info => "ℹ",
             };
             let reason = issue.reason.as_deref().unwrap_or("no reason given");
             println!(
