@@ -1039,7 +1039,7 @@ pub fn check_excessive_decorators(
 // component, not a resolved import) that already make a class a
 // declarative data container — flagging them as "lazy" and suggesting
 // "@dataclass" is nonsensical since they already fulfill that exact role.
-const LAZY_CLASS_EXEMPT_BASE_NAMES: &[&str] = &["BaseModel", "BaseSettings"];
+const LAZY_CLASS_EXEMPT_BASE_NAMES: &[&str] = &["BaseModel", "BaseSettings", "NamedTuple"];
 
 /// The name a decorator resolves to, e.g. "dataclass" for both `@dataclass`
 /// and `@dataclass(frozen=True)`.
@@ -2280,6 +2280,18 @@ mod lazy_class_tests {
     #[test]
     fn allows_pydantic_base_settings() {
         let issues = issues_for("class C(BaseSettings):\n    x: int = 1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_named_tuple() {
+        let issues = issues_for("class C(NamedTuple):\n    x: int\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_named_tuple_qualified() {
+        let issues = issues_for("class C(typing.NamedTuple):\n    x: int\n");
         assert!(issues.is_empty());
     }
 
