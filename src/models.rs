@@ -29,6 +29,9 @@ pub struct Issue {
     pub rule: &'static str,
     pub message: String,
     pub package: String,
+    /// Human-supplied justification from a `# spaghetti-ignore: ...` marker.
+    /// Only ever set on issues that ended up in `ScanResult::ignored`.
+    pub reason: Option<String>,
 }
 
 /// Workspace-relative path when possible, absolute otherwise — mirrors
@@ -63,6 +66,11 @@ pub struct ScanResult {
     pub functions_scanned: usize,
     pub total_lines: usize,
     pub suppressed: usize,
+    /// Issues suppressed by an inline `# spaghetti-ignore` marker, kept (rather
+    /// than discarded) so callers can audit *why* something was waived — each
+    /// entry's `reason` is the text after the marker's `:`, or `None` if the
+    /// marker didn't give one.
+    pub ignored: Vec<Issue>,
 }
 
 impl ScanResult {
@@ -93,5 +101,6 @@ impl ScanResult {
         self.functions_scanned += other.functions_scanned;
         self.total_lines += other.total_lines;
         self.suppressed += other.suppressed;
+        self.ignored.extend(other.ignored);
     }
 }

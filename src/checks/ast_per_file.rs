@@ -18,9 +18,9 @@ use crate::ast_helpers::{
     walk_keyword_children, walk_withitem_children,
 };
 use crate::config::{
-    COMPLEXITY_THRESHOLD, MAX_CLASS_ATTRS, MAX_CLASS_METHODS, MAX_DECORATORS, MAX_FUNC_PARAMS,
-    MAX_FUNCTION_LINES, MAX_INHERITANCE_DEPTH, MAX_NESTING_DEPTH, MAX_RETURNS, MIN_BOOLEAN_FLAGS,
-    is_dunder, layer_rules,
+    COMPLEXITY_THRESHOLD, ERROR_ESCALATION_MULTIPLIER, MAX_CLASS_ATTRS, MAX_CLASS_METHODS,
+    MAX_DECORATORS, MAX_FUNC_PARAMS, MAX_FUNCTION_LINES, MAX_INHERITANCE_DEPTH, MAX_NESTING_DEPTH,
+    MAX_PUBLIC_SYMBOLS, MAX_RETURNS, MIN_BOOLEAN_FLAGS, MIN_CLASS_METHODS, is_dunder, layer_rules,
 };
 use crate::models::{Issue, Severity};
 use rustpython_ast::{Arguments, Constant, Expr, Mod, Ranged, Stmt, Visitor};
@@ -49,6 +49,7 @@ fn issue(
         rule,
         message,
         package: package.to_string(),
+        reason: None,
     }
 }
 
@@ -94,7 +95,8 @@ pub fn check_complexity(module: &Mod, source: &str, filepath: &Path, package: &s
     for func in collect_functions(module_body(module)) {
         let cc = cyclomatic_complexity(&func);
         if cc > COMPLEXITY_THRESHOLD as i64 {
-            let severity = if cc > 15 {
+            let severity = if cc as f64 > COMPLEXITY_THRESHOLD as f64 * ERROR_ESCALATION_MULTIPLIER
+            {
                 Severity::Error
             } else {
                 Severity::Warning
@@ -413,6 +415,21 @@ struct MissingElseVisitor<'a> {
 
 const NON_TRIVIAL_BODY_THRESHOLD: usize = 2;
 
+/// True when *stmt* — as an if-body's last statement — means the if only
+/// *guards entry* into a final step (a nested bare if, a discarded-return
+/// call, or a loop) rather than encoding two real branches of logic. The
+/// "negative path" in that shape is just "skip this node", which is
+/// already what happens without an else — mirrors
+/// `check_missing_else`'s Python docstring.
+fn is_guard_delegation_tail(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::If(inner) => inner.orelse.is_empty(),
+        Stmt::Expr(e) => matches!(e.value.as_ref(), Expr::Call(_)),
+        Stmt::For(_) | Stmt::AsyncFor(_) | Stmt::While(_) => true,
+        _ => false,
+    }
+}
+
 impl<'a> Visitor for MissingElseVisitor<'a> {
     fn visit_stmt_if(&mut self, node: rustpython_ast::StmtIf) {
         // Skipped when the if body's last statement already terminates
@@ -421,7 +438,11 @@ impl<'a> Visitor for MissingElseVisitor<'a> {
         // and is not missing. Reuses is_unreachable_after from the
         // dead-code rule, which defines the same set of terminators.
         let is_terminated = node.body.last().is_some_and(is_unreachable_after);
-        if node.orelse.is_empty() && node.body.len() >= NON_TRIVIAL_BODY_THRESHOLD && !is_terminated
+        let is_guard_delegation = node.body.last().is_some_and(is_guard_delegation_tail);
+        if node.orelse.is_empty()
+            && node.body.len() >= NON_TRIVIAL_BODY_THRESHOLD
+            && !is_terminated
+            && !is_guard_delegation
         {
             self.issues.push(issue(
                 self.filepath,
@@ -460,20 +481,12 @@ pub fn check_missing_else(
 
 // ── Rule: Unused Imports ─────────────────────────────────────────────────────
 
-pub fn check_unused_imports(
-    module: &Mod,
-    source: &str,
-    filepath: &Path,
-    package: &str,
-) -> Vec<Issue> {
-    if filepath.file_name().and_then(|n| n.to_str()) == Some("__init__.py") {
-        return Vec::new();
-    }
-    let line_index = LineIndex::new(source);
-
-    // Mirrors Python's `imported[name] = node.lineno`: a plain dict
-    // assignment, so if the same name is imported twice, the *last*
-    // occurrence's position wins, not the first.
+/// Every name an `import`/`from ... import` statement binds, mapped to its
+/// position — mirrors Python's `imported[name] = node.lineno`: a plain dict
+/// assignment, so if the same name is imported twice, the *last* occurrence's
+/// position wins, not the first. `*` and `__future__` imports bind no real
+/// name; `_` is the conventional "I don't care about this" sink.
+fn collect_imported_names(module: &Mod) -> HashMap<String, rustpython_ast::text_size::TextSize> {
     struct ImportCollector {
         imported: HashMap<String, rustpython_ast::text_size::TextSize>,
     }
@@ -518,10 +531,12 @@ pub fn check_unused_imports(
     for stmt in module_body(module) {
         collector.visit_stmt(stmt.clone());
     }
-    if collector.imported.is_empty() {
-        return Vec::new();
-    }
+    collector.imported
+}
 
+/// Every name referenced by the module — either directly, or listed in an
+/// `__all__ = [...]` re-export declaration.
+fn collect_used_names(module: &Mod) -> HashSet<String> {
     struct UsageCollector {
         used: HashSet<String>,
     }
@@ -571,14 +586,33 @@ pub fn check_unused_imports(
     for stmt in module_body(module) {
         usage.visit_stmt(stmt.clone());
     }
+    usage.used
+}
 
+pub fn check_unused_imports(
+    module: &Mod,
+    source: &str,
+    filepath: &Path,
+    package: &str,
+) -> Vec<Issue> {
+    if filepath.file_name().and_then(|n| n.to_str()) == Some("__init__.py") {
+        return Vec::new();
+    }
+
+    let imported = collect_imported_names(module);
+    if imported.is_empty() {
+        return Vec::new();
+    }
+    let used = collect_used_names(module);
+
+    let line_index = LineIndex::new(source);
     let mut entries: Vec<(&String, &rustpython_ast::text_size::TextSize)> =
-        collector.imported.iter().collect();
+        imported.iter().collect();
     entries.sort_by_key(|(_, pos)| **pos);
 
     entries
         .into_iter()
-        .filter(|(name, _)| !usage.used.contains(*name))
+        .filter(|(name, _)| !used.contains(*name))
         .map(|(name, pos)| {
             issue(
                 filepath,
@@ -1088,7 +1122,7 @@ pub fn check_lazy_class(module: &Mod, source: &str, filepath: &Path, package: &s
                     .iter()
                     .filter(|s| matches!(s, Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_)))
                     .count();
-                if methods < 2 {
+                if methods < MIN_CLASS_METHODS {
                     self.issues.push(issue(
                         self.filepath,
                         self.line_index.line_number(node.range().start()),
@@ -1392,6 +1426,57 @@ fn is_allowed_base(base: &Expr, current_class: Option<&str>) -> bool {
     }
 }
 
+fn is_private_name(name: &str) -> bool {
+    name.starts_with('_') && !is_dunder(name)
+}
+
+// getattr(obj, name)/setattr(obj, name, value)/hasattr(obj, name) all take
+// the attribute-name argument in position 1 — reflective access can't be
+// checked without at least that many positional args.
+const MIN_REFLECTIVE_ACCESS_ARGS: usize = 2;
+
+/// The private attribute name reached via `obj._attr`, or None.
+fn direct_private_access<'a>(
+    node: &'a rustpython_ast::ExprAttribute,
+    current_class: Option<&str>,
+) -> Option<&'a str> {
+    if !matches!(node.ctx, rustpython_ast::ExprContext::Load) {
+        return None;
+    }
+    let attr = node.attr.as_str();
+    if !is_private_name(attr) || is_allowed_base(&node.value, current_class) {
+        return None;
+    }
+    Some(attr)
+}
+
+/// The `(func_name, attr_name)` reached via `getattr(obj, "_attr")` (or
+/// `setattr`/`hasattr`), or None.
+fn reflective_private_access<'a>(
+    node: &'a rustpython_ast::ExprCall,
+    current_class: Option<&str>,
+) -> Option<(&'a str, &'a str)> {
+    let Expr::Name(func_name) = node.func.as_ref() else {
+        return None;
+    };
+    let fname = func_name.id.as_str();
+    if !matches!(fname, "getattr" | "setattr" | "hasattr")
+        || node.args.len() < MIN_REFLECTIVE_ACCESS_ARGS
+    {
+        return None;
+    }
+    let Expr::Constant(c) = &node.args[1] else {
+        return None;
+    };
+    let Constant::Str(attr_name) = &c.value else {
+        return None;
+    };
+    if !is_private_name(attr_name) || is_allowed_base(&node.args[0], current_class) {
+        return None;
+    }
+    Some((fname, attr_name.as_str()))
+}
+
 struct EncapsulationVisitor<'a> {
     line_index: &'a LineIndex,
     filepath: &'a Path,
@@ -1411,12 +1496,7 @@ impl<'a> Visitor for EncapsulationVisitor<'a> {
         self.class_stack.pop();
     }
     fn visit_expr_attribute(&mut self, node: rustpython_ast::ExprAttribute) {
-        let attr = node.attr.as_str();
-        if matches!(node.ctx, rustpython_ast::ExprContext::Load)
-            && attr.starts_with('_')
-            && !is_dunder(attr)
-            && !is_allowed_base(&node.value, self.current_class())
-        {
+        if let Some(attr) = direct_private_access(&node, self.current_class()) {
             self.issues.push(issue(
                 self.filepath,
                 self.line_index.line_number(node.range().start()),
@@ -1429,25 +1509,15 @@ impl<'a> Visitor for EncapsulationVisitor<'a> {
         self.generic_visit_expr_attribute(node);
     }
     fn visit_expr_call(&mut self, node: rustpython_ast::ExprCall) {
-        if let Expr::Name(func_name) = node.func.as_ref() {
-            let fname = func_name.id.as_str();
-            if (fname == "getattr" || fname == "setattr" || fname == "hasattr")
-                && node.args.len() >= 2
-                && let Expr::Constant(c) = &node.args[1]
-                && let Constant::Str(attr_name) = &c.value
-                && attr_name.starts_with('_')
-                && !is_dunder(attr_name)
-                && !is_allowed_base(&node.args[0], self.current_class())
-            {
-                self.issues.push(issue(
-                    self.filepath,
-                    self.line_index.line_number(node.range().start()),
-                    Severity::Info,
-                    "encapsulation-violation",
-                    self.package,
-                    format!("{fname}(..., '{attr_name}', ...) reaches into a private attribute"),
-                ));
-            }
+        if let Some((fname, attr_name)) = reflective_private_access(&node, self.current_class()) {
+            self.issues.push(issue(
+                self.filepath,
+                self.line_index.line_number(node.range().start()),
+                Severity::Info,
+                "encapsulation-violation",
+                self.package,
+                format!("{fname}(..., '{attr_name}', ...) reaches into a private attribute"),
+            ));
         }
         self.generic_visit_expr_call(node);
     }
@@ -1534,8 +1604,10 @@ impl<'a> Visitor for GodClassVisitor<'a> {
         }
 
         if methods.len() > MAX_CLASS_METHODS || attr_visitor.attrs.len() > MAX_CLASS_ATTRS {
-            let severity = if methods.len() as f64 > MAX_CLASS_METHODS as f64 * 1.5
-                || attr_visitor.attrs.len() as f64 > MAX_CLASS_ATTRS as f64 * 1.5
+            let severity = if methods.len() as f64
+                > MAX_CLASS_METHODS as f64 * ERROR_ESCALATION_MULTIPLIER
+                || attr_visitor.attrs.len() as f64
+                    > MAX_CLASS_ATTRS as f64 * ERROR_ESCALATION_MULTIPLIER
             {
                 Severity::Error
             } else {
@@ -1764,7 +1836,7 @@ pub fn check_god_module(module: &Mod, _source: &str, filepath: &Path, package: &
         }
     }
     let total = public_classes + public_funcs;
-    if total > 15 {
+    if total > MAX_PUBLIC_SYMBOLS {
         vec![issue(
             filepath,
             1,
@@ -1833,6 +1905,13 @@ pub fn check_deep_inheritance(
     let mut all_classes_full = Vec::new();
     collect_all_classes(module_body(module), &mut all_classes_full);
 
+    // Indexed once so the BFS below does O(1) name lookups instead of
+    // re-scanning every class in the module for each ancestor it discovers.
+    let mut classes_by_name: HashMap<&str, Vec<&[Expr]>> = HashMap::new();
+    for (class_name, bases, _) in &all_classes_full {
+        classes_by_name.entry(class_name).or_default().push(bases);
+    }
+
     let mut issues = Vec::new();
     for (class_name, bases, start) in &all_classes_full {
         if bases.is_empty() {
@@ -1845,10 +1924,8 @@ pub fn check_deep_inheritance(
                 continue;
             }
             seen.insert(name.clone());
-            for (other_name, other_bases, _) in &all_classes_full {
-                if *other_name == name {
-                    queue.extend(base_names(other_bases));
-                }
+            for other_bases in classes_by_name.get(name.as_str()).into_iter().flatten() {
+                queue.extend(base_names(other_bases));
             }
         }
         let total_depth = seen.len();

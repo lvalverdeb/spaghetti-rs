@@ -6,7 +6,7 @@ use crate::ast_helpers::{
     FuncNode, LineIndex, collect_functions, collect_functions_with_class_context, dump_stmts,
     is_trivial_body, line_count,
 };
-use crate::config::allowed_import_prefix;
+use crate::config::{MIN_TWIN_FUNCTION_LINES, allowed_import_prefix};
 use crate::models::{Issue, Severity, display_path};
 use crate::similarity::sequence_matcher_ratio;
 use crate::unparse::unparse_function;
@@ -44,6 +44,7 @@ fn issue(
         rule,
         message,
         package: package.to_string(),
+        reason: None,
     }
 }
 
@@ -280,6 +281,9 @@ pub fn check_import_cycles_pkg(
 
 // ── Duplicate Function Bodies (whole-package) ────────────────────────────────
 
+// A body needs at least this many occurrences to be a "duplicate" at all.
+const MIN_DUPLICATE_OCCURRENCES: usize = 2;
+
 pub fn check_duplicate_functions_pkg(
     pkg_name: &str,
     files: &[ParsedFile],
@@ -305,7 +309,7 @@ pub fn check_duplicate_functions_pkg(
 
     let mut issues = Vec::new();
     for (_key, mut occurrences) in groups {
-        if occurrences.len() < 2 {
+        if occurrences.len() < MIN_DUPLICATE_OCCURRENCES {
             continue;
         }
         occurrences.sort_by(|a, b| (a.0.to_string_lossy(), a.2).cmp(&(b.0.to_string_lossy(), b.2)));
@@ -422,7 +426,7 @@ pub fn check_sync_async_twins_pkg(
         let line_index = &line_indices[filepath];
         for (name, func) in by_name {
             let lines = line_count(line_index, func.start, func.end());
-            if lines < 4 {
+            if lines < MIN_TWIN_FUNCTION_LINES {
                 continue;
             }
             for candidate in twin_candidates(name) {

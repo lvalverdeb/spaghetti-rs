@@ -1,8 +1,28 @@
 //! Health scoring and remediation planning — mirrors `scoring.py`.
 
+use crate::config::{BANNER_WIDTH, LINES_PER_KLOC};
 use crate::models::{Issue, RemediationStep, ScanResult, Severity, display_path};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
+
+const MAX_SCORE: f64 = 100.0;
+
+// Module-level (not inside plan_report) so the column widths are computed
+// once rather than re-literalized every render — mirrors
+// `scoring.py::_PLAN_TABLE_DIVIDER`.
+static PLAN_TABLE_DIVIDER: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "  {} {} {} {} {} {}  {}",
+        "─".repeat(3),
+        "─".repeat(4),
+        "─".repeat(30),
+        "─".repeat(4),
+        "─".repeat(9),
+        "─".repeat(6),
+        "─".repeat(5)
+    )
+});
 
 fn severity_weight(s: Severity) -> f64 {
     match s {
@@ -16,15 +36,15 @@ fn severity_weight(s: Severity) -> f64 {
 /// 1,000 lines so larger packages aren't unfairly penalized.
 pub fn compute_score(result: &ScanResult) -> (f64, &'static str) {
     if result.total_lines == 0 {
-        return (100.0, "A");
+        return (MAX_SCORE, "A");
     }
     let penalty: f64 = result
         .issues
         .iter()
         .map(|i| severity_weight(i.severity))
         .sum();
-    let penalty_per_kloc = penalty / (result.total_lines as f64 / 1000.0);
-    let score = (100.0 - penalty_per_kloc).max(0.0);
+    let penalty_per_kloc = penalty / (result.total_lines as f64 / LINES_PER_KLOC);
+    let score = (MAX_SCORE - penalty_per_kloc).max(0.0);
     let grade = if score >= 90.0 {
         "A"
     } else if score >= 75.0 {
@@ -168,9 +188,9 @@ pub fn plan_report(issues: &[&Issue], top: usize, workspace_root: Option<&Path>)
     let mut out = String::new();
     use std::fmt::Write as _;
 
-    let _ = writeln!(out, "{}", "=".repeat(72));
+    let _ = writeln!(out, "{}", "=".repeat(BANNER_WIDTH));
     let _ = writeln!(out, "  REMEDIATION PLAN — Prioritized Fix Order");
-    let _ = writeln!(out, "{}", "=".repeat(72));
+    let _ = writeln!(out, "{}", "=".repeat(BANNER_WIDTH));
     let _ = writeln!(out);
 
     if steps.is_empty() {
@@ -196,17 +216,7 @@ pub fn plan_report(issues: &[&Issue], top: usize, workspace_root: Option<&Path>)
         "  {:<3} {:<4} {:<30} {:<4} {:<9} {:>6}  {:>5}",
         "#", "Pri", "Rule", "Sev", "Effort", "Issues", "Score"
     );
-    let _ = writeln!(
-        out,
-        "  {} {} {} {} {} {}  {}",
-        "─".repeat(3),
-        "─".repeat(4),
-        "─".repeat(30),
-        "─".repeat(4),
-        "─".repeat(9),
-        "─".repeat(6),
-        "─".repeat(5)
-    );
+    let _ = writeln!(out, "{}", *PLAN_TABLE_DIVIDER);
 
     let shown = &steps[..steps.len().min(top)];
     for (idx, step) in shown.iter().enumerate() {
@@ -246,9 +256,9 @@ pub fn plan_report(issues: &[&Issue], top: usize, workspace_root: Option<&Path>)
     }
 
     let _ = writeln!(out);
-    let _ = writeln!(out, "{}", "=".repeat(72));
+    let _ = writeln!(out, "{}", "=".repeat(BANNER_WIDTH));
     let _ = writeln!(out, "  RECOMMENDED FIX ORDER");
-    let _ = writeln!(out, "{}", "=".repeat(72));
+    let _ = writeln!(out, "{}", "=".repeat(BANNER_WIDTH));
     let _ = writeln!(out);
 
     for (_, label, desc) in PRIORITY_LEVELS {

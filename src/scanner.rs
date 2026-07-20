@@ -24,6 +24,7 @@ pub fn scan_package(
     exclude: &[String],
     min_duplicate_lines: usize,
     twin_similarity: f64,
+    recursive: bool,
 ) -> ScanResult {
     let mut result = ScanResult::default();
     if !root.exists() {
@@ -39,11 +40,19 @@ pub fn scan_package(
     // dedup in particular, since its `reported` key doesn't include the
     // file path) depends on which file is processed first, so this can't
     // be arbitrary directory-walk order.
-    for entry in WalkDir::new(root)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    //
+    // `recursive=false` caps depth at 1 (root's direct children only) —
+    // used for the synthetic "loose root scripts" package cwd
+    // auto-discovery produces alongside real subpackages (mirrors
+    // `scan_package(..., recursive=False)` in the Python port), so its own
+    // directory's already-registered subdirectories aren't double-scanned.
+    let walker = WalkDir::new(root).sort_by_file_name();
+    let walker = if recursive {
+        walker
+    } else {
+        walker.max_depth(1)
+    };
+    for entry in walker.into_iter().filter_map(Result::ok) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("py") {
             continue;
@@ -86,6 +95,7 @@ pub fn scan_package(
                     rule: "syntax-error",
                     message: format!("Failed to parse file — syntax error: {e}"),
                     package: package.to_string(),
+                    reason: None,
                 });
             }
         }
@@ -109,16 +119,61 @@ pub fn scan_package(
         twin_similarity,
     ));
 
-    for issue in all_issues {
+    for mut issue in all_issues {
         let lines: Option<Vec<&str>> = source_by_file
             .iter()
             .find(|(p, _)| p == &issue.file)
             .map(|(_, s)| s.lines().collect());
-        match lines {
-            Some(lines) if is_suppressed(&issue, &lines) => result.suppressed += 1,
-            _ => result.issues.push(issue),
+        let suppression = lines.and_then(|lines| is_suppressed(&issue, &lines));
+        match suppression {
+            Some(sup) => {
+                result.suppressed += 1;
+                issue.reason = sup.reason;
+                result.ignored.push(issue);
+            }
+            None => result.issues.push(issue),
         }
     }
 
     result
+}
+
+#[cfg(test)]
+mod recursive_flag_tests {
+    use super::scan_package;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn non_recursive_ignores_subdirectories() {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "spaghetti_rs_scan_non_recursive_{}_{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(
+            root.join("loose.py"),
+            "def f():\n    try:\n        pass\n    except:\n        pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("sub/mod.py"),
+            "def g():\n    try:\n        pass\n    except:\n        pass\n",
+        )
+        .unwrap();
+
+        let result = scan_package("root", &root, &[], 5, 0.6, false);
+
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(result.files_scanned, 1);
+        assert!(
+            result
+                .issues
+                .iter()
+                .filter(|i| i.rule == "bare-except")
+                .all(|i| i.file == root.join("loose.py"))
+        );
+    }
 }

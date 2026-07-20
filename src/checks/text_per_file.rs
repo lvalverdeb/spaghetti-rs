@@ -14,6 +14,7 @@ pub fn check_long_file(source: &str, filepath: &Path, package: &str) -> Vec<Issu
             rule: "long-file",
             message: format!("File is {count} lines (max {MAX_FILE_LINES})"),
             package: package.to_string(),
+            reason: None,
         }]
     } else {
         Vec::new()
@@ -39,6 +40,7 @@ pub fn check_todo_markers(source: &str, filepath: &Path, package: &str) -> Vec<I
                 rule: "todo-marker",
                 message: format!("{marker} marker: {snippet}"),
                 package: package.to_string(),
+                reason: None,
             });
         }
     }

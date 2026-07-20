@@ -77,6 +77,21 @@ pub const MAX_INHERITANCE_DEPTH: usize = 4;
 pub const MAX_MESSAGE_CHAIN_DEPTH: i64 = 3;
 pub const DEFAULT_TWIN_SIMILARITY: f64 = 0.6;
 pub const DEFAULT_MIN_DUPLICATE_LINES: usize = 5;
+pub const DEFAULT_TOP_FILES: usize = 5;
+pub const DEFAULT_PLAN_TOP: usize = 20;
+pub const MIN_TWIN_FUNCTION_LINES: usize = 4;
+pub const MAX_PUBLIC_SYMBOLS: usize = 15;
+pub const MIN_CLASS_METHODS: usize = 2;
+
+/// By how much a warning-level threshold is multiplied to decide when a rule
+/// escalates its own finding to "error" instead (e.g. high-complexity,
+/// god-class) — one shared factor instead of each rule picking its own.
+pub const ERROR_ESCALATION_MULTIPLIER: f64 = 1.5;
+
+// ── Units & display ──────────────────────────────────────────────────────────
+
+pub const LINES_PER_KLOC: f64 = 1000.0;
+pub const BANNER_WIDTH: usize = 72;
 
 // ── Layer rules (pkg -> {path-prefix: [forbidden import prefixes]}) ─────────
 //
@@ -98,7 +113,7 @@ pub static TODO_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"#.*\b(TODO|FIXME|XXX|HACK)\b").unwrap());
 
 pub static SUPPRESS_MARKER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"#\s*spaghetti-ignore(?:\[([^\]]*)\])?").unwrap());
+    LazyLock::new(|| Regex::new(r"#\s*spaghetti-ignore(?:\[([^\]]*)\])?(?:\s*:\s*(.*))?").unwrap());
 
 /// Mirrors `config.py::DUNDER_RE` (`^__.*__$`). Guards the length so a
 /// 2-3 char name like `__`/`___` isn't misidentified as dunder by a naive
