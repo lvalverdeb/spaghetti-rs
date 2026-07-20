@@ -1279,6 +1279,68 @@ fn string_operand(expr: &Expr) -> Option<&str> {
     }
 }
 
+// Fields Python's own `ast` module uses to hold identifier strings: keyword
+// argument names (`keyword.arg`), variable names (`Name.id`), attribute
+// names (`Attribute.attr`). Equality checks against these are AST-shape
+// matching (e.g. `kw.arg == "allow_pickle"` to find a specific call
+// signature), not the stringly-typed business logic this rule targets —
+// excluding them avoids false positives in any AST-walking tool comparing
+// against known field/argument names.
+const AST_IDENTIFIER_FIELDS: &[&str] = &["arg", "id", "attr"];
+
+fn is_ast_identifier_field_access(expr: &Expr) -> bool {
+    matches!(expr, Expr::Attribute(a) if AST_IDENTIFIER_FIELDS.contains(&a.attr.as_str()))
+}
+
+// A dunder name needs at least one character between the double
+// underscores (e.g. "__init__") — bare underscore runs like "____" are
+// just punctuation, not Python's magic-method vocabulary.
+const MIN_DUNDER_NAME_LENGTH: usize = 4;
+
+// Python's own magic-method/attribute vocabulary (`__init__`, `__new__`,
+// `__call__`, ...) is a reflection/introspection artifact, never a business
+// category code, regardless of what attribute holds it — so a comparison
+// like `name == "__init__"` isn't the stringly-typed smell this rule
+// targets, unlike the general `.name` field (too common in ordinary
+// business code to exclude wholesale).
+fn is_dunder_name(value: &str) -> bool {
+    value.len() > MIN_DUNDER_NAME_LENGTH && value.starts_with("__") && value.ends_with("__")
+}
+
+/// True when this string/other-operand pairing is a known non-business
+/// comparison (AST-shape matching or Python's own dunder vocabulary) that
+/// `check_magic_strings` should ignore.
+fn is_excluded_magic_string_value(value: &str, other_operand: &Expr) -> bool {
+    is_dunder_name(value) || is_ast_identifier_field_access(other_operand)
+}
+
+/// The (value, position) pair for *node* if it's a non-excluded
+/// `str == <expr>` / `<expr> == str` equality comparison, else `None`.
+fn magic_string_comparison(
+    node: &rustpython_ast::ExprCompare,
+) -> Option<(String, rustpython_ast::text_size::TextSize)> {
+    if node.ops.len() != 1
+        || !matches!(
+            node.ops[0],
+            rustpython_ast::CmpOp::Eq | rustpython_ast::CmpOp::NotEq
+        )
+    {
+        return None;
+    }
+    let left = string_operand(&node.left);
+    let right = node.comparators.first().and_then(string_operand);
+    let pos = node.range().start();
+    match (left, right) {
+        (Some(v), None) if !is_excluded_magic_string_value(v, &node.comparators[0]) => {
+            Some((v.to_string(), pos))
+        }
+        (None, Some(v)) if !is_excluded_magic_string_value(v, &node.left) => {
+            Some((v.to_string(), pos))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct MagicStringVisitor {
     comparisons: Vec<(String, rustpython_ast::text_size::TextSize)>,
@@ -1297,20 +1359,8 @@ impl Visitor for MagicStringVisitor {
         walk_withitem_children(self, node);
     }
     fn visit_expr_compare(&mut self, node: rustpython_ast::ExprCompare) {
-        if node.ops.len() == 1
-            && matches!(
-                node.ops[0],
-                rustpython_ast::CmpOp::Eq | rustpython_ast::CmpOp::NotEq
-            )
-        {
-            let left = string_operand(&node.left);
-            let right = node.comparators.first().and_then(string_operand);
-            let pos = node.range().start();
-            match (left, right) {
-                (Some(v), None) => self.comparisons.push((v.to_string(), pos)),
-                (None, Some(v)) => self.comparisons.push((v.to_string(), pos)),
-                _ => {}
-            }
+        if let Some(result) = magic_string_comparison(&node) {
+            self.comparisons.push(result);
         }
         self.generic_visit_expr_compare(node);
     }
@@ -2239,6 +2289,28 @@ fn is_docstring_only(stmt: &Stmt) -> bool {
     )
 }
 
+/// `super().method(...)`-style delegation is normal inheritance plumbing,
+/// not a pass-through smell — skip it.
+fn is_super_call(call_node: &rustpython_ast::ExprCall) -> bool {
+    matches!(call_node.func.as_ref(), Expr::Attribute(func_attr)
+        if matches!(func_attr.value.as_ref(), Expr::Call(inner_call)
+            if matches!(inner_call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super")))
+}
+
+/// True if every argument is forwarded unchanged (a bare name or
+/// `*args`/`**kwargs`), not transformed or computed.
+fn is_pure_delegation_call(call_node: &rustpython_ast::ExprCall) -> bool {
+    let args_are_pure = call_node
+        .args
+        .iter()
+        .all(|a| matches!(a, Expr::Name(_) | Expr::Starred(_)));
+    let kwargs_are_pure = call_node
+        .keywords
+        .iter()
+        .all(|k| matches!(k.value, Expr::Name(_)));
+    args_are_pure && kwargs_are_pure
+}
+
 struct PassThroughVisitor<'a> {
     line_index: &'a LineIndex,
     filepath: &'a Path,
@@ -2272,25 +2344,11 @@ impl<'a> PassThroughVisitor<'a> {
         let Some(call_node) = extract_call(meaningful[0]) else {
             return;
         };
-
-        // Skip `super().method(...)`-style delegation — that's normal
-        // inheritance plumbing, not a pass-through smell.
-        if let Expr::Attribute(func_attr) = call_node.func.as_ref()
-            && let Expr::Call(inner_call) = func_attr.value.as_ref()
-            && matches!(inner_call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super")
-        {
+        if is_super_call(call_node) {
             return;
         }
 
-        let args_are_pure = call_node
-            .args
-            .iter()
-            .all(|a| matches!(a, Expr::Name(_) | Expr::Starred(_)));
-        let kwargs_are_pure = call_node
-            .keywords
-            .iter()
-            .all(|k| matches!(k.value, Expr::Name(_)));
-        if args_are_pure && kwargs_are_pure {
+        if is_pure_delegation_call(call_node) {
             let target = render_call_target(&call_node.func);
             self.issues.push(issue(
                 self.filepath,
@@ -2516,6 +2574,36 @@ mod magic_string_tests {
         );
         assert!(issues.is_empty());
     }
+
+    #[test]
+    fn ignores_ast_identifier_field_access() {
+        let issues = issues_for(
+            "def f(kw, t, target):\n    if kw.arg == 'allow_pickle':\n        pass\n\
+             \n    if t.id == 'allow_pickle':\n        pass\n\
+             \n    if target.attr == 'allow_pickle':\n        pass\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_dunder_name() {
+        let issues = issues_for(
+            "def f(name):\n    if name == '__init__':\n        pass\n\
+             \n    if name != '__init__':\n        pass\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_short_dunder_looking_string() {
+        // '____' has no content between the underscores — not a real
+        // dunder name, just four underscores — so it should still be
+        // flagged as an ordinary repeated string comparison.
+        let issues = issues_for(
+            "def f(x):\n    if x == '____':\n        pass\n    if x == '____':\n        pass\n",
+        );
+        assert_eq!(issues.len(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -2599,6 +2687,83 @@ mod lazy_class_tests {
         // Sanity check: the pydantic/dataclass exemption must not swallow
         // genuine hits — an unrelated base class doesn't grant an exemption.
         let issues = issues_for("class C(SomeOtherBase):\n    x = 1\n");
+        assert_eq!(issues.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod pass_through_tests {
+    use super::check_pass_through_methods;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_pass_through_methods(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_pure_delegation() {
+        let issues = issues_for(
+            "class Wrapper:\n    def get(self, key):\n        return self._inner.get(key)\n",
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "pass-through-method");
+        assert!(issues[0].message.contains("_inner.get()"));
+    }
+
+    #[test]
+    fn flags_expression_statement_form() {
+        let issues =
+            issues_for("class Wrapper:\n    def close(self):\n        self._inner.close()\n");
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn flags_awaited_call() {
+        let issues = issues_for(
+            "class Wrapper:\n    async def get(self, key):\n        return await self._inner.get(key)\n",
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn ignores_transformed_args() {
+        let issues = issues_for(
+            "class Wrapper:\n    def get(self, key):\n        return self._inner.get(key.upper())\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_multi_statement_body() {
+        let issues = issues_for(
+            "class Wrapper:\n    def get(self, key):\n        log(key)\n        return self._inner.get(key)\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_dunder_methods() {
+        let issues = issues_for(
+            "class Wrapper:\n    def __init__(self, inner):\n        self._inner = inner\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_super_call() {
+        let issues = issues_for(
+            "class Child(Base):\n    def get(self, key):\n        return super().get(key)\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_docstring_only_body_to_still_flag() {
+        let issues = issues_for(
+            "class Wrapper:\n    def get(self, key):\n        '''Docstring.'''\n        return self._inner.get(key)\n",
+        );
         assert_eq!(issues.len(), 1);
     }
 }
