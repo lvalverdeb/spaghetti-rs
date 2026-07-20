@@ -1,5 +1,5 @@
 use clap::Parser;
-use spaghetti_detector_rs::cli;
+use spaghetti::cli;
 
 fn main() {
     let args = cli::Args::parse();

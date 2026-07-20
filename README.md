@@ -1,18 +1,35 @@
-# spaghetti-rs
+# spaghetti
 
-A Rust port of [`spaghetti`](https://github.com/lvalverdeb/spaghetti), the spaghetti-code and architectural-smell detector for Python projects.
+Spaghetti code and architectural-smell detector **for Python codebases**, implemented in Rust.
 
-This is a from-scratch reimplementation, not a wrapper or FFI binding — a native binary with no Python runtime dependency, built for speed and easy distribution (drop it into any CI image or pre-commit hook with nothing else installed). The [Python original](https://github.com/lvalverdeb/spaghetti) remains the actively maintained **spec of record**: when the two disagree, the Python behavior is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/spaghetti/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioral quirk (some quite subtle — e.g. `difflib.SequenceMatcher.ratio()`'s asymmetry under `autojunk`) uncovered and matched along the way.
+This is a from-scratch reimplementation of [`spaghetti-detector`](https://github.com/lvalverdeb/spaghetti) (the Python original) — not a wrapper or FFI binding. It parses and scans Python source directly, with no Python runtime dependency, producing a single native binary you can drop into any CI image or pre-commit hook with nothing else installed. Scans workspace packages for anti-patterns, architectural violations, and structural code smells — from single-function issues (long functions, deep nesting, high cyclomatic complexity) up to whole-package issues that only show up once you can see across files: real circular imports (not just a parent/child heuristic), copy-pasted function bodies, and the sync/async "twin" duplication pattern (`load`/`aload`, `foo`/`foo_async`) where a fix applied to one twin silently never reaches the other.
 
-**Status**: all 36 rules ported and verified — 674/674 issues identical to Python's own output across a real multi-package codebase, output is reproducible run-to-run, and `--plan` output is byte-for-byte identical to Python's. Not yet published; packaging (this README, `LICENSE`, `cargo-dist` config) is in progress.
+The [Python original](https://github.com/lvalverdeb/spaghetti) remains the actively maintained **spec of record**: when the two disagree, the Python behavior is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/spaghetti/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioral quirk (some quite subtle — e.g. `difflib.SequenceMatcher.ratio()`'s asymmetry under `autojunk`) uncovered and matched along the way.
+
+**Status**: all 36 rules ported and verified — 674/674 issues identical to Python's own output across a real multi-package codebase, output is reproducible run-to-run, and `--plan` output is byte-for-byte identical to Python's.
+
+## Why It Exists
+
+AI-generated spaghetti code — often referred to as "slop code" — is extremely common because Large Language Models prioritize immediate functional completion (the "happy path") over long-term software architecture. It looks syntactically perfect and heavily commented, but often suffers from monolithic structures, copy-paste duplication, accidental complexity, and hallucinated dependencies. Human-written spaghetti code predates AI and has its own causes — tight deadlines, scope creep, skill gaps — but the fix is the same either way: mechanically-enforced rules that measure concrete thresholds instead of relying on review vibes.
+
+### Problem → Rule Mapping
+
+| Problem | Detector Rules | What It Catches |
+|---------|---------------|-----------------|
+| **Monolithic structures** | `god-class`, `god-module`, `long-function`, `long-file`, `deep-nesting` | Classes with 25+ methods, files over 400 lines, functions exceeding 50 lines, nesting beyond 5 levels |
+| **Copy-paste duplication** | `duplicate-function-body`, `sync-async-duplication` | Identical function bodies (5+ lines), sync/async twin pairs with ≥60% text similarity |
+| **Accidental complexity** | `high-complexity`, `excessive-returns`, `message-chain`, `deep-inheritance`, `excessive-decorators` | Cyclomatic complexity above 10, functions with 4+ return paths, chained calls deeper than 3 levels, inheritance exceeding 4 levels |
+| **Layering violations** | `layer-violation`, `transport-in-library`, `import-cycle`, `encapsulation-violation` | Library code importing transport frameworks, circular import chains, accessing private attributes across objects |
+| **Type safety gaps** | `missing-return-type`, `missing-param-type`, `untyped-dict`, `bare-except` | Public functions missing annotations, bare `dict` in type hints, bare `except:` clauses |
+| **Dead code & clutter** | `dead-code`, `unused-import`, `star-import`, `todo-marker`, `magic-number`, `magic-string` | Unreachable statements after `return`/`raise`/`break`, `from x import *`, unexplained numeric literals, repeated string comparisons standing in for a category code |
 
 ## Install
 
 ```bash
-cargo install spaghetti-detector-rs
+cargo install spaghetti
 ```
 
-This installs a binary named `spaghetti` (matching the Python CLI's command name), not `spaghetti-detector-rs` — the crate name and the command you run are deliberately different.
+This installs a binary named `spaghetti` (matching the Python CLI's command name and the crate name).
 
 ## Usage
 
