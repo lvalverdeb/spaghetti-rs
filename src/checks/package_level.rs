@@ -6,7 +6,9 @@ use crate::ast_helpers::{
     FuncNode, LineIndex, collect_functions, collect_functions_with_class_context, dump_stmts,
     is_trivial_body, line_count,
 };
-use crate::config::{MIN_TWIN_FUNCTION_LINES, allowed_import_prefix};
+use crate::config::{
+    MAX_MODULE_FAN_IN, MAX_MODULE_FAN_OUT, MIN_TWIN_FUNCTION_LINES, allowed_import_prefix,
+};
 use crate::models::{Issue, Severity, display_path};
 use crate::similarity::sequence_matcher_ratio;
 use crate::unparse::unparse_function;
@@ -169,18 +171,27 @@ fn module_level_imports(module_body: &[Stmt]) -> Vec<ImportNode> {
     visitor.imports
 }
 
-pub fn check_import_cycles_pkg(
+/// The real intra-package import graph: module -> set of modules it
+/// imports, plus module -> its file. Shared by check_import_cycles_pkg and
+/// check_module_coupling_pkg so both see identical import resolution
+/// (relative imports, package-prefix resolution, TYPE_CHECKING exclusion —
+/// see `module_level_imports`) instead of duplicating it.
+///
+/// A module only appears as a `graph` key if it has at least one qualifying
+/// import; a module with zero intra-package imports is still present in
+/// `file_for_module`, just absent from `graph` (equivalent to an empty
+/// adjacency set — callers use `graph.get(module)`).
+fn build_import_graph<'a>(
     pkg_name: &str,
-    files: &[ParsedFile],
+    files: &'a [ParsedFile],
     pkg_root: &Path,
-) -> Vec<Issue> {
-    let Some(prefix) = allowed_import_prefix(pkg_name) else {
-        return Vec::new();
-    };
-    let stem = prefix.trim_end_matches('.');
-
+) -> (HashMap<String, HashSet<String>>, HashMap<String, &'a Path>) {
     let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
     let mut file_for_module: HashMap<String, &Path> = HashMap::new();
+    let Some(prefix) = allowed_import_prefix(pkg_name) else {
+        return (graph, file_for_module);
+    };
+    let stem = prefix.trim_end_matches('.');
 
     for f in files {
         let (mod_name, package) = module_and_package_for(pkg_root, &f.path);
@@ -207,6 +218,19 @@ pub fn check_import_cycles_pkg(
                 }
             }
         }
+    }
+
+    (graph, file_for_module)
+}
+
+pub fn check_import_cycles_pkg(
+    pkg_name: &str,
+    files: &[ParsedFile],
+    pkg_root: &Path,
+) -> Vec<Issue> {
+    let (graph, file_for_module) = build_import_graph(pkg_name, files, pkg_root);
+    if file_for_module.is_empty() {
+        return Vec::new();
     }
 
     let mut issues = Vec::new();
@@ -282,6 +306,61 @@ pub fn check_import_cycles_pkg(
         }
     }
 
+    issues
+}
+
+/// Flags a module as an overloaded "hub" — reuses the same import graph as
+/// check_import_cycles_pkg, but measures fan-in/fan-out instead of cycles.
+///
+/// Only flagged when *both* fan-in and fan-out exceed their thresholds:
+/// high fan-in alone is often just a legitimately central util module (many
+/// things use it, by design), and high fan-out alone is often just a
+/// legitimately thin orchestrator (it wires many things together, by
+/// design). Both-high together is the real signal — a module that's both
+/// heavily depended-on and heavily dependent, so a change anywhere near it
+/// tends to ripple.
+pub fn check_module_coupling_pkg(
+    pkg_name: &str,
+    files: &[ParsedFile],
+    pkg_root: &Path,
+) -> Vec<Issue> {
+    let (graph, file_for_module) = build_import_graph(pkg_name, files, pkg_root);
+    if file_for_module.is_empty() {
+        return Vec::new();
+    }
+
+    let mut fan_in: HashMap<String, usize> = HashMap::new();
+    for targets in graph.values() {
+        for target in targets {
+            *fan_in.entry(target.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let mut module_names: Vec<&String> = file_for_module.keys().collect();
+    module_names.sort();
+
+    let mut issues = Vec::new();
+    for module in module_names {
+        let filepath = file_for_module[module];
+        let fan_out = graph.get(module).map(|s| s.len()).unwrap_or(0);
+        let module_fan_in = fan_in.get(module).copied().unwrap_or(0);
+        if module_fan_in > MAX_MODULE_FAN_IN && fan_out > MAX_MODULE_FAN_OUT {
+            issues.push(issue(
+                filepath,
+                1,
+                Severity::Warning,
+                "high-coupling",
+                pkg_name,
+                format!(
+                    "module {module} has fan-in={module_fan_in} and fan-out={fan_out} \
+                     (max {MAX_MODULE_FAN_IN}/{MAX_MODULE_FAN_OUT}) — other modules depend \
+                     on it heavily and it depends on other modules heavily; consider \
+                     splitting it or inverting some dependencies (Dependency Inversion \
+                     Principle)"
+                ),
+            ));
+        }
+    }
     issues
 }
 
@@ -476,4 +555,71 @@ pub fn check_sync_async_twins_pkg(
         }
     }
     issues
+}
+
+#[cfg(test)]
+mod module_coupling_tests {
+    use super::{ParsedFile, check_module_coupling_pkg};
+    use crate::config::MAX_MODULE_FAN_IN;
+    use std::path::{Path, PathBuf};
+
+    fn parsed_file(path: &str, source: &str) -> ParsedFile {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, path)
+            .expect("test source must parse");
+        ParsedFile {
+            path: PathBuf::from(path),
+            source: source.to_string(),
+            module,
+        }
+    }
+
+    #[test]
+    fn flags_hub_module() {
+        let n = MAX_MODULE_FAN_IN + 1; // also > MAX_MODULE_FAN_OUT since both are equal
+        let mut files = Vec::new();
+        for i in 0..n {
+            files.push(parsed_file(&format!("/pkg/boti_data/dep{i}.py"), "x = 1\n"));
+        }
+        let hub_source: String = (0..n)
+            .map(|i| format!("from .dep{i} import x as x{i}\n"))
+            .collect();
+        files.push(parsed_file("/pkg/boti_data/hub.py", &hub_source));
+        for i in 0..n {
+            files.push(parsed_file(
+                &format!("/pkg/boti_data/user{i}.py"),
+                "from .hub import hub\n",
+            ));
+        }
+
+        let issues = check_module_coupling_pkg("boti-data", &files, Path::new("/pkg/boti_data"));
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "high-coupling");
+        assert!(issues[0].message.contains("boti_data.hub"));
+    }
+
+    #[test]
+    fn allows_high_fan_in_alone() {
+        // Sanity check: fan-in alone (a legitimately central util everyone
+        // imports) must not trigger — only both fan-in AND fan-out high does.
+        let n = MAX_MODULE_FAN_IN + 1;
+        let mut files = vec![parsed_file("/pkg/boti_data/util.py", "x = 1\n")];
+        for i in 0..n {
+            files.push(parsed_file(
+                &format!("/pkg/boti_data/user{i}.py"),
+                "from .util import x\n",
+            ));
+        }
+        let issues = check_module_coupling_pkg("boti-data", &files, Path::new("/pkg/boti_data"));
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn clean() {
+        let files = vec![
+            parsed_file("/pkg/boti_data/a.py", "x = 1\n"),
+            parsed_file("/pkg/boti_data/b.py", "from .a import x\n"),
+        ];
+        let issues = check_module_coupling_pkg("boti-data", &files, Path::new("/pkg/boti_data"));
+        assert!(issues.is_empty());
+    }
 }

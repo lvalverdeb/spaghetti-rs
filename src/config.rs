@@ -83,6 +83,17 @@ pub const MIN_TWIN_FUNCTION_LINES: usize = 4;
 pub const MAX_PUBLIC_SYMBOLS: usize = 15;
 pub const MIN_CLASS_METHODS: usize = 2;
 
+// Weighted Methods per Class: sum of each method's own cyclomatic
+// complexity. A class can stay under MAX_CLASS_METHODS/MAX_CLASS_ATTRS yet
+// still be a god class if its few methods are individually complex enough.
+pub const MAX_CLASS_WMC: i64 = 50;
+
+// A module is only flagged as an overloaded "hub" when it's both heavily
+// depended-on (fan-in) and heavily dependent (fan-out) — either alone is
+// often just a legitimately central util or a legitimately thin orchestrator.
+pub const MAX_MODULE_FAN_IN: usize = 8;
+pub const MAX_MODULE_FAN_OUT: usize = 8;
+
 /// By how much a warning-level threshold is multiplied to decide when a rule
 /// escalates its own finding to "error" instead (e.g. high-complexity,
 /// god-class) — one shared factor instead of each rule picking its own.

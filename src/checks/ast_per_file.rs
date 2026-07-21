@@ -13,14 +13,15 @@
 //! (see §7.6/§10 of the proposal).
 
 use crate::ast_helpers::{
-    LineIndex, collect_functions, count_own_returns, cyclomatic_complexity, dump_stmts, is_private,
-    line_count, nesting_depth, walk_arguments_children, walk_comprehension_children,
+    FuncNode, LineIndex, collect_functions, count_own_returns, cyclomatic_complexity, dump_stmts,
+    is_private, line_count, nesting_depth, walk_arguments_children, walk_comprehension_children,
     walk_keyword_children, walk_withitem_children,
 };
 use crate::config::{
     COMPLEXITY_THRESHOLD, ERROR_ESCALATION_MULTIPLIER, MAX_CLASS_ATTRS, MAX_CLASS_METHODS,
-    MAX_DECORATORS, MAX_FUNC_PARAMS, MAX_FUNCTION_LINES, MAX_INHERITANCE_DEPTH, MAX_NESTING_DEPTH,
-    MAX_PUBLIC_SYMBOLS, MAX_RETURNS, MIN_BOOLEAN_FLAGS, MIN_CLASS_METHODS, is_dunder, layer_rules,
+    MAX_CLASS_WMC, MAX_DECORATORS, MAX_FUNC_PARAMS, MAX_FUNCTION_LINES, MAX_INHERITANCE_DEPTH,
+    MAX_NESTING_DEPTH, MAX_PUBLIC_SYMBOLS, MAX_RETURNS, MIN_BOOLEAN_FLAGS, MIN_CLASS_METHODS,
+    is_dunder, layer_rules,
 };
 use crate::models::{Issue, Severity};
 use rustpython_ast::{Arguments, Constant, Expr, Mod, Ranged, Stmt, Visitor};
@@ -1887,11 +1888,26 @@ impl<'a> Visitor for GodClassVisitor<'a> {
             attr_visitor.visit_stmt((*method).clone());
         }
 
-        if methods.len() > MAX_CLASS_METHODS || attr_visitor.attrs.len() > MAX_CLASS_ATTRS {
+        let wmc: i64 = methods
+            .iter()
+            .map(|m| {
+                cyclomatic_complexity(&FuncNode {
+                    name: String::new(),
+                    start: m.range().start(),
+                    stmt: (*m).clone(),
+                })
+            })
+            .sum();
+
+        if methods.len() > MAX_CLASS_METHODS
+            || attr_visitor.attrs.len() > MAX_CLASS_ATTRS
+            || wmc > MAX_CLASS_WMC
+        {
             let severity = if methods.len() as f64
                 > MAX_CLASS_METHODS as f64 * ERROR_ESCALATION_MULTIPLIER
                 || attr_visitor.attrs.len() as f64
                     > MAX_CLASS_ATTRS as f64 * ERROR_ESCALATION_MULTIPLIER
+                || wmc as f64 > MAX_CLASS_WMC as f64 * ERROR_ESCALATION_MULTIPLIER
             {
                 Severity::Error
             } else {
@@ -1904,10 +1920,11 @@ impl<'a> Visitor for GodClassVisitor<'a> {
                 "god-class",
                 self.package,
                 format!(
-                    "class {} has {} methods and {} attributes (max {MAX_CLASS_METHODS}/{MAX_CLASS_ATTRS}) — consider splitting responsibilities",
+                    "class {} has {} methods, {} attributes, and total complexity (WMC) {} (max {MAX_CLASS_METHODS}/{MAX_CLASS_ATTRS}/{MAX_CLASS_WMC}) — consider splitting responsibilities",
                     node.name,
                     methods.len(),
-                    attr_visitor.attrs.len()
+                    attr_visitor.attrs.len(),
+                    wmc
                 ),
             ));
         }
@@ -2740,6 +2757,67 @@ mod encapsulation_tests {
         let issues =
             issues_for("class Foo:\n    def method(self) -> int:\n        return self.__dict__\n");
         assert!(issues.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod god_class_tests {
+    use super::check_god_class;
+    use crate::config::MAX_CLASS_METHODS;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_god_class(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_many_methods() {
+        let methods: String = (0..MAX_CLASS_METHODS + 3)
+            .map(|i| format!("    def m{i}(self) -> None: pass\n"))
+            .collect();
+        let issues = issues_for(&format!("class GodClass:\n{methods}"));
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "god-class");
+    }
+
+    #[test]
+    fn error_at_extreme() {
+        let methods: String = (0..(MAX_CLASS_METHODS as f64 * 1.5) as usize + 1)
+            .map(|i| format!("    def m{i}(self) -> None: pass\n"))
+            .collect();
+        let issues = issues_for(&format!("class GodClass:\n{methods}"));
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, crate::models::Severity::Error);
+    }
+
+    #[test]
+    fn clean() {
+        let issues = issues_for(
+            "class SmallClass:\n    def m1(self) -> None: pass\n    def m2(self) -> None: pass\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn flags_high_wmc_with_few_methods() {
+        // A class can stay well under MAX_CLASS_METHODS/MAX_CLASS_ATTRS yet
+        // still be a god class if its handful of methods are each
+        // individually complex.
+        use crate::config::MAX_CLASS_WMC;
+        let mut lines = vec![
+            "class ComplexClass:".to_string(),
+            "    def m1(self, x) -> None:".to_string(),
+        ];
+        for i in 0..(MAX_CLASS_WMC + 2) {
+            lines.push(format!("        if x == {i}:"));
+            lines.push("            pass".to_string());
+        }
+        let source = lines.join("\n") + "\n";
+        let issues = issues_for(&source);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("WMC"));
     }
 }
 

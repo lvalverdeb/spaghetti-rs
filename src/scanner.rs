@@ -105,6 +105,11 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
         &parsed_files,
         root,
     ));
+    all_issues.extend(package_level::check_module_coupling_pkg(
+        package,
+        &parsed_files,
+        root,
+    ));
     all_issues.extend(package_level::check_duplicate_functions_pkg(
         package,
         &parsed_files,
