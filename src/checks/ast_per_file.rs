@@ -427,17 +427,49 @@ const NON_TRIVIAL_BODY_THRESHOLD: usize = 2;
 
 /// True when *stmt* — as an if-body's last statement — means the if only
 /// *guards entry* into a final step (a nested bare if, a discarded-return
-/// call, or a loop) rather than encoding two real branches of logic. The
-/// "negative path" in that shape is just "skip this node", which is
-/// already what happens without an else — mirrors
+/// call, a bare yield/yield-from, or a loop) rather than encoding two real
+/// branches of logic. The "negative path" in that shape is just "skip this
+/// node", which is already what happens without an else — mirrors
 /// `check_missing_else`'s Python docstring.
 fn is_guard_delegation_tail(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::If(inner) => inner.orelse.is_empty(),
-        Stmt::Expr(e) => matches!(e.value.as_ref(), Expr::Call(_)),
+        Stmt::Expr(e) => matches!(
+            e.value.as_ref(),
+            Expr::Call(_) | Expr::Yield(_) | Expr::YieldFrom(_)
+        ),
         Stmt::For(_) | Stmt::AsyncFor(_) | Stmt::While(_) => true,
         _ => false,
     }
+}
+
+/// The assignment target(s) of *stmt*, or empty if it isn't an assignment.
+fn assignment_targets(stmt: &Stmt) -> Vec<&Expr> {
+    match stmt {
+        Stmt::Assign(a) => a.targets.iter().collect(),
+        Stmt::AugAssign(a) => vec![a.target.as_ref()],
+        Stmt::AnnAssign(a) => vec![a.target.as_ref()],
+        _ => Vec::new(),
+    }
+}
+
+/// True when *stmt* — as an if-body's last statement — assigns to an
+/// attribute or subscript (`self.x = ...` / `cache[key] = ...`) rather than
+/// a fresh local name: the "conditionally update already-existing state"
+/// idiom (lazy-init-then-cache, one-time setup flags, degrade-in-place
+/// dicts) where the "negative path" is simply "leave the existing value
+/// alone" — already true without an else. A fresh local name (`a = 1`) is
+/// deliberately not exempted: unlike an attribute/subscript, it has no
+/// existence outside the branch, so it's the shape most likely to actually
+/// be missing its negative-path counterpart. A multi-target assignment
+/// (`a = self.x = 1`) only qualifies if *every* target is attribute/
+/// subscript.
+fn is_trailing_state_mutation(stmt: &Stmt) -> bool {
+    let targets = assignment_targets(stmt);
+    !targets.is_empty()
+        && targets
+            .iter()
+            .all(|t| matches!(t, Expr::Attribute(_) | Expr::Subscript(_)))
 }
 
 impl<'a> Visitor for MissingElseVisitor<'a> {
@@ -449,10 +481,12 @@ impl<'a> Visitor for MissingElseVisitor<'a> {
         // dead-code rule, which defines the same set of terminators.
         let is_terminated = node.body.last().is_some_and(is_unreachable_after);
         let is_guard_delegation = node.body.last().is_some_and(is_guard_delegation_tail);
+        let is_state_mutation = node.body.last().is_some_and(is_trailing_state_mutation);
         if node.orelse.is_empty()
             && node.body.len() >= NON_TRIVIAL_BODY_THRESHOLD
             && !is_terminated
             && !is_guard_delegation
+            && !is_state_mutation
         {
             self.issues.push(issue(
                 self.filepath,
@@ -1087,6 +1121,14 @@ pub fn check_excessive_decorators(
 // "@dataclass" is nonsensical since they already fulfill that exact role.
 const LAZY_CLASS_EXEMPT_BASE_NAMES: &[&str] = &["BaseModel", "BaseSettings", "NamedTuple"];
 
+// A base class named by the standard exception/warning naming convention
+// (PEP 8: "exception names should use the CapWords convention and the
+// suffix Error/Exception/Warning") makes a class raise-able — it can't be
+// "a plain function or @dataclass" and still be an exception type. Matching
+// by suffix (rather than a fixed list of builtins) also covers subclassing
+// a project's own custom exception base, not just direct builtin bases.
+const LAZY_CLASS_EXEMPT_BASE_SUFFIXES: &[&str] = &["Error", "Exception", "Warning"];
+
 /// The name a decorator resolves to, e.g. "dataclass" for both `@dataclass`
 /// and `@dataclass(frozen=True)`.
 fn decorator_target_name(dec: &Expr) -> Option<String> {
@@ -1101,15 +1143,18 @@ fn decorator_target_name(dec: &Expr) -> Option<String> {
     }
 }
 
-/// True if `node` already is a declarative data container: a pydantic
-/// BaseModel/BaseSettings subclass, or a @dataclass-decorated class. These
-/// already satisfy check_lazy_class's own suggested remedy, so they should
-/// never be flagged regardless of method count.
+/// True if `node` already is a declarative data container (a pydantic
+/// BaseModel/BaseSettings subclass, or a @dataclass-decorated class — these
+/// already satisfy check_lazy_class's own suggested remedy) or a raise-able
+/// exception/warning type (the remedy itself isn't raise-able, so it
+/// doesn't apply). Never flagged regardless of method count.
 fn is_lazy_class_exempt(node: &rustpython_ast::StmtClassDef) -> bool {
-    if base_names(&node.bases)
-        .iter()
-        .any(|b| LAZY_CLASS_EXEMPT_BASE_NAMES.contains(&b.as_str()))
-    {
+    if base_names(&node.bases).iter().any(|b| {
+        LAZY_CLASS_EXEMPT_BASE_NAMES.contains(&b.as_str())
+            || LAZY_CLASS_EXEMPT_BASE_SUFFIXES
+                .iter()
+                .any(|suffix| b.ends_with(suffix))
+    }) {
         return true;
     }
     node.decorator_list
@@ -2512,6 +2557,54 @@ mod missing_else_tests {
             issues_for("def f():\n    if x:\n        a = 1\n        b = 2\n    return a + b\n");
         assert_eq!(issues.len(), 1);
     }
+
+    #[test]
+    fn allows_guard_then_attribute_assignment() {
+        // Lazy-init-then-cache idiom: mutating self.x (already-existing
+        // state) needs no negative path — "leave it as is" is already the
+        // default.
+        let issues = issues_for(
+            "def f():\n    if x is None:\n        x = compute()\n        self.x = x\n    return self.x\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_guard_then_subscript_assignment() {
+        let issues = issues_for(
+            "def f():\n    if endpoint:\n        kwargs['a'] = 1\n        kwargs['b'] = 2\n    return kwargs\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_guard_then_augassign_attribute() {
+        let issues = issues_for("def f():\n    if x:\n        a = 1\n        self.count += a\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_guard_then_yield() {
+        let issues = issues_for(
+            "def f():\n    for c in items:\n        if c not in seen:\n            seen.add(c)\n            yield c\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_guard_then_yield_from() {
+        let issues = issues_for("def f():\n    if x:\n        a = 1\n        yield from a\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_mixed_target_assignment() {
+        // Sanity check: a multi-target assignment must be *all* attribute/
+        // subscript targets to qualify — `a = self.x = 1` still introduces
+        // a fresh local (`a`), so it stays flagged.
+        let issues = issues_for("def f():\n    if x:\n        a = 1\n        a = self.x = 2\n");
+        assert_eq!(issues.len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -2560,7 +2653,8 @@ mod magic_number_tests {
 
     #[test]
     fn skips_default_parameter_value() {
-        let issues = issues_for("def f(max_attempts: int = 3, base_delay: float = 0.5):\n    pass\n");
+        let issues =
+            issues_for("def f(max_attempts: int = 3, base_delay: float = 0.5):\n    pass\n");
         assert!(issues.is_empty());
     }
 
@@ -2762,6 +2856,40 @@ mod lazy_class_tests {
         // genuine hits — an unrelated base class doesn't grant an exemption.
         let issues = issues_for("class C(SomeOtherBase):\n    x = 1\n");
         assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn allows_builtin_exception_subclass() {
+        let issues = issues_for(
+            "class SchemaValidationError(TypeError):\n    '''Raised on bad schema.'''\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_plain_exception_subclass() {
+        let issues = issues_for("class MyError(Exception):\n    pass\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_custom_exception_hierarchy() {
+        // Not a builtin base, but named by the same Error/Exception/Warning
+        // convention — covers subclassing a project's own exception base.
+        let issues = issues_for("class NotFoundError(AppBaseError):\n    pass\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_warning_subclass() {
+        let issues = issues_for("class DeprecatedFeatureWarning(UserWarning):\n    pass\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_qualified_exception_subclass() {
+        let issues = issues_for("class Boom(builtins.RuntimeError):\n    pass\n");
+        assert!(issues.is_empty());
     }
 }
 
