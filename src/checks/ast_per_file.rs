@@ -1199,11 +1199,20 @@ impl<'a> Visitor for MagicNumberVisitor<'a> {
     fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
         walk_comprehension_children(self, node);
     }
-    fn visit_arguments(&mut self, node: Arguments) {
-        walk_arguments_children(self, node);
-    }
+    // Skip the signature entirely: a default parameter value (e.g.
+    // `base_delay: float = 0.5`) is already named by the parameter itself,
+    // so it isn't "magic" the way a bare literal in the body is. Mirrors the
+    // Python check, which only walks `func.body`.
+    fn visit_arguments(&mut self, _node: Arguments) {}
+    // A literal passed directly as `name=<literal>` (e.g. `stacklevel=2`) is
+    // already documented by the keyword name the same way a named constant
+    // would document it — skip only that direct value, but still walk into
+    // non-literal values so a magic number nested inside one (e.g.
+    // `timeout=compute(30)`) is still caught.
     fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
-        walk_keyword_children(self, node);
+        if !matches!(node.value, Expr::Constant(_)) {
+            self.visit_expr(node.value);
+        }
     }
     fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
         walk_withitem_children(self, node);
@@ -2502,6 +2511,71 @@ mod missing_else_tests {
         let issues =
             issues_for("def f():\n    if x:\n        a = 1\n        b = 2\n    return a + b\n");
         assert_eq!(issues.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod magic_number_tests {
+    use super::check_magic_numbers;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_magic_numbers(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_literal() {
+        let issues = issues_for("def f():\n    x = 42\n");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "magic-number");
+        assert!(issues[0].message.contains("42"));
+    }
+
+    #[test]
+    fn allows_zero_one_minus_one() {
+        let issues = issues_for("def f():\n    a = 0\n    b = 1\n    c = -1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn skips_init() {
+        let issues = issues_for("class C:\n    def __init__(self):\n        self.x = 42\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn flags_float() {
+        let issues = issues_for("def f():\n    ratio = 0.75\n");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "magic-number");
+    }
+
+    #[test]
+    fn skips_keyword_argument() {
+        let issues = issues_for("def f():\n    warnings.warn('x', UserWarning, stacklevel=2)\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn skips_default_parameter_value() {
+        let issues = issues_for("def f(max_attempts: int = 3, base_delay: float = 0.5):\n    pass\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_positional_argument() {
+        let issues = issues_for("def f():\n    do_thing(42)\n");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("42"));
+    }
+
+    #[test]
+    fn still_flags_magic_number_nested_inside_keyword_value() {
+        let issues = issues_for("def f():\n    do_thing(timeout=compute(42))\n");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("42"));
     }
 }
 
