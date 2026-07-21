@@ -1234,8 +1234,20 @@ fn format_number_for_magic_check(c: &Constant) -> Option<(bool, String)> {
     }
 }
 
+/// The literal exactly as written in `source` (`0o600`, `0x1F`, `1_000`),
+/// or None if the range doesn't land on a valid source slice. `0o600` and
+/// `384` parse to the identical int — the AST has no notation to fall back
+/// on, so reporting the decimal `i.to_string()` for a literal someone wrote
+/// as `0o600` reads as arbitrary when it isn't.
+fn source_segment(source: &str, range: rustpython_ast::text_size::TextRange) -> Option<&str> {
+    let start: u32 = range.start().into();
+    let end: u32 = range.end().into();
+    source.get(start as usize..end as usize)
+}
+
 struct MagicNumberVisitor<'a> {
     line_index: &'a LineIndex,
+    source: &'a str,
     filepath: &'a Path,
     package: &'a str,
     issues: Vec<Issue>,
@@ -1266,6 +1278,7 @@ impl<'a> Visitor for MagicNumberVisitor<'a> {
         if let Some((allowed, repr)) = format_number_for_magic_check(&node.value)
             && !allowed
         {
+            let display = source_segment(self.source, node.range()).unwrap_or(&repr);
             self.issues.push(issue(
                 self.filepath,
                 self.line_index.line_number(node.range().start()),
@@ -1273,7 +1286,7 @@ impl<'a> Visitor for MagicNumberVisitor<'a> {
                 "magic-number",
                 self.package,
                 format!(
-                    "magic number {repr} — extract to a named constant, or an \
+                    "magic number {display} — extract to a named constant, or an \
                      enum.IntEnum if it's one of a fixed set of status/category codes"
                 ),
             ));
@@ -1295,6 +1308,7 @@ pub fn check_magic_numbers(
         }
         let mut visitor = MagicNumberVisitor {
             line_index: &line_index,
+            source,
             filepath,
             package,
             issues: Vec::new(),
@@ -1641,11 +1655,34 @@ pub fn check_duplicate_branches(
 // class, unaffected by nested functions), checked against `self`/`cls`/the
 // class's own name/`super()`.
 
-fn is_allowed_base(base: &Expr, current_class: Option<&str>) -> bool {
+/// The name of *args*'s first positional parameter, if any.
+fn first_param_name(args: &Arguments) -> Option<String> {
+    args.posonlyargs
+        .first()
+        .or_else(|| args.args.first())
+        .map(|a| a.def.arg.to_string())
+}
+
+/// True if *base* is `self`/`cls`/the enclosing class/`super()`, or the
+/// enclosing function's own first parameter — i.e. a private member reached
+/// through it is *not* an encapsulation violation.
+///
+/// The first-parameter case covers module-level free functions that take a
+/// not-yet-fully-constructed (or otherwise "owning") instance explicitly as
+/// their first argument instead of being a method — a documented pattern in
+/// this codebase for splitting a class's own `__init__`/method bodies out
+/// for line-count headroom (see e.g. `boti_data.gateway._gateway_init`).
+/// Reaching into that parameter's private state is the free-function
+/// equivalent of `self` access, not a real violation. This is syntactic,
+/// not semantic: it can't tell "the extracted-method pattern" from "a
+/// function that just happens to take some other object as its first
+/// argument and reaches into it for no good reason" — but the former is
+/// common and idiomatic enough here that the trade-off favors exempting it.
+fn is_allowed_base(base: &Expr, current_class: Option<&str>, first_param: Option<&str>) -> bool {
     match base {
         Expr::Name(n) => {
             let id = n.id.as_str();
-            id == "self" || id == "cls" || Some(id) == current_class
+            id == "self" || id == "cls" || Some(id) == current_class || Some(id) == first_param
         }
         Expr::Call(c) => matches!(c.func.as_ref(), Expr::Name(n) if n.id.as_str() == "super"),
         _ => false,
@@ -1665,12 +1702,13 @@ const MIN_REFLECTIVE_ACCESS_ARGS: usize = 2;
 fn direct_private_access<'a>(
     node: &'a rustpython_ast::ExprAttribute,
     current_class: Option<&str>,
+    first_param: Option<&str>,
 ) -> Option<&'a str> {
     if !matches!(node.ctx, rustpython_ast::ExprContext::Load) {
         return None;
     }
     let attr = node.attr.as_str();
-    if !is_private_name(attr) || is_allowed_base(&node.value, current_class) {
+    if !is_private_name(attr) || is_allowed_base(&node.value, current_class, first_param) {
         return None;
     }
     Some(attr)
@@ -1681,6 +1719,7 @@ fn direct_private_access<'a>(
 fn reflective_private_access<'a>(
     node: &'a rustpython_ast::ExprCall,
     current_class: Option<&str>,
+    first_param: Option<&str>,
 ) -> Option<(&'a str, &'a str)> {
     let Expr::Name(func_name) = node.func.as_ref() else {
         return None;
@@ -1697,7 +1736,7 @@ fn reflective_private_access<'a>(
     let Constant::Str(attr_name) = &c.value else {
         return None;
     };
-    if !is_private_name(attr_name) || is_allowed_base(&node.args[0], current_class) {
+    if !is_private_name(attr_name) || is_allowed_base(&node.args[0], current_class, first_param) {
         return None;
     }
     Some((fname, attr_name.as_str()))
@@ -1708,11 +1747,15 @@ struct EncapsulationVisitor<'a> {
     filepath: &'a Path,
     package: &'a str,
     class_stack: Vec<String>,
+    first_param_stack: Vec<Option<String>>,
     issues: Vec<Issue>,
 }
 impl<'a> EncapsulationVisitor<'a> {
     fn current_class(&self) -> Option<&str> {
         self.class_stack.last().map(|s| s.as_str())
+    }
+    fn current_first_param(&self) -> Option<&str> {
+        self.first_param_stack.last().and_then(|p| p.as_deref())
     }
 }
 impl<'a> Visitor for EncapsulationVisitor<'a> {
@@ -1721,8 +1764,20 @@ impl<'a> Visitor for EncapsulationVisitor<'a> {
         self.generic_visit_stmt_class_def(node);
         self.class_stack.pop();
     }
+    fn visit_stmt_function_def(&mut self, node: rustpython_ast::StmtFunctionDef) {
+        self.first_param_stack.push(first_param_name(&node.args));
+        self.generic_visit_stmt_function_def(node);
+        self.first_param_stack.pop();
+    }
+    fn visit_stmt_async_function_def(&mut self, node: rustpython_ast::StmtAsyncFunctionDef) {
+        self.first_param_stack.push(first_param_name(&node.args));
+        self.generic_visit_stmt_async_function_def(node);
+        self.first_param_stack.pop();
+    }
     fn visit_expr_attribute(&mut self, node: rustpython_ast::ExprAttribute) {
-        if let Some(attr) = direct_private_access(&node, self.current_class()) {
+        if let Some(attr) =
+            direct_private_access(&node, self.current_class(), self.current_first_param())
+        {
             self.issues.push(issue(
                 self.filepath,
                 self.line_index.line_number(node.range().start()),
@@ -1735,7 +1790,9 @@ impl<'a> Visitor for EncapsulationVisitor<'a> {
         self.generic_visit_expr_attribute(node);
     }
     fn visit_expr_call(&mut self, node: rustpython_ast::ExprCall) {
-        if let Some((fname, attr_name)) = reflective_private_access(&node, self.current_class()) {
+        if let Some((fname, attr_name)) =
+            reflective_private_access(&node, self.current_class(), self.current_first_param())
+        {
             self.issues.push(issue(
                 self.filepath,
                 self.line_index.line_number(node.range().start()),
@@ -1773,6 +1830,7 @@ pub fn check_encapsulation_violations(
         filepath,
         package,
         class_stack: Vec::new(),
+        first_param_stack: Vec::new(),
         issues: Vec::new(),
     };
     for stmt in module_body(module) {
@@ -2608,6 +2666,84 @@ mod missing_else_tests {
 }
 
 #[cfg(test)]
+mod encapsulation_tests {
+    use super::check_encapsulation_violations;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_encapsulation_violations(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_private_access() {
+        let issues = issues_for(
+            "class Foo:\n    def __init__(self):\n        self._x = 1\n\nclass Bar:\n    def method(self, foo: Foo) -> int:\n        return foo._x\n",
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "encapsulation-violation");
+    }
+
+    #[test]
+    fn flags_getattr_private() {
+        // foo is the *second* parameter here (not the enclosing function's
+        // own first), so the first-parameter exemption below doesn't apply
+        // — this is still a genuine reflective violation into an unrelated
+        // object.
+        let issues = issues_for(
+            "class Foo:\n    def __init__(self):\n        self._x = 1\n\ndef bar(label: str, foo: Foo) -> int:\n    return getattr(foo, '_x')\n",
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn allows_first_param_direct_access() {
+        // A free function taking the "owning" instance explicitly as its
+        // first parameter (the extracted-__init__/method pattern, e.g.
+        // boti_data.gateway._gateway_init) is the free-function equivalent
+        // of self access, not a violation.
+        let issues = issues_for(
+            "class Gateway:\n    pass\n\ndef _init_resource(gateway: Gateway, config) -> None:\n    gateway._strategy.build(config)\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_first_param_reflective_access() {
+        let issues = issues_for(
+            "class Gateway:\n    pass\n\ndef _init_resource(gateway: Gateway) -> None:\n    setattr(gateway, '_strategy', None)\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_non_first_param_access() {
+        // Sanity check: the exemption is positional, not "any parameter" —
+        // a second-positional parameter's private state is still a
+        // violation.
+        let issues = issues_for(
+            "class Gateway:\n    pass\n\ndef combine(label: str, gateway: Gateway) -> None:\n    gateway._strategy.build()\n",
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn allows_self() {
+        let issues =
+            issues_for("class Foo:\n    def method(self) -> int:\n        return self._x\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_dunder() {
+        let issues =
+            issues_for("class Foo:\n    def method(self) -> int:\n        return self.__dict__\n");
+        assert!(issues.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod magic_number_tests {
     use super::check_magic_numbers;
     use std::path::Path;
@@ -2663,6 +2799,31 @@ mod magic_number_tests {
         let issues = issues_for("def f():\n    do_thing(42)\n");
         assert_eq!(issues.len(), 1);
         assert!(issues[0].message.contains("42"));
+    }
+
+    #[test]
+    fn displays_octal_notation() {
+        // 0o600 and 384 parse to the identical int — the message must show
+        // the literal as written in source, not its decimal AST value, or
+        // "384" reads as an arbitrary number when it isn't.
+        let issues = issues_for("def f():\n    os.chmod(path, 0o600)\n");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("0o600"));
+        assert!(!issues[0].message.contains("384"));
+    }
+
+    #[test]
+    fn displays_hex_notation() {
+        let issues = issues_for("def f():\n    mask = 0x1F\n");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("0x1F"));
+    }
+
+    #[test]
+    fn displays_underscored_notation() {
+        let issues = issues_for("def f():\n    batch = 1_000\n");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("1_000"));
     }
 
     #[test]

@@ -414,7 +414,10 @@ fn severity_counts(issues: &[&Issue]) -> (usize, usize, usize) {
 
 fn render_text_report(filtered: &[&Issue], total: &ScanResult, workspace_root: Option<&Path>) {
     println!("{}", "=".repeat(config::BANNER_WIDTH));
-    println!("  SPAGHETTI CODE DETECTION REPORT (Rust port, Phase 1)");
+    println!(
+        "  SPAGHETTI CODE DETECTION REPORT (v{})",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("{}", "=".repeat(config::BANNER_WIDTH));
     println!();
     println!("  Files scanned:     {}", total.files_scanned);
