@@ -4,13 +4,13 @@ Spaghetti code and architectural-smell detector **for Python codebases**, implem
 
 This is a from-scratch reimplementation of [`spaghetti-detector`](https://github.com/lvalverdeb/spaghetti) (the Python original) — not a wrapper or FFI binding. It parses and scans Python source directly, with no Python runtime dependency, producing a single native binary you can drop into any CI image or pre-commit hook with nothing else installed. Scans workspace packages for anti-patterns, architectural violations, and structural code smells — from single-function issues (long functions, deep nesting, high cyclomatic complexity) up to whole-package issues that only show up once you can see across files: real circular imports (not just a parent/child heuristic), copy-pasted function bodies, and the sync/async "twin" duplication pattern (`load`/`aload`, `foo`/`foo_async`) where a fix applied to one twin silently never reaches the other.
 
-The [Python original](https://github.com/lvalverdeb/spaghetti) remains the actively maintained **spec of record**: when the two disagree, the Python behavior is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/spaghetti/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioral quirk (some quite subtle — e.g. `difflib.SequenceMatcher.ratio()`'s asymmetry under `autojunk`) uncovered and matched along the way.
+The [Python original](https://github.com/lvalverdeb/spaghetti) remains the actively maintained **spec of record**: when the two disagree, the Python behaviour is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/spaghetti/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioural quirk (some quite subtle — e.g. `difflib.SequenceMatcher.ratio()`'s asymmetry under `autojunk`) uncovered and matched along the way.
 
-**Status**: all 36 rules ported and verified — 674/674 issues identical to Python's own output across a real multi-package codebase, output is reproducible run-to-run, and `--plan` output is byte-for-byte identical to Python's.
+**Status**: all 39 rules ported and verified — 674/674 issues identical to Python's own output across a real multi-package codebase, output is reproducible run-to-run, and `--plan` output is byte-for-byte identical to Python's.
 
 ## Why It Exists
 
-AI-generated spaghetti code — often referred to as "slop code" — is extremely common because Large Language Models prioritize immediate functional completion (the "happy path") over long-term software architecture. It looks syntactically perfect and heavily commented, but often suffers from monolithic structures, copy-paste duplication, accidental complexity, and hallucinated dependencies. Human-written spaghetti code predates AI and has its own causes — tight deadlines, scope creep, skill gaps — but the fix is the same either way: mechanically-enforced rules that measure concrete thresholds instead of relying on review vibes.
+AI-generated spaghetti code — often referred to as "slop code" — is extremely common because Large Language Models prioritise immediate functional completion (the "happy path") over long-term software architecture. It looks syntactically perfect and heavily commented, but often suffers from monolithic structures, copy-paste duplication, accidental complexity, and hallucinated dependencies. Human-written spaghetti code predates AI and has its own causes — tight deadlines, scope creep, skill gaps — but the fix is the same either way: mechanically-enforced rules that measure concrete thresholds instead of relying on review vibes.
 
 ### Problem → Rule Mapping
 
@@ -35,7 +35,7 @@ This installs a binary named `spaghetti` (matching the Python CLI's command name
 
 ```bash
 spaghetti
-spaghetti --packages boti-data boti-dask
+spaghetti --packages package1 package2
 spaghetti --severity error
 spaghetti --top 10 --exclude tests/ examples/
 spaghetti --json > report.json
@@ -59,7 +59,7 @@ Exit codes: `0` (clean), `1` (warnings present), `2` (errors present) — safe t
 | `--exclude` | none | Path substrings to exclude from scanning |
 | `--min-duplicate-lines` | `5` | Minimum function length to consider for duplicate-body detection |
 | `--twin-similarity` | `0.6` | Minimum text-similarity ratio (0–1) to flag a sync/async twin pair |
-| `--plan` | off | Output a prioritized remediation plan instead of the standard report |
+| `--plan` | off | Output a prioritised remediation plan instead of the standard report |
 
 ## Inline suppression
 
@@ -74,7 +74,7 @@ x: dict = {}  # spaghetti-ignore: reviewed, no issue
 
 ## Rules
 
-All 36 rules from the Python original: 30 documented per-file AST checks, the (also-ported) undocumented `pass-through-method`, 2 source-text checks, 1 infrastructure check (`syntax-error`), and the 3 cross-file package checks (`import-cycle`, `duplicate-function-body`, `sync-async-duplication`). See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
+All 39 rules from the Python original: 31 per-file AST checks (including `pass-through-method`), 2 source-text checks, 1 infrastructure check (`syntax-error`), and 5 cross-file package checks (`import-cycle`, `high-coupling`, `orphan-interface`, `duplicate-function-body`, `sync-async-duplication`). A `low-cohesion` (LCOM4) check also exists in the codebase but is intentionally not enabled by default — see the rule's own doc comment for why. See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
 
 ## Development
 

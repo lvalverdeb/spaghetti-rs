@@ -101,6 +101,7 @@ fn fix_effort(rule: &str) -> f64 {
         "excessive-decorators" => 1.0,
         "pass-through-method" => 1.0,
         "orphan-interface" => 1.5,
+        "high-coupling" => 4.0,
         _ => 1.0,
     }
 }
@@ -281,4 +282,54 @@ pub fn plan_report(issues: &[&Issue], top: usize, workspace_root: Option<&Path>)
     }
 
     out
+}
+
+#[cfg(test)]
+mod priority_score_tests {
+    use super::compute_priority_score;
+    use crate::models::{Issue, Severity};
+    use std::path::PathBuf;
+
+    fn issue(severity: Severity, rule: &'static str) -> Issue {
+        Issue {
+            file: PathBuf::from("f.py"),
+            line: 1,
+            severity,
+            rule,
+            message: String::new(),
+            package: "pkg".to_string(),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn error_high_effort() {
+        // error=6.0 x effort=5.0 = 30.0
+        let score = compute_priority_score(&issue(Severity::Error, "import-cycle"));
+        assert_eq!(score, 30.0);
+    }
+
+    #[test]
+    fn warning_moderate_effort() {
+        // warning=1.5 x effort=2.5 = 3.75
+        let score = compute_priority_score(&issue(Severity::Warning, "long-function"));
+        assert_eq!(score, 3.75);
+    }
+
+    #[test]
+    fn info_trivial() {
+        // info=0.3 x effort=0.5 = 0.15
+        let score = compute_priority_score(&issue(Severity::Info, "dead-code"));
+        assert_eq!(score, 0.15);
+    }
+
+    #[test]
+    fn high_coupling_major_effort() {
+        // Regression test: high-coupling was missing from fix_effort
+        // entirely, silently falling back to the 1.0 (trivial) default —
+        // understating the real cost of splitting an overloaded hub module.
+        // warning=1.5 x effort=4.0 = 6.0
+        let score = compute_priority_score(&issue(Severity::Warning, "high-coupling"));
+        assert_eq!(score, 6.0);
+    }
 }
