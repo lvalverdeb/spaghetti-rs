@@ -1,8 +1,7 @@
-//! Package-wide configuration: workspace root, thresholds, package registry —
+//! Package-wide configuration: workspace root, thresholds, layer rules —
 //! mirrors `spaghetti/config.py`.
 
 use regex::Regex;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -30,21 +29,6 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
         candidate = dir.parent().map(PathBuf::from);
     }
     None
-}
-
-pub fn default_packages(workspace_root: Option<&Path>) -> BTreeMap<String, PathBuf> {
-    let Some(root) = workspace_root else {
-        return BTreeMap::new();
-    };
-    [
-        ("boti", "boti/src/boti"),
-        ("boti-data", "boti-data/src/boti_data"),
-        ("boti-dask", "boti-dask/src/boti_dask"),
-        ("spaghetti", "spaghetti/src/spaghetti"),
-    ]
-    .into_iter()
-    .map(|(name, rel)| (name.to_string(), root.join(rel)))
-    .collect()
 }
 
 /// The first allowed import prefix for `pkg` — mirrors

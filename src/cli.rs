@@ -246,14 +246,15 @@ struct JsonOutput {
 pub fn run(args: Args) -> i32 {
     let cwd = std::env::current_dir().expect("cwd");
     let workspace_root = config::find_workspace_root(&cwd);
-    let defaults = config::default_packages(workspace_root.as_deref());
 
     // A bare invocation (no --config, no --package) must never silently
-    // fall back to the workspace's built-in boti/boti-data/boti-dask
-    // registry — instead it auto-discovers whatever's actually under the
-    // current directory. --config/--package (in any combination) opt back
-    // into the explicit registry-resolution path below, unchanged. Mirrors
-    // `cli.py::main`'s equivalent branch.
+    // fall back to a hardcoded workspace-specific registry — instead it
+    // auto-discovers whatever's actually under the current directory.
+    // --config/--package (in any combination) opt back into the explicit
+    // registry-resolution path below, unchanged. There's no built-in
+    // default registry to fall back to in that path either (empty
+    // defaults) — a generic tool shouldn't assume it's running inside this
+    // particular monorepo. Mirrors `cli.py::main`'s equivalent branch.
     let mut run_exclude = args.exclude.clone();
     let mut non_recursive: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let registry = if args.config.is_none() && args.package_args.is_empty() {
@@ -264,7 +265,12 @@ pub fn run(args: Args) -> i32 {
         }
         discovered
     } else {
-        resolve_packages(args.config.as_deref(), &args.package_args, &defaults, &cwd)
+        resolve_packages(
+            args.config.as_deref(),
+            &args.package_args,
+            &BTreeMap::new(),
+            &cwd,
+        )
     };
     if registry.is_empty() {
         eprintln!("error: no packages to scan — the resolved package registry is empty");
