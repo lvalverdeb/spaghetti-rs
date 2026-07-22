@@ -178,7 +178,7 @@ pub fn check_missing_types(
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
-        if is_private(&func.name) || is_test_function(&func.name) {
+        if is_private(&func.name) || is_test_function(&func.name) || is_test_file(filepath) {
             continue;
         }
         let line = line_index.line_number(func.start);
@@ -1317,7 +1317,21 @@ pub fn check_excessive_decorators(
 // component, not a resolved import) that already make a class a
 // declarative data container — flagging them as "lazy" and suggesting
 // "@dataclass" is nonsensical since they already fulfill that exact role.
-const LAZY_CLASS_EXEMPT_BASE_NAMES: &[&str] = &["BaseModel", "BaseSettings", "NamedTuple"];
+// Protocol/Enum variants are a different reason for the same exemption: a
+// structural-typing interface's whole point is a low method count, and an
+// enum's members aren't methods at all — neither can be expressed as a
+// dataclass or plain function either.
+const LAZY_CLASS_EXEMPT_BASE_NAMES: &[&str] = &[
+    "BaseModel",
+    "BaseSettings",
+    "NamedTuple",
+    "Protocol",
+    "Enum",
+    "StrEnum",
+    "IntEnum",
+    "IntFlag",
+    "Flag",
+];
 
 // A base class named by the standard exception/warning naming convention
 // (PEP 8: "exception names should use the CapWords convention and the
@@ -1482,6 +1496,14 @@ const MAGIC_NUMBER_HTTP_STATUS_CODES: &[i32] = &[
 ];
 const MAGIC_NUMBER_WELL_KNOWN_PORTS: &[i32] = &[80, 443, 3306, 5432, 6379, 8080, 8200, 27017];
 
+// A file with this many *distinct* disallowed numeric literals reads as an
+// intentional parameter/threshold table (e.g. an FMR/FNMR bake-off script's
+// tuning constants) rather than incidental magic numbers creeping into
+// control flow — "many distinct numbers with no repeats" is itself the
+// signal, not any one value. Must stay numerically identical to Python's
+// `_MAGIC_NUMBER_DENSE_FILE_MIN_DISTINCT` in ast_per_file.py.
+const MAGIC_NUMBER_DENSE_FILE_MIN_DISTINCT: usize = 8;
+
 fn format_number_for_magic_check(c: &Constant) -> Option<(bool, String)> {
     match c {
         Constant::Int(i) => {
@@ -1521,6 +1543,7 @@ struct MagicNumberVisitor<'a> {
     filepath: &'a Path,
     package: &'a str,
     issues: Vec<Issue>,
+    distinct: HashSet<String>,
 }
 impl<'a> Visitor for MagicNumberVisitor<'a> {
     fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
@@ -1549,6 +1572,7 @@ impl<'a> Visitor for MagicNumberVisitor<'a> {
             && !allowed
         {
             let display = source_segment(self.source, node.range()).unwrap_or(&repr);
+            self.distinct.insert(display.to_string());
             self.issues.push(issue(
                 self.filepath,
                 self.line_index.line_number(node.range().start()),
@@ -1572,6 +1596,7 @@ pub fn check_magic_numbers(
 ) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
+    let mut distinct: HashSet<String> = HashSet::new();
     for func in collect_functions(module_body(module)) {
         if func.name == "__init__" {
             continue;
@@ -1582,9 +1607,14 @@ pub fn check_magic_numbers(
             filepath,
             package,
             issues: Vec::new(),
+            distinct: HashSet::new(),
         };
         visitor.visit_stmt(func.stmt.clone());
         issues.append(&mut visitor.issues);
+        distinct.extend(visitor.distinct);
+    }
+    if distinct.len() >= MAGIC_NUMBER_DENSE_FILE_MIN_DISTINCT {
+        return Vec::new();
     }
     issues
 }
@@ -2496,6 +2526,19 @@ mod god_module_tests {
         assert_eq!(issues.len(), 1);
         assert!(issues[0].message.contains("16 classes"));
     }
+
+    #[test]
+    fn ignores_protocol_and_enum_classes() {
+        let protocols: String = (0..10)
+            .map(|i| format!("class Proto{i}(Protocol):\n    def m(self) -> None: ...\n"))
+            .collect();
+        let enums: String = (0..10)
+            .map(|i| format!("class Enum{i}(StrEnum):\n    A = \"a\"\n"))
+            .collect();
+        let source = format!("{protocols}\n{enums}");
+        let issues = issues_for(&source);
+        assert!(issues.is_empty());
+    }
 }
 
 // ── Rule: Deep Inheritance ────────────────────────────────────────────────────
@@ -2619,7 +2662,12 @@ pub fn check_deep_inheritance(
 // gives the same answer `ast.walk` + `break` would.
 struct MessageChainVisitor {
     current_depth: usize,
-    candidates: Vec<(usize, i64, rustpython_ast::text_size::TextSize)>,
+    candidates: Vec<(
+        usize,
+        i64,
+        rustpython_ast::text_size::TextSize,
+        Option<String>,
+    )>,
 }
 
 fn chain_depth(expr: &Expr) -> i64 {
@@ -2630,11 +2678,27 @@ fn chain_depth(expr: &Expr) -> i64 {
     }
 }
 
+/// The bare name a chain bottoms out at, e.g. `PostgresContainer` for
+/// `PostgresContainer(...).with_bind_ports(...).start()` — None if the
+/// chain bottoms out at anything else (a Subscript, a Constant, ...).
+fn chain_root_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Call(c) => chain_root_name(&c.func),
+        Expr::Attribute(a) => chain_root_name(&a.value),
+        Expr::Name(n) => Some(n.id.to_string()),
+        _ => None,
+    }
+}
+
 impl MessageChainVisitor {
     fn record_if_candidate(&mut self, node: &Expr) {
         if matches!(node, Expr::Call(_) | Expr::Attribute(_)) {
-            self.candidates
-                .push((self.current_depth, chain_depth(node), node.range().start()));
+            self.candidates.push((
+                self.current_depth,
+                chain_depth(node),
+                node.range().start(),
+                chain_root_name(node),
+            ));
         }
     }
 }
@@ -2681,6 +2745,7 @@ pub fn check_message_chains(
 ) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
+    let imported = collect_imported_names(module);
 
     for stmt in module_body(module) {
         let mut visitor = MessageChainVisitor {
@@ -2690,11 +2755,12 @@ pub fn check_message_chains(
         visitor.visit_stmt(stmt.clone());
 
         // Stable sort by depth == BFS order (see block comment above).
-        visitor.candidates.sort_by_key(|(depth, _, _)| *depth);
-        if let Some((_, depth, pos)) = visitor
-            .candidates
-            .iter()
-            .find(|(_, chain_depth, _)| *chain_depth > crate::config::MAX_MESSAGE_CHAIN_DEPTH)
+        visitor.candidates.sort_by_key(|(depth, _, _, _)| *depth);
+        if let Some((_, depth, pos, _)) =
+            visitor.candidates.iter().find(|(_, chain_depth, _, root)| {
+                *chain_depth > crate::config::MAX_MESSAGE_CHAIN_DEPTH
+                    && !root.as_deref().is_some_and(|r| imported.contains_key(r))
+            })
         {
             issues.push(issue(
                 filepath,
@@ -2710,6 +2776,55 @@ pub fn check_message_chains(
         }
     }
     issues
+}
+
+#[cfg(test)]
+mod message_chain_tests {
+    use super::check_message_chains;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_message_chains(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_deep_chain() {
+        let issues = issues_for("def f():\n    a.b().c().d().e()\n");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "message-chain");
+        assert!(issues[0].message.contains("depth 4"));
+    }
+
+    #[test]
+    fn allows_short_chain() {
+        let issues = issues_for("def f():\n    a.b().c()\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_import_rooted_fluent_chain() {
+        // A fluent chain rooted directly in a call to an imported class
+        // (e.g. testcontainers' own builder API) reflects that library's
+        // shape, not a coupling problem this codebase's authors can
+        // address.
+        let issues = issues_for(
+            "from testcontainers.postgres import PostgresContainer\n\n\ndef f():\n    PostgresContainer('postgres:15').with_bind_ports(5432, 5432).with_env('a', 'b').with_exposed_ports(5432).start()\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_project_rooted_chain() {
+        // An import elsewhere in the file must not exempt a chain rooted in
+        // an unrelated, non-imported local/project object.
+        let issues = issues_for(
+            "from testcontainers.postgres import PostgresContainer\n\n\ndef f():\n    a.b().c().d().e()\n",
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "message-chain");
+    }
 }
 
 // ── Rule: Pass-Through Methods ───────────────────────────────────────────────
@@ -2934,13 +3049,33 @@ mod missing_types_tests {
 
     #[test]
     fn still_flags_test_file_helper_functions() {
-        // A non-test_-prefixed helper inside a test file (e.g. helpers.py)
-        // must stay checked — only the bare test_* functions are exempt.
+        // A bare "helpers.py" (no tests/ parent, not conftest.py) isn't
+        // recognized as a test path at all, so it stays fully checked —
+        // this is the "not a test file" baseline, distinct from the tests
+        // below.
         let issues = issues_for(
             "def create_consented_subject(db):\n    pass\n",
             "helpers.py",
         );
         assert_eq!(issues.len(), 2); // missing-return-type + missing-param-type
+    }
+
+    #[test]
+    fn skips_pytest_fixture_in_conftest() {
+        let issues = issues_for(
+            "@pytest.fixture\ndef db_session():\n    yield session\n",
+            "conftest.py",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn skips_helper_in_tests_directory() {
+        let issues = issues_for(
+            "def create_consented_subject(db):\n    pass\n",
+            "tests/helpers.py",
+        );
+        assert!(issues.is_empty());
     }
 }
 
@@ -3319,6 +3454,28 @@ mod magic_number_tests {
         assert_eq!(issues.len(), 1);
         assert!(issues[0].message.contains("42"));
     }
+
+    #[test]
+    fn skips_dense_tuning_file() {
+        // A file with many distinct, non-repeating literals reads as an
+        // intentional parameter table (e.g. an FMR/FNMR bake-off script),
+        // not a smell — the density itself is the signal.
+        let values = ["2", "5", "1.2", "10", "70", "0.05", "20", "34", "0.36"];
+        let body: String = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("    v{i} = {v}\n"))
+            .collect();
+        let source = format!("def bakeoff():\n{body}");
+        let issues = issues_for(&source);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_sparse_file() {
+        let issues = issues_for("def f():\n    a = 47\n    b = 91\n");
+        assert_eq!(issues.len(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -3515,6 +3672,22 @@ mod lazy_class_tests {
     #[test]
     fn allows_named_tuple_qualified() {
         let issues = issues_for("class C(typing.NamedTuple):\n    x: int\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_protocol_class() {
+        let issues = issues_for(
+            "class LivenessChecker(Protocol):\n    def check(self, image_bgr: np.ndarray) -> LivenessResult: ...\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_str_enum_class() {
+        let issues = issues_for(
+            "class ConsentStatus(StrEnum):\n    ACTIVE = \"active\"\n    REVOKED = \"revoked\"\n",
+        );
         assert!(issues.is_empty());
     }
 
