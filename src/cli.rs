@@ -240,8 +240,12 @@ struct JsonIgnoredIssue {
 struct JsonOutput {
     issues: Vec<JsonIssue>,
     suppressed: usize,
+    suppression_help: &'static str,
     ignored: Vec<JsonIgnoredIssue>,
 }
+
+const SUPPRESSION_HELP: &str = "Silence a confirmed non-issue by adding \
+'# spaghetti-ignore[rule-name]: reason' on the flagged line (or the line above).";
 
 pub fn run(args: Args) -> i32 {
     let cwd = std::env::current_dir().expect("cwd");
@@ -372,6 +376,7 @@ pub fn run(args: Args) -> i32 {
                 })
                 .collect(),
             suppressed: total.suppressed,
+            suppression_help: SUPPRESSION_HELP,
             ignored: total
                 .ignored
                 .iter()
@@ -438,6 +443,12 @@ fn render_text_report(filtered: &[&Issue], total: &ScanResult, workspace_root: O
         println!(
             "  Suppressed:        {} (inline spaghetti-ignore markers)",
             total.suppressed
+        );
+    }
+    if !filtered.is_empty() {
+        println!(
+            "  Silence a confirmed non-issue: add \
+             '# spaghetti-ignore[rule-name]: reason' on the flagged line (or the line above)."
         );
     }
     println!();

@@ -510,3 +510,25 @@ pub fn count_own_returns(func: &FuncNode) -> i64 {
 pub fn is_private(name: &str) -> bool {
     name.starts_with('_')
 }
+
+/// Mirrors `ast_helpers.py::_is_test_function`. True for a pytest test
+/// function's own name (`test_*`), not a test *file*'s helper functions —
+/// `create_consented_subject` in a test file should still be checked, only
+/// the bare `test_*` functions and their fixture-injected parameters are
+/// pytest-convention boilerplate.
+pub fn is_test_function(name: &str) -> bool {
+    name.starts_with("test_")
+}
+
+/// Mirrors `ast_helpers.py::_is_test_file`. True for a pytest test module:
+/// `test_*.py`/`*_test.py`, `conftest.py`, or anything under a directory
+/// literally named `tests`.
+pub fn is_test_file(filepath: &std::path::Path) -> bool {
+    let name = filepath.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "conftest.py" || name.starts_with("test_") || name.ends_with("_test.py") {
+        return true;
+    }
+    filepath
+        .parent()
+        .is_some_and(|parent| parent.components().any(|c| c.as_os_str() == "tests"))
+}

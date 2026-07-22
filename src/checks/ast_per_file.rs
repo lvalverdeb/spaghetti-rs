@@ -14,8 +14,8 @@
 
 use crate::ast_helpers::{
     FuncNode, LineIndex, collect_functions, count_own_returns, cyclomatic_complexity, dump_stmts,
-    is_private, line_count, nesting_depth, walk_arguments_children, walk_comprehension_children,
-    walk_keyword_children, walk_withitem_children,
+    is_private, is_test_file, is_test_function, line_count, nesting_depth, walk_arguments_children,
+    walk_comprehension_children, walk_keyword_children, walk_withitem_children,
 };
 use crate::config::{
     COMPLEXITY_THRESHOLD, ERROR_ESCALATION_MULTIPLIER, MAX_CLASS_ATTRS, MAX_CLASS_METHODS,
@@ -135,7 +135,7 @@ pub fn check_missing_types(
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
-        if is_private(&func.name) {
+        if is_private(&func.name) || is_test_function(&func.name) {
             continue;
         }
         let line = line_index.line_number(func.start);
@@ -854,12 +854,34 @@ pub fn check_global_mutations(
 struct OwnScopeCollector {
     global_names: HashSet<String>,
     nonlocal_names: HashSet<String>,
-    assignments: Vec<(String, TextSizeShim)>,
+    // (name, position, is_lazy_singleton_init)
+    assignments: Vec<(String, TextSizeShim, bool)>,
 }
 
 // Local newtype so this file doesn't need to import rustpython's TextSize
 // directly just for this one field's type name in a doc-adjacent struct.
 type TextSizeShim = rustpython_ast::text_size::TextSize;
+
+/// `<name> is None` — the target of a lazy-singleton-init guard, if `test`
+/// has that exact shape.
+fn none_guard_target(test: &Expr) -> Option<&str> {
+    let Expr::Compare(cmp) = test else {
+        return None;
+    };
+    let Expr::Name(left) = cmp.left.as_ref() else {
+        return None;
+    };
+    if cmp.ops.len() != 1 || cmp.ops[0] != rustpython_ast::CmpOp::Is {
+        return None;
+    }
+    if cmp.comparators.len() != 1 {
+        return None;
+    }
+    match &cmp.comparators[0] {
+        Expr::Constant(c) if matches!(c.value, Constant::None) => Some(left.id.as_str()),
+        _ => None,
+    }
+}
 
 impl Visitor for OwnScopeCollector {
     fn visit_stmt_function_def(&mut self, _node: rustpython_ast::StmtFunctionDef) {}
@@ -877,7 +899,7 @@ impl Visitor for OwnScopeCollector {
         for t in &node.targets {
             if let Expr::Name(n) = t {
                 self.assignments
-                    .push((n.id.to_string(), node.range().start()));
+                    .push((n.id.to_string(), node.range().start(), false));
             }
         }
         self.generic_visit_stmt_assign(node);
@@ -885,9 +907,47 @@ impl Visitor for OwnScopeCollector {
     fn visit_stmt_aug_assign(&mut self, node: rustpython_ast::StmtAugAssign) {
         if let Expr::Name(n) = node.target.as_ref() {
             self.assignments
-                .push((n.id.to_string(), node.range().start()));
+                .push((n.id.to_string(), node.range().start(), false));
         }
         self.generic_visit_stmt_aug_assign(node);
+    }
+    // Mirrors Python's `_is_lazy_singleton_init`: an assignment/aug-assign
+    // that sits *directly* in an `if <name> is None:` guard's body (not
+    // merely nested somewhere inside it — matching Python's exact
+    // `mutation in node.body` list-membership check) is the standard
+    // lazy-init idiom, not unconstrained global mutation.
+    fn visit_stmt_if(&mut self, node: rustpython_ast::StmtIf) {
+        let Some(guarded_name) = none_guard_target(&node.test) else {
+            self.generic_visit_stmt_if(node);
+            return;
+        };
+        for stmt in &node.body {
+            match stmt {
+                Stmt::Assign(a) => {
+                    for t in &a.targets {
+                        if let Expr::Name(n) = t {
+                            let is_guarded = n.id.as_str() == guarded_name;
+                            self.assignments.push((
+                                n.id.to_string(),
+                                a.range().start(),
+                                is_guarded,
+                            ));
+                        }
+                    }
+                }
+                Stmt::AugAssign(a) => {
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        let is_guarded = n.id.as_str() == guarded_name;
+                        self.assignments
+                            .push((n.id.to_string(), a.range().start(), is_guarded));
+                    }
+                }
+                other => self.visit_stmt(other.clone()),
+            }
+        }
+        for stmt in &node.orelse {
+            self.visit_stmt(stmt.clone());
+        }
     }
 }
 
@@ -912,10 +972,13 @@ pub fn check_scope_mutations(
         if outer_names.is_empty() {
             continue;
         }
-        if let Some((target_name, pos)) = collector
-            .assignments
-            .iter()
-            .find(|(name, _)| outer_names.contains(name))
+        if let Some((target_name, pos, _)) =
+            collector
+                .assignments
+                .iter()
+                .find(|(name, _, is_lazy_singleton_init)| {
+                    outer_names.contains(name) && !is_lazy_singleton_init
+                })
         {
             let mut declared_by = Vec::new();
             if collector.global_names.contains(target_name) {
@@ -940,6 +1003,61 @@ pub fn check_scope_mutations(
         }
     }
     issues
+}
+
+#[cfg(test)]
+mod scope_mutation_tests {
+    use super::check_scope_mutations;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_scope_mutations(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_global_assign() {
+        let issues = issues_for(
+            "config = {}\ndef reload() -> None:\n    global config\n    config = load_config()\n",
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "scope-mutation");
+    }
+
+    #[test]
+    fn skips_read_only() {
+        let issues =
+            issues_for("counter = 0\ndef read() -> int:\n    global counter\n    return counter\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn skips_lazy_singleton_init() {
+        let issues = issues_for(
+            "_pipeline = None\ndef get_pipeline():\n    global _pipeline\n    if _pipeline is None:\n        _pipeline = load_pipeline()\n    return _pipeline\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_unconditional_mutation() {
+        // Sanity check: the lazy-init exemption must not swallow genuine
+        // hits — a mutation with no `is None` guard at all is still flagged.
+        let issues = issues_for(
+            "_pipeline = None\ndef reset_pipeline() -> None:\n    global _pipeline\n    _pipeline = load_pipeline()\n",
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn still_flags_mutation_guarded_by_different_condition() {
+        // The guard must test *this* variable specifically, not just any if.
+        let issues = issues_for(
+            "_cache = None\ndef refresh(force):\n    global _cache\n    if force:\n        _cache = reload()\n",
+        );
+        assert_eq!(issues.len(), 1);
+    }
 }
 
 // ── Rule: Dead Code ───────────────────────────────────────────────────────────
@@ -1144,12 +1262,63 @@ fn decorator_target_name(dec: &Expr) -> Option<String> {
     }
 }
 
+/// The bare name a `Mapped[...]`/`mapped_column(...)`/`Column(...)`
+/// reference resolves to, whether written directly or qualified
+/// (`orm.Mapped`, `sa.Column`).
+fn lazy_class_attr_target_name(node: &Expr) -> Option<String> {
+    match node {
+        Expr::Name(n) => Some(n.id.to_string()),
+        Expr::Attribute(a) => Some(a.attr.to_string()),
+        _ => None,
+    }
+}
+
+/// True for a `Mapped[...]` annotation (SQLAlchemy 2.0 typed declarative).
+fn is_mapped_annotation(annotation: &Expr) -> bool {
+    let target = match annotation {
+        Expr::Subscript(s) => s.value.as_ref(),
+        other => other,
+    };
+    lazy_class_attr_target_name(target).as_deref() == Some("Mapped")
+}
+
+/// True for a `mapped_column(...)`/`Column(...)` call (SQLAlchemy 2.0
+/// untyped declarative, or legacy 1.x Declarative style).
+fn is_orm_column_call(value: Option<&Expr>) -> bool {
+    let Some(Expr::Call(call)) = value else {
+        return false;
+    };
+    matches!(
+        lazy_class_attr_target_name(&call.func).as_deref(),
+        Some("mapped_column") | Some("Column")
+    )
+}
+
+/// True if `node` has at least one SQLAlchemy declarative column attribute.
+/// This is what actually makes a class an ORM model — a project's own
+/// declarative `Base` can be named anything, so matching by base-class name
+/// (like `is_lazy_class_exempt`'s other checks) would be guesswork; the
+/// column declarations are the unambiguous signal.
+fn lazy_class_has_orm_columns(node: &rustpython_ast::StmtClassDef) -> bool {
+    node.body.iter().any(|stmt| match stmt {
+        Stmt::AnnAssign(a) => {
+            is_mapped_annotation(&a.annotation) || is_orm_column_call(a.value.as_deref())
+        }
+        Stmt::Assign(a) => is_orm_column_call(Some(&a.value)),
+        _ => false,
+    })
+}
+
 /// True if `node` already is a declarative data container (a pydantic
-/// BaseModel/BaseSettings subclass, or a @dataclass-decorated class — these
+/// BaseModel/BaseSettings subclass, a SQLAlchemy declarative model — see
+/// `lazy_class_has_orm_columns` — or a @dataclass-decorated class — these
 /// already satisfy check_lazy_class's own suggested remedy) or a raise-able
 /// exception/warning type (the remedy itself isn't raise-able, so it
 /// doesn't apply). Never flagged regardless of method count.
 fn is_lazy_class_exempt(node: &rustpython_ast::StmtClassDef) -> bool {
+    if lazy_class_has_orm_columns(node) {
+        return true;
+    }
     if base_names(&node.bases).iter().any(|b| {
         LAZY_CLASS_EXEMPT_BASE_NAMES.contains(&b.as_str())
             || LAZY_CLASS_EXEMPT_BASE_SUFFIXES
@@ -1221,10 +1390,31 @@ pub fn check_lazy_class(module: &Mod, source: &str, filepath: &Path, package: &s
 // already always "allowed" there; the two implementations just reach that
 // same answer via different type systems.
 
+// Standard HTTP status codes and well-known infra ports: as conventionally
+// idiomatic as -1/0/1 (every reader recognizes 404 or 5432 instantly; naming
+// them buys nothing over the literal), so allowed unconditionally rather than
+// only when compared against e.g. `.status_code` — matching how -1/0/1 are
+// already allowed everywhere, not just in specific contexts. Must stay
+// numerically identical to Python's `_MAGIC_NUMBER_HTTP_STATUS_CODES`/
+// `_MAGIC_NUMBER_WELL_KNOWN_PORTS` in ast_per_file.py.
+const MAGIC_NUMBER_HTTP_STATUS_CODES: &[i32] = &[
+    100, 101, 200, 201, 202, 204, 301, 302, 304, 400, 401, 403, 404, 405, 409, 410, 422, 429, 500,
+    502, 503, 504,
+];
+const MAGIC_NUMBER_WELL_KNOWN_PORTS: &[i32] = &[80, 443, 3306, 5432, 6379, 8080, 8200, 27017];
+
 fn format_number_for_magic_check(c: &Constant) -> Option<(bool, String)> {
     match c {
         Constant::Int(i) => {
-            let allowed = *i == (-1).into() || *i == 0.into() || *i == 1.into();
+            let allowed = *i == (-1).into()
+                || *i == 0.into()
+                || *i == 1.into()
+                || MAGIC_NUMBER_HTTP_STATUS_CODES
+                    .iter()
+                    .any(|&n| *i == n.into())
+                || MAGIC_NUMBER_WELL_KNOWN_PORTS
+                    .iter()
+                    .any(|&n| *i == n.into());
             Some((allowed, i.to_string()))
         }
         Constant::Float(f) => {
@@ -1435,12 +1625,18 @@ impl Visitor for MagicStringVisitor {
     }
 }
 
+/// Skipped entirely for test files: a value compared twice in one test
+/// function is normal arrange-then-assert structure, not a sign of a
+/// missing domain concept.
 pub fn check_magic_strings(
     module: &Mod,
     source: &str,
     filepath: &Path,
     package: &str,
 ) -> Vec<Issue> {
+    if is_test_file(filepath) {
+        return Vec::new();
+    }
     let line_index = LineIndex::new(source);
     let mut visitor = MagicStringVisitor::default();
     for stmt in module_body(module) {
@@ -2555,6 +2751,65 @@ pub type PkgRootCheck = fn(&Mod, &str, &Path, &str, &Path) -> Vec<Issue>;
 pub const PKG_ROOT_CHECKS: &[PkgRootCheck] = &[check_layer_violations, check_circular_imports];
 
 #[cfg(test)]
+mod missing_types_tests {
+    use super::check_missing_types;
+    use std::path::Path;
+
+    fn issues_for(source: &str, filepath: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_missing_types(&module, source, Path::new(filepath), "pkg")
+    }
+
+    #[test]
+    fn flags_return_type() {
+        let issues = issues_for("def no_return_type(x: int):\n    return x\n", "f.py");
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.rule == "missing-return-type")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn flags_param_type() {
+        let issues = issues_for("def no_param_type(x) -> int:\n    return x\n", "f.py");
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.rule == "missing-param-type")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn skips_test_functions_and_fixture_params() {
+        // def test_*(...) is exempt entirely — both the bare `-> None`
+        // return type and fixture-injected params (`client`) pytest
+        // supplies itself.
+        let issues = issues_for(
+            "def test_enroll_blocked_without_consent(client):\n    pass\n",
+            "f.py",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_test_file_helper_functions() {
+        // A non-test_-prefixed helper inside a test file (e.g. helpers.py)
+        // must stay checked — only the bare test_* functions are exempt.
+        let issues = issues_for(
+            "def create_consented_subject(db):\n    pass\n",
+            "helpers.py",
+        );
+        assert_eq!(issues.len(), 2); // missing-return-type + missing-param-type
+    }
+}
+
+#[cfg(test)]
 mod missing_else_tests {
     use super::check_missing_else;
     use std::path::Path;
@@ -2847,6 +3102,25 @@ mod magic_number_tests {
     }
 
     #[test]
+    fn allows_http_status_codes() {
+        let issues = issues_for("def f():\n    assert response.status_code == 404\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_well_known_ports() {
+        let issues = issues_for("def f():\n    connect(host, 5432)\n    connect(host, 6379)\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_unrelated_number_outside_allowlist() {
+        let issues = issues_for("def f():\n    retry_after = 47\n");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("47"));
+    }
+
+    #[test]
     fn skips_init() {
         let issues = issues_for("class C:\n    def __init__(self):\n        self.x = 42\n");
         assert!(issues.is_empty());
@@ -2918,9 +3192,13 @@ mod magic_string_tests {
     use std::path::Path;
 
     fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        issues_for_path(source, "f.py")
+    }
+
+    fn issues_for_path(source: &str, filepath: &str) -> Vec<crate::models::Issue> {
         let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
             .expect("test source must parse");
-        check_magic_strings(&module, source, Path::new("f.py"), "pkg")
+        check_magic_strings(&module, source, Path::new(filepath), "pkg")
     }
 
     #[test]
@@ -3011,6 +3289,34 @@ mod magic_string_tests {
         );
         assert_eq!(issues.len(), 2);
     }
+
+    #[test]
+    fn skips_test_files() {
+        let issues = issues_for_path(
+            "def test_kms_round_trip():\n    assert plaintext == 'sensitive-employee-id'\n    \
+             assert decrypted == 'sensitive-employee-id'\n",
+            "test_kms.py",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn skips_conftest() {
+        let issues = issues_for_path(
+            "def f():\n    if a == 'x':\n        pass\n    if b == 'x':\n        pass\n",
+            "conftest.py",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn skips_files_under_tests_directory() {
+        let issues = issues_for_path(
+            "def f():\n    if a == 'x':\n        pass\n    if b == 'x':\n        pass\n",
+            "tests/helpers.py",
+        );
+        assert!(issues.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -3086,6 +3392,31 @@ mod lazy_class_tests {
     #[test]
     fn allows_dataclass_decorator_with_args() {
         let issues = issues_for("@dataclass(frozen=True)\nclass C:\n    x: int = 1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_sqlalchemy_mapped_annotation() {
+        // A project's own declarative Base can be named anything, so this
+        // must be recognized by column shape, not by base-class name.
+        let issues = issues_for(
+            "class Subject(Base):\n    id: Mapped[int] = mapped_column(primary_key=True)\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_sqlalchemy_mapped_qualified() {
+        let issues = issues_for(
+            "class Subject(Base):\n    id: orm.Mapped[int] = orm.mapped_column(primary_key=True)\n",
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_legacy_sqlalchemy_column() {
+        let issues =
+            issues_for("class Subject(Base):\n    id = Column(Integer, primary_key=True)\n");
         assert!(issues.is_empty());
     }
 
