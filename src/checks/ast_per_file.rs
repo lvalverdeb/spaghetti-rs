@@ -13,15 +13,16 @@
 //! (see §7.6/§10 of the proposal).
 
 use crate::ast_helpers::{
-    FuncNode, LineIndex, collect_functions, count_own_returns, cyclomatic_complexity, dump_stmts,
-    is_private, is_test_file, is_test_function, line_count, nesting_depth, walk_arguments_children,
-    walk_comprehension_children, walk_keyword_children, walk_withitem_children,
+    FuncNode, LineIndex, collect_functions, count_nested_returns, cyclomatic_complexity,
+    dump_stmts, is_private, is_test_file, is_test_function, line_count, nesting_depth,
+    walk_arguments_children, walk_comprehension_children, walk_keyword_children,
+    walk_withitem_children,
 };
 use crate::config::{
-    COMPLEXITY_THRESHOLD, ERROR_ESCALATION_MULTIPLIER, MAX_CLASS_ATTRS, MAX_CLASS_METHODS,
-    MAX_CLASS_WMC, MAX_DECORATORS, MAX_FUNC_PARAMS, MAX_FUNCTION_LINES, MAX_INHERITANCE_DEPTH,
-    MAX_NESTING_DEPTH, MAX_PUBLIC_SYMBOLS, MAX_RETURNS, MIN_BOOLEAN_FLAGS, MIN_CLASS_METHODS,
-    is_dunder, layer_rules,
+    COMPLEXITY_THRESHOLD, ERROR_ESCALATION_MULTIPLIER, LONG_FUNCTION_FLAT_NESTING_MAX,
+    MAX_CLASS_ATTRS, MAX_CLASS_METHODS, MAX_CLASS_WMC, MAX_DECORATORS, MAX_FUNC_PARAMS,
+    MAX_FUNCTION_LINES, MAX_INHERITANCE_DEPTH, MAX_NESTING_DEPTH, MAX_PUBLIC_SYMBOLS, MAX_RETURNS,
+    MIN_BOOLEAN_FLAGS, MIN_CLASS_METHODS, is_dunder, layer_rules,
 };
 use crate::models::{Issue, Severity};
 use rustpython_ast::{Arguments, Constant, Expr, Mod, Ranged, Stmt, Visitor};
@@ -66,7 +67,7 @@ pub fn check_long_functions(
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
         let lines = line_count(&line_index, func.start, func.end());
-        if lines > MAX_FUNCTION_LINES {
+        if lines > MAX_FUNCTION_LINES && nesting_depth(&func) > LONG_FUNCTION_FLAT_NESTING_MAX {
             issues.push(issue(
                 filepath,
                 line_index.line_number(func.start),
@@ -82,6 +83,48 @@ pub fn check_long_functions(
         }
     }
     issues
+}
+
+#[cfg(test)]
+mod long_function_tests {
+    use super::check_long_functions;
+    use crate::config::MAX_FUNCTION_LINES;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_long_functions(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_over_threshold() {
+        let body: String = (0..MAX_FUNCTION_LINES + 5)
+            .map(|i| format!("                x{i} = {i}\n"))
+            .collect();
+        let source = format!(
+            "def long_func():\n    if True:\n        if True:\n            if True:\n{body}    return x0\n"
+        );
+        let issues = issues_for(&source);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "long-function");
+    }
+
+    #[test]
+    fn ignores_short_function() {
+        let issues = issues_for("def short_func():\n    return 1\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_long_but_flat_function() {
+        let body: String = (0..MAX_FUNCTION_LINES + 5)
+            .map(|i| format!("    x{i} = {i}\n"))
+            .collect();
+        let source = format!("def long_flat_func():\n{body}    return x0\n");
+        let issues = issues_for(&source);
+        assert!(issues.is_empty());
+    }
 }
 
 /// Mirrors `detector.py::scan_package`'s `functions_scanned` counter.
@@ -221,7 +264,7 @@ pub fn check_excessive_returns(
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
-        let n = count_own_returns(&func);
+        let n = count_nested_returns(&func);
         if n > MAX_RETURNS as i64 {
             issues.push(issue(
                 filepath,
@@ -230,14 +273,50 @@ pub fn check_excessive_returns(
                 "excessive-returns",
                 package,
                 format!(
-                    "{}() has {n} return statements (max {MAX_RETURNS}) — consider a Return \
-                     Object bundling the result and building it up to a single return",
+                    "{}() has {n} nested return statements (max {MAX_RETURNS}) — consider a \
+                     Return Object bundling the result and building it up to a single return",
                     func.name
                 ),
             ));
         }
     }
     issues
+}
+
+#[cfg(test)]
+mod excessive_returns_tests {
+    use super::check_excessive_returns;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_excessive_returns(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_many_nested() {
+        let issues = issues_for(
+            "def func(x: int) -> int:\n    if x == 1:\n        if True:\n            return 1\n    if x == 2:\n        if True:\n            return 2\n    if x == 3:\n        if True:\n            return 3\n    if x == 4:\n        if True:\n            return 4\n    return 0\n",
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "excessive-returns");
+    }
+
+    #[test]
+    fn clean() {
+        let issues =
+            issues_for("def func(x: int) -> int:\n    if x > 0:\n        return 1\n    return 0\n");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_flat_guard_clauses() {
+        let issues = issues_for(
+            "def func(x: int) -> int:\n    if x == 1:\n        return 1\n    if x == 2:\n        return 2\n    if x == 3:\n        return 3\n    if x == 4:\n        return 4\n    return 0\n",
+        );
+        assert!(issues.is_empty());
+    }
 }
 
 // ── Rule: Boolean Flag Parameters ────────────────────────────────────────────
@@ -2340,7 +2419,9 @@ pub fn check_god_module(module: &Mod, _source: &str, filepath: &Path, package: &
     let mut public_funcs = 0;
     for stmt in module_body(module) {
         match stmt {
-            Stmt::ClassDef(c) if !c.name.starts_with('_') => public_classes += 1,
+            Stmt::ClassDef(c) if !c.name.starts_with('_') && !is_lazy_class_exempt(c) => {
+                public_classes += 1
+            }
             Stmt::FunctionDef(f) if !f.name.starts_with('_') => public_funcs += 1,
             Stmt::AsyncFunctionDef(f) if !f.name.starts_with('_') => public_funcs += 1,
             _ => {}
@@ -2360,6 +2441,60 @@ pub fn check_god_module(module: &Mod, _source: &str, filepath: &Path, package: &
         )]
     } else {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod god_module_tests {
+    use super::check_god_module;
+    use std::path::Path;
+
+    fn issues_for(source: &str) -> Vec<crate::models::Issue> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check_god_module(&module, source, Path::new("f.py"), "pkg")
+    }
+
+    #[test]
+    fn flags_many_symbols() {
+        let funcs: String = (0..16)
+            .map(|i| format!("def func{i}() -> None: pass\n"))
+            .collect();
+        let issues = issues_for(&funcs);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].rule, "god-module");
+    }
+
+    #[test]
+    fn clean() {
+        let funcs: String = (0..10)
+            .map(|i| format!("def func{i}() -> None: pass\n"))
+            .collect();
+        let issues = issues_for(&funcs);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignores_dto_classes() {
+        let classes: String = (0..20)
+            .map(|i| format!("class Dto{i}(BaseModel):\n    pass\n"))
+            .collect();
+        let issues = issues_for(&classes);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn still_flags_mixed_module() {
+        let real_classes: String = (0..16)
+            .map(|i| format!("class Real{i}:\n    def m(self) -> None: pass\n"))
+            .collect();
+        let dtos: String = (0..5)
+            .map(|i| format!("class Dto{i}(BaseModel):\n    pass\n"))
+            .collect();
+        let source = format!("{real_classes}\n{dtos}");
+        let issues = issues_for(&source);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("16 classes"));
     }
 }
 

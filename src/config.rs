@@ -52,6 +52,11 @@ pub const MAX_FILE_LINES: usize = 400;
 pub const MAX_FUNC_PARAMS: usize = 6;
 pub const MAX_RETURNS: usize = 3;
 pub const MAX_NESTING_DEPTH: usize = 5;
+// A long function whose nesting stays this shallow or shallower (a couple of
+// single-level guard clauses) reads as a flat, linear sequence, not something
+// Extract Method reliably improves — distinct from MAX_NESTING_DEPTH, which
+// is deep-nesting's own, much higher threshold for a different rule.
+pub const LONG_FUNCTION_FLAT_NESTING_MAX: usize = 2;
 pub const COMPLEXITY_THRESHOLD: usize = 10;
 pub const MIN_BOOLEAN_FLAGS: usize = 3;
 pub const MAX_DECORATORS: usize = 3;

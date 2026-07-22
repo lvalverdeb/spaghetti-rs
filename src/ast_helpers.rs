@@ -471,22 +471,52 @@ pub fn nesting_depth(func: &FuncNode) -> usize {
     visitor.max_depth
 }
 
-// ── Own return-statement count ───────────────────────────────────────────────
+// ── Nested return-statement count ───────────────────────────────────────────
 //
-// Mirrors `ast_helpers.py::_count_own_returns`: unlike complexity/nesting
-// above, this one *does* stop at nested function/lambda boundaries — Python
-// does so explicitly (`if isinstance(child, (FunctionDef, AsyncFunctionDef,
-// Lambda)): continue`). Calling the *generic* visit method directly on the
-// outer node (bypassing the no-op override below, which exists only to stop
-// descent into *nested* defs found while walking) reproduces that: the outer
-// function's own body is still processed normally.
-struct OwnReturnsVisitor {
+// Mirrors `ast_helpers.py::_count_nested_returns`: combines
+// NestingDepthVisitor's depth-tracking `descend()` with the nested
+// def/lambda stop condition previously used by `count_own_returns` — a
+// `Return` only counts when it occurs at depth >= 2, and returns inside a
+// nested function/lambda don't count at all.
+struct NestedReturnsVisitor {
+    current: usize,
     count: i64,
 }
 
-impl Visitor for OwnReturnsVisitor {
+impl NestedReturnsVisitor {
+    fn descend(&mut self, f: impl FnOnce(&mut Self)) {
+        self.current += 1;
+        f(self);
+        self.current -= 1;
+    }
+}
+
+impl Visitor for NestedReturnsVisitor {
+    fn visit_stmt_if(&mut self, node: StmtIf) {
+        self.descend(|v| v.generic_visit_stmt_if(node));
+    }
+    fn visit_stmt_while(&mut self, node: StmtWhile) {
+        self.descend(|v| v.generic_visit_stmt_while(node));
+    }
+    fn visit_stmt_for(&mut self, node: StmtFor) {
+        self.descend(|v| v.generic_visit_stmt_for(node));
+    }
+    fn visit_stmt_async_for(&mut self, node: StmtAsyncFor) {
+        self.descend(|v| v.generic_visit_stmt_async_for(node));
+    }
+    fn visit_stmt_with(&mut self, node: StmtWith) {
+        self.descend(|v| v.generic_visit_stmt_with(node));
+    }
+    fn visit_stmt_try(&mut self, node: StmtTry) {
+        self.descend(|v| v.generic_visit_stmt_try(node));
+    }
+    fn visit_excepthandler_except_handler(&mut self, node: ExceptHandlerExceptHandler) {
+        self.descend(|v| v.generic_visit_excepthandler_except_handler(node));
+    }
     fn visit_stmt_return(&mut self, node: rustpython_ast::StmtReturn) {
-        self.count += 1;
+        if self.current >= 2 {
+            self.count += 1;
+        }
         self.generic_visit_stmt_return(node);
     }
     fn visit_stmt_function_def(&mut self, _node: StmtFunctionDef) {}
@@ -494,8 +524,11 @@ impl Visitor for OwnReturnsVisitor {
     fn visit_expr_lambda(&mut self, _node: rustpython_ast::ExprLambda) {}
 }
 
-pub fn count_own_returns(func: &FuncNode) -> i64 {
-    let mut visitor = OwnReturnsVisitor { count: 0 };
+pub fn count_nested_returns(func: &FuncNode) -> i64 {
+    let mut visitor = NestedReturnsVisitor {
+        current: 0,
+        count: 0,
+    };
     match &func.stmt {
         Stmt::FunctionDef(n) => visitor.generic_visit_stmt_function_def(n.clone()),
         Stmt::AsyncFunctionDef(n) => visitor.generic_visit_stmt_async_function_def(n.clone()),
