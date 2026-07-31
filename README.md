@@ -42,6 +42,7 @@ spaghetti --json > report.json
 spaghetti --plan --top 10
 spaghetti --config spaghetti.yaml
 spaghetti --package my-lib=my-lib/src/my_lib
+spaghetti -q
 ```
 
 Exit codes: `0` (clean), `1` (warnings present), `2` (errors present) — safe to wire into CI as a gate.
@@ -55,11 +56,13 @@ Exit codes: `0` (clean), `1` (warnings present), `2` (errors present) — safe t
 | `--packages` | all resolved packages | Names to scan from the resolved registry |
 | `--severity` | `info` | Minimum severity to display (`info` / `warning` / `error`) |
 | `--json` | off | Output as JSON instead of the console report |
+| `--quiet` / `-q` | off | Suppress the report banner (text-report mode only; `--json` is unaffected) |
 | `--top` | `5` | Number of worst files/rules to list |
 | `--exclude` | none | Path substrings to exclude from scanning |
 | `--min-duplicate-lines` | `5` | Minimum function length to consider for duplicate-body detection |
 | `--twin-similarity` | `0.6` | Minimum text-similarity ratio (0–1) to flag a sync/async twin pair |
 | `--plan` | off | Output a prioritised remediation plan instead of the standard report |
+| `--version` | — | Print the installed spaghetti version and exit |
 
 ## Inline suppression
 

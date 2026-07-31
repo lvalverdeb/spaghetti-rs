@@ -14,8 +14,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
-#[command(name = "spaghetti", about = "Spaghetti Code Detector (Rust port)")]
+#[command(
+    name = "spaghetti",
+    about = "Spaghetti Code Detector (Rust port)",
+    version
+)]
 pub struct Args {
+    /// Suppress the report banner (text-report mode only; --json is unaffected)
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -393,7 +401,7 @@ pub fn run(args: Args) -> i32 {
         };
         println!("{}", serde_json::to_string_pretty(&output).unwrap());
     } else {
-        render_text_report(&filtered, &total, workspace_root.as_deref());
+        render_text_report(&filtered, &total, workspace_root.as_deref(), args.quiet);
     }
 
     if total.issues.iter().any(|i| i.severity == Severity::Error) {
@@ -423,14 +431,21 @@ fn severity_counts(issues: &[&Issue]) -> (usize, usize, usize) {
     (errors, warnings, infos)
 }
 
-fn render_text_report(filtered: &[&Issue], total: &ScanResult, workspace_root: Option<&Path>) {
-    println!("{}", "=".repeat(config::BANNER_WIDTH));
-    println!(
-        "  SPAGHETTI CODE DETECTION REPORT (v{})",
-        env!("CARGO_PKG_VERSION")
-    );
-    println!("{}", "=".repeat(config::BANNER_WIDTH));
-    println!();
+fn render_text_report(
+    filtered: &[&Issue],
+    total: &ScanResult,
+    workspace_root: Option<&Path>,
+    quiet: bool,
+) {
+    if !quiet {
+        println!("{}", "=".repeat(config::BANNER_WIDTH));
+        println!(
+            "  SPAGHETTI CODE DETECTION REPORT (v{})",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!("{}", "=".repeat(config::BANNER_WIDTH));
+        println!();
+    }
     println!("  Files scanned:     {}", total.files_scanned);
     println!("  Lines scanned:     {}", total.total_lines);
     println!("  Functions scanned: {}", total.functions_scanned);

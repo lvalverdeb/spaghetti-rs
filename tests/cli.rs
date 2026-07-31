@@ -187,3 +187,47 @@ fn bare_invocation_empty_cwd_errors() {
         "unexpected stderr: {stderr}"
     );
 }
+
+#[test]
+fn version_flag_prints_version_and_exits_zero() {
+    let output = Command::new(spaghetti_bin())
+        .args(["--version"])
+        .output()
+        .expect("failed to run spaghetti binary");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("spaghetti"), "unexpected stdout: {stdout}");
+}
+
+#[test]
+fn quiet_flag_suppresses_banner_but_keeps_summary() {
+    let tmp = std::env::temp_dir().join(format!("spaghetti_rs_test_quiet_{}", std::process::id()));
+    let pkg_dir = tmp.join("fake_pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("mod.py"), "x = 1\n").unwrap();
+
+    let output = Command::new(spaghetti_bin())
+        .args([
+            "--package",
+            "fake_pkg=fake_pkg",
+            "--severity",
+            "info",
+            "--quiet",
+        ])
+        .current_dir(&tmp)
+        .output()
+        .expect("failed to run spaghetti binary");
+
+    std::fs::remove_dir_all(&tmp).ok();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("SPAGHETTI CODE DETECTION REPORT"),
+        "unexpected stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Files scanned:"),
+        "unexpected stdout: {stdout}"
+    );
+}
