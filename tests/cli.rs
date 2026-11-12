@@ -231,3 +231,65 @@ fn quiet_flag_suppresses_banner_but_keeps_summary() {
         "unexpected stdout: {stdout}"
     );
 }
+
+#[test]
+fn config_file_resolves_packages_relative_to_itself() {
+    let tmp = std::env::temp_dir().join(format!("spaghetti_rs_test_cfg_{}", std::process::id()));
+    let pkg_dir = tmp.join("nested").join("fake_pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("messy.py"),
+        "def f():\n    try:\n        pass\n    except:\n        pass\n",
+    )
+    .unwrap();
+    // Paths in the config are relative to the config file, not the cwd, and
+    // unrelated top-level keys are ignored (same as the Python original).
+    std::fs::write(
+        tmp.join("nested").join("spaghetti.yaml"),
+        "other: ignored\npackages:\n  fake_pkg: fake_pkg\n",
+    )
+    .unwrap();
+
+    let output = Command::new(spaghetti_bin())
+        .args([
+            "--config",
+            "nested/spaghetti.yaml",
+            "--json",
+            "--severity",
+            "info",
+        ])
+        .current_dir(&tmp)
+        .output()
+        .expect("failed to run spaghetti binary");
+
+    std::fs::remove_dir_all(&tmp).ok();
+
+    assert!(output.status.success() || output.status.code() == Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("bare-except"),
+        "unexpected stdout: {stdout}"
+    );
+}
+
+#[test]
+fn config_file_without_packages_mapping_errors() {
+    let tmp = std::env::temp_dir().join(format!("spaghetti_rs_test_badcfg_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("spaghetti.yaml"), "not_packages:\n  a: b\n").unwrap();
+
+    let output = Command::new(spaghetti_bin())
+        .args(["--config", "spaghetti.yaml"])
+        .current_dir(&tmp)
+        .output()
+        .expect("failed to run spaghetti binary");
+
+    std::fs::remove_dir_all(&tmp).ok();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must define a top-level 'packages' mapping"),
+        "unexpected stderr: {stderr}"
+    );
+}

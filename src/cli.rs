@@ -9,7 +9,6 @@ use crate::scanner::scan_package;
 use clap::Parser;
 use rayon::prelude::*;
 use serde::Serialize;
-use serde_yaml::Value as YamlValue;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -63,6 +62,14 @@ fn severity_rank(s: &str) -> u8 {
     }
 }
 
+/// Shape of a `--config` YAML file: a top-level `packages` mapping of
+/// `{name: path}`. Mirrors the Python original's `yaml.safe_load` + shape
+/// check in `spaghetti/src/spaghetti/cli.py`; other top-level keys are ignored.
+#[derive(serde::Deserialize)]
+struct ConfigFile {
+    packages: Option<BTreeMap<String, String>>,
+}
+
 fn load_packages_from_config(config_path: &Path) -> BTreeMap<String, PathBuf> {
     let text = std::fs::read_to_string(config_path).unwrap_or_else(|e| {
         panic!(
@@ -70,22 +77,19 @@ fn load_packages_from_config(config_path: &Path) -> BTreeMap<String, PathBuf> {
             config_path.display()
         )
     });
-    let raw: YamlValue = serde_yaml::from_str(&text).unwrap_or_else(|e| {
+    let config: ConfigFile = serde_saphyr::from_str(&text).unwrap_or_else(|e| {
         panic!(
             "error: could not parse --config {}: {e}",
             config_path.display()
         )
     });
 
-    let packages = raw
-        .get("packages")
-        .and_then(|p| p.as_mapping())
-        .unwrap_or_else(|| {
-            panic!(
-                "error: {} must define a top-level 'packages' mapping of {{name: path}}",
-                config_path.display()
-            )
-        });
+    let packages = config.packages.unwrap_or_else(|| {
+        panic!(
+            "error: {} must define a top-level 'packages' mapping of {{name: path}}",
+            config_path.display()
+        )
+    });
 
     let base_dir = config_path
         .canonicalize()
@@ -95,12 +99,8 @@ fn load_packages_from_config(config_path: &Path) -> BTreeMap<String, PathBuf> {
         .to_path_buf();
 
     packages
-        .iter()
-        .map(|(k, v)| {
-            let name = k.as_str().unwrap_or_default().to_string();
-            let rel = v.as_str().unwrap_or_default();
-            (name, base_dir.join(rel))
-        })
+        .into_iter()
+        .map(|(name, rel)| (name, base_dir.join(rel)))
         .collect()
 }
 
