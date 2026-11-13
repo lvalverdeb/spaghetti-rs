@@ -87,25 +87,13 @@ fn py_str(value: &Value) -> String {
     }
 }
 
-/// Python's `int(value)` for a decoded JSON value.
-fn py_int(value: &Value) -> Result<i64, ToolError> {
-    match value {
-        Value::Bool(b) => Ok(i64::from(*b)),
-        Value::Number(n) => match (n.as_i64(), n.as_f64()) {
-            (Some(i), _) => Ok(i),
-            (None, Some(f)) if f.is_finite() => Ok(f.trunc() as i64),
-            _ => tool_err(format!("cannot convert {n} to an integer")),
-        },
-        Value::String(s) => s.trim().replace('_', "").parse::<i64>().or_else(|_| {
-            tool_err(format!(
-                "invalid literal for int() with base 10: {}",
-                py_value_repr(value)
-            ))
-        }),
-        other => tool_err(format!(
-            "int() argument must be a string or a number, not {}",
-            py_value_repr(other)
-        )),
+/// `_int_arg`: an integer argument; a bool or a float is not one.
+fn int_arg(args: &Map<String, Value>, key: &str) -> Result<i64, ToolError> {
+    match args.get(key) {
+        Some(Value::Number(n)) if !n.is_f64() => n
+            .as_i64()
+            .ok_or_else(|| ToolError(format!("'{key}' must be an integer"))),
+        _ => tool_err(format!("'{key}' must be an integer")),
     }
 }
 
@@ -151,9 +139,12 @@ fn run(runner: Runner<'_>, argv: &[String], cwd: &Path) -> Result<CliOutput, Too
     runner(argv, cwd).map_err(ToolError)
 }
 
-fn required<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a Value, ToolError> {
-    args.get(key)
-        .ok_or_else(|| ToolError(format!("missing required argument '{key}'")))
+/// `_required`: a non-empty string argument.
+fn required<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, ToolError> {
+    match args.get(key) {
+        Some(Value::String(s)) if !s.is_empty() => Ok(s),
+        _ => tool_err(format!("missing required argument '{key}'")),
+    }
 }
 
 pub fn explain_rule(rule: &str) -> Result<Value, ToolError> {
@@ -208,9 +199,9 @@ fn scan(args: &Map<String, Value>, runner: Runner<'_>) -> Result<Value, ToolErro
 fn plan(args: &Map<String, Value>, runner: Runner<'_>) -> Result<Value, ToolError> {
     let (mut argv, cwd) = common_argv(args)?;
     argv.extend(["--plan".to_string(), "--json".to_string()]);
-    if truthy(args.get("top")) {
+    if args.get("top").is_some_and(|v| !v.is_null()) {
         argv.push("--top".to_string());
-        argv.push(py_int(&args["top"])?.to_string());
+        argv.push(int_arg(args, "top")?.to_string());
     }
     if truthy(args.get("hotspots")) {
         argv.push("--hotspots".to_string());
@@ -220,7 +211,7 @@ fn plan(args: &Map<String, Value>, runner: Runner<'_>) -> Result<Value, ToolErro
 
 fn compare(args: &Map<String, Value>, runner: Runner<'_>) -> Result<Value, ToolError> {
     let (mut argv, cwd) = common_argv(args)?;
-    let reference = py_str(required(args, "ref")?);
+    let reference = required(args, "ref")?.to_string();
     argv.extend(["--json".to_string(), "--compare".to_string(), reference]);
     if truthy(args.get("store")) {
         argv.push("--snapshot-store".to_string());
@@ -239,7 +230,11 @@ fn baseline(args: &Map<String, Value>, runner: Runner<'_>) -> Result<Value, Tool
         argv.push("--baseline".to_string());
         argv.push(py_str(&args["baseline"]));
     }
-    if required(args, "action")?.as_str() == Some("update") {
+    let action = required(args, "action")?;
+    if action != "status" && action != "update" {
+        return tool_err("action must be 'status' or 'update'");
+    }
+    if action == "update" {
         argv.push("--update-baseline".to_string());
         let proc = run(runner, &argv, &cwd)?;
         if proc.code != 0 {
@@ -300,28 +295,26 @@ fn tool_result(name: &str, args: &Map<String, Value>, runner: Runner<'_>) -> Val
     }
 }
 
-/// One request → one response; notifications → `None`.
+/// One request → one response; notifications → `None`. Never fails: a
+/// malformed message gets an error reply, and the server keeps serving.
 pub fn handle(message: &Value, version: &str, runner: Runner<'_>) -> Option<Value> {
     let Some(message) = message.as_object() else {
-        // Python raises AttributeError here and the server dies; answer instead.
-        return Some(error(Value::Null, -32600, "not a request"));
+        return Some(error(Value::Null, -32600, "not a request object"));
     };
     let id = message.get("id").cloned().unwrap_or(Value::Null);
-    let method = match message.get("method") {
-        None | Some(Value::Null) => return Some(error(id, -32600, "not a request")),
-        Some(Value::String(m)) => m.as_str(),
-        // Python raises on `.startswith` of a non-string; answer instead.
-        Some(_) => return Some(error(id, -32600, "not a request")),
+    let empty = Map::new();
+    let Some(Value::String(method)) = message.get("method") else {
+        return Some(error(id, -32600, "not a request"));
+    };
+    let params = match message.get("params") {
+        None | Some(Value::Null) => &empty,
+        Some(Value::Object(p)) => p,
+        Some(_) => return Some(error(id, -32602, "params must be an object")),
     };
     if method.starts_with("notifications/") {
         return None;
     }
-    let empty = Map::new();
-    let params = match message.get("params") {
-        Some(Value::Object(p)) => p,
-        _ => &empty,
-    };
-    Some(match method {
+    Some(match method.as_str() {
         "initialize" => result(
             id,
             json!({
@@ -334,7 +327,6 @@ pub fn handle(message: &Value, version: &str, runner: Runner<'_>) -> Option<Valu
         "ping" => result(id, json!({})),
         "tools/list" => result(id, json!({"tools": *TOOLS})),
         "tools/call" => {
-            let malformed_params = truthy(message.get("params")) && !message["params"].is_object();
             let name = params.get("name").and_then(Value::as_str);
             let args = if truthy(params.get("arguments")) {
                 params.get("arguments").and_then(Value::as_object)
@@ -342,9 +334,7 @@ pub fn handle(message: &Value, version: &str, runner: Runner<'_>) -> Option<Valu
                 Some(&empty)
             };
             match (name, args) {
-                (Some(name), Some(args)) if !malformed_params => {
-                    result(id, tool_result(name, args, runner))
-                }
+                (Some(name), Some(args)) => result(id, tool_result(name, args, runner)),
                 _ => error(
                     id,
                     -32602,
@@ -470,8 +460,39 @@ mod tests {
                 .unwrap()
                 .contains("unknown rule")
         );
-        let not_object = handle(&json!([1]), "9", &no_run).unwrap();
-        assert_eq!(not_object["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn handle_never_fails_on_malformed_input() {
+        let call = |name: &str, arguments: Value| {
+            handle(
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": name, "arguments": arguments}}),
+                "9",
+                &no_run,
+            )
+            .unwrap()["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let code =
+            |message: Value| handle(&message, "9", &no_run).unwrap()["error"]["code"].clone();
+        assert_eq!(code(json!([])), -32600);
+        assert_eq!(
+            handle(&json!([]), "9", &no_run).unwrap()["error"]["message"],
+            "not a request object"
+        );
+        assert_eq!(code(json!({"id": 1, "method": 5})), -32600);
+        assert_eq!(
+            code(json!({"id": 1, "method": "ping", "params": []})),
+            -32602
+        );
+        assert!(call("compare", json!({"path": "."})).contains("missing required argument 'ref'"));
+        assert!(call("baseline", json!({})).contains("missing required argument 'action'"));
+        assert!(call("baseline", json!({"action": "wipe"})).contains("action must be"));
+        assert!(call("plan", json!({"top": "three"})).contains("'top' must be an integer"));
+        assert!(call("plan", json!({"top": true})).contains("'top' must be an integer"));
     }
 
     #[test]

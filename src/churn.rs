@@ -29,7 +29,10 @@ pub struct Churn {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String, ChurnError> {
+    // core.quotePath=false: otherwise non-ASCII paths come back quoted and
+    // octal-escaped and never match the scanned files.
     let out = std::process::Command::new("git")
+        .args(["-c", "core.quotePath=false"])
         .args(args)
         .current_dir(cwd)
         .output()
@@ -182,6 +185,40 @@ mod tests {
         let mid = churn_factor(Some(&c(3)), 10);
         assert!(mid > 1.0 && mid < 2.0);
         assert_eq!(mid, 1.0 + 2.0 / 11f64.log2());
+    }
+
+    #[test]
+    fn file_churn_sees_non_ascii_paths() {
+        let repo = std::env::temp_dir().join(format!("spaghetti_rs_churn_{}", std::process::id()));
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        let odd = repo.join("pkg/caf\u{e9}.py");
+        std::fs::write(&odd, "z = 1\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "non-ascii"]);
+        let churn = file_churn(&[repo.join("pkg")], 6).unwrap();
+        std::fs::remove_dir_all(&repo).ok();
+        assert_eq!(
+            churn.get(&odd),
+            Some(&Churn {
+                commits: 1,
+                authors: 1
+            })
+        );
     }
 
     #[test]

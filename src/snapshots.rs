@@ -636,6 +636,24 @@ mod tests {
     }
 
     #[test]
+    fn store_lines_split_on_newline_only_and_must_be_objects() {
+        let dir = std::env::temp_dir().join(format!("spaghetti_rs_store_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("s.jsonl");
+        let mut s = snap(Some("abc"), "t", &["f1"], &[("a\u{2028}b.py", 1.5)], 90.0);
+        s.findings[0].message = "x\u{2029}y\u{85}z".to_string();
+        append_snapshot(&store, &s).unwrap();
+        assert_eq!(load_snapshots(&store).unwrap(), [s]);
+        std::fs::write(&store, "[]\n").unwrap();
+        let err = load_snapshots(&store).unwrap_err().0;
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            err.ends_with("s.jsonl:1: malformed snapshot (not an object)"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn find_snapshot_references() {
         let all = vec![
             snap(Some("aaa111"), "2026-10-01T00:00:00+00:00", &[], &[], 80.0),
