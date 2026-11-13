@@ -75,6 +75,42 @@ def f():  # spaghetti-ignore[long-function]: intentionally large
 x: dict = {}  # spaghetti-ignore: reviewed, no issue
 ```
 
+The marker applies to the line it appears on and the line directly above it (so a marker can sit above a `def` line too long for a trailing comment). Suppressed findings are counted in the report summary (`Suppressed: N`) rather than silently dropped — they remain visible, and `--json` lists each one under `ignored` (below).
+
+## JSON Output
+
+With `--json`, the report is a single JSON object to stdout — the same shape as the Python original's:
+
+```json
+{
+  "issues": [
+    {
+      "file": "src/my_module.py",
+      "line": 42,
+      "severity": "warning",
+      "rule": "long-function",
+      "message": "my_func() is 65 lines (max 50)",
+      "package": "my-lib"
+    }
+  ],
+  "suppressed": 3,
+  "suppression_help": "Silence a confirmed non-issue by adding '# spaghetti-ignore[rule-name]: reason' on the flagged line (or the line above).",
+  "ignored": [
+    {
+      "file": "src/legacy.py",
+      "line": 10,
+      "severity": "warning",
+      "rule": "bare-except",
+      "message": "Bare except: clause",
+      "package": "my-lib",
+      "reason": "reviewed, no issue"
+    }
+  ]
+}
+```
+
+`ignored` lists the findings a `# spaghetti-ignore` marker actually silenced (each with its `reason`, if one was given), so a suppression is visible rather than invisible in the JSON report too.
+
 ## Rules
 
 All 39 rules from the Python original: 31 per-file AST checks (including `pass-through-method`), 2 source-text checks, 1 infrastructure check (`syntax-error`), and 5 cross-file package checks (`import-cycle`, `high-coupling`, `orphan-interface`, `duplicate-function-body`, `sync-async-duplication`). A `low-cohesion` (LCOM4) check also exists in the codebase but is intentionally not enabled by default — see the rule's own doc comment for why. See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
