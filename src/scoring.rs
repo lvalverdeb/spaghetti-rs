@@ -2,8 +2,9 @@
 
 use crate::config::{BANNER_WIDTH, LINES_PER_KLOC};
 use crate::models::{Issue, RemediationStep, ScanResult, Severity, display_path};
+use indexmap::IndexMap;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 const MAX_SCORE: f64 = 100.0;
@@ -24,13 +25,28 @@ static PLAN_TABLE_DIVIDER: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-fn severity_weight(s: Severity) -> f64 {
+pub fn severity_weight(s: Severity) -> f64 {
     match s {
         Severity::Error => 6.0,
         Severity::Warning => 1.5,
         Severity::Info => 0.3,
     }
 }
+
+/// Per-file health cost: the sum of severity weights of its findings — the
+/// same quantity `compute_score` normalises per KLOC, left raw so files can
+/// be ranked and tracked across snapshots. Insertion-ordered by first
+/// finding, like Python's dict — mirrors `scoring.py::file_penalties`.
+pub fn file_penalties<'a>(issues: impl IntoIterator<Item = &'a Issue>) -> IndexMap<PathBuf, f64> {
+    let mut penalties: IndexMap<PathBuf, f64> = IndexMap::new();
+    for issue in issues {
+        *penalties.entry(issue.file.clone()).or_insert(0.0) += severity_weight(issue.severity);
+    }
+    penalties
+}
+
+/// A per-file multiplier for the plan (the churn factor); `None` is 1.0.
+pub type Weight<'a> = Option<&'a dyn Fn(&Path) -> f64>;
 
 /// A rough 0-100 health score, weighted by severity and normalized per
 /// 1,000 lines so larger packages aren't unfairly penalized.
@@ -65,6 +81,7 @@ fn fix_effort(rule: &str) -> f64 {
     match rule {
         "import-cycle" => 5.0,
         "layer-violation" => 4.0,
+        "contract-violation" => 4.0,
         "transport-in-library" => 4.0,
         "god-class" => 5.0,
         "god-module" => 4.0,
@@ -144,12 +161,18 @@ fn priority_label(score: f64) -> (&'static str, &'static str) {
 }
 
 /// Groups issues by rule, computes priority scores, and returns an ordered
-/// list of `RemediationStep`s — mirrors `build_remediation_plan`.
+/// list of `RemediationStep`s — mirrors `build_remediation_plan`. `weight`
+/// (default 1) multiplies a finding's score by its file's churn factor so P0
+/// is "worst *and* hottest", not just worst (see `churn`); files inside a
+/// step are listed hottest first. Rules are grouped in first-appearance
+/// order (a Python dict), so equal-score steps keep that order.
 pub fn build_remediation_plan(
     issues: &[&Issue],
     workspace_root: Option<&Path>,
+    weight: Weight<'_>,
 ) -> Vec<RemediationStep> {
-    let mut by_rule: HashMap<&'static str, Vec<&Issue>> = HashMap::new();
+    let weight_of = |path: &Path| weight.map_or(1.0, |w| w(path));
+    let mut by_rule: IndexMap<&'static str, Vec<&Issue>> = IndexMap::new();
     for issue in issues {
         by_rule.entry(issue.rule).or_default().push(issue);
     }
@@ -157,19 +180,30 @@ pub fn build_remediation_plan(
     let mut steps: Vec<RemediationStep> = Vec::new();
     for (rule, rule_issues) in by_rule {
         let effort = fix_effort(rule);
-        let max_sev_issue = rule_issues
+        // Python's `max` keeps the first of equal keys.
+        let mut max_sev_issue = rule_issues[0];
+        for issue in &rule_issues[1..] {
+            if severity_weight(issue.severity) > severity_weight(max_sev_issue.severity) {
+                max_sev_issue = issue;
+            }
+        }
+        let score = rule_issues
             .iter()
-            .max_by(|a, b| severity_weight(a.severity).total_cmp(&severity_weight(b.severity)))
-            .unwrap();
-        let score = severity_weight(max_sev_issue.severity) * effort;
+            .map(|i| severity_weight(i.severity) * effort * weight_of(&i.file))
+            .fold(f64::NEG_INFINITY, f64::max);
         let (priority, _) = priority_label(score);
 
-        let mut files: Vec<String> = rule_issues
-            .iter()
-            .map(|i| display_path(&i.file, workspace_root))
-            .collect();
-        files.sort();
-        files.dedup();
+        let mut hottest: IndexMap<String, f64> = IndexMap::new();
+        for i in &rule_issues {
+            let w = weight_of(&i.file);
+            let slot = hottest
+                .entry(display_path(&i.file, workspace_root))
+                .or_insert(0.0);
+            *slot = slot.max(w);
+        }
+        let mut files: Vec<(String, f64)> = hottest.into_iter().collect();
+        files.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let files: Vec<String> = files.into_iter().map(|(p, _)| p).collect();
 
         steps.push(RemediationStep {
             priority,
@@ -188,15 +222,24 @@ pub fn build_remediation_plan(
 }
 
 /// Renders a prioritized remediation plan as a text report — mirrors
-/// `plan_report`.
-pub fn plan_report(issues: &[&Issue], top: usize, workspace_root: Option<&Path>) -> String {
-    let steps = build_remediation_plan(issues, workspace_root);
+/// `plan_report`; `note` is printed under the banner.
+pub fn plan_report(
+    issues: &[&Issue],
+    top: usize,
+    workspace_root: Option<&Path>,
+    weight: Weight<'_>,
+    note: Option<&str>,
+) -> String {
+    let steps = build_remediation_plan(issues, workspace_root, weight);
     let mut out = String::new();
     use std::fmt::Write as _;
 
     let _ = writeln!(out, "{}", "=".repeat(BANNER_WIDTH));
     let _ = writeln!(out, "  REMEDIATION PLAN — Prioritized Fix Order");
     let _ = writeln!(out, "{}", "=".repeat(BANNER_WIDTH));
+    if let Some(note) = note.filter(|n| !n.is_empty()) {
+        let _ = writeln!(out, "  {note}");
+    }
     let _ = writeln!(out);
 
     if steps.is_empty() {

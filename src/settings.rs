@@ -12,6 +12,13 @@
 //! exclude = ["tests/", "migrations/"]
 //! fail-on = "error"                       # error | warning | info | never
 //! baseline = ".spaghetti-baseline.json"   # relative to the settings file
+//! snapshot-store = ".spaghetti/snapshots.jsonl"  # relative to the settings file
+//!
+//! [[tool.spaghetti.contracts]]            # architecture contracts, see contracts
+//! name = "domain stays framework-free"
+//! type = "forbidden"
+//! source = ["my_lib.domain"]
+//! forbidden = ["my_lib.transport", "fastapi"]
 //! library-packages = ["my-lib"]           # packages transport-in-library applies to
 //!
 //! [tool.spaghetti.packages]
@@ -38,6 +45,7 @@ use crate::config::{
     LayerRules, RuleSetting, Runtime, THRESHOLD_NAMES, ThresholdKind, ThresholdValue, Thresholds,
     threshold_kind,
 };
+use crate::contracts::{Contract, parse_contracts};
 use crate::models::Severity;
 use crate::rules::is_known_rule;
 use indexmap::IndexMap;
@@ -74,6 +82,8 @@ pub struct Settings {
     pub exclude: Vec<String>,
     pub fail_on: Option<String>,
     pub baseline: Option<PathBuf>,
+    pub snapshot_store: Option<PathBuf>,
+    pub contracts: Vec<Contract>,
     pub packages: IndexMap<String, PathBuf>,
     pub sources: Vec<PathBuf>,
 }
@@ -100,6 +110,11 @@ impl Settings {
             exclude: [&self.exclude[..], &other.exclude[..]].concat(),
             fail_on: other.fail_on.clone().or_else(|| self.fail_on.clone()),
             baseline: other.baseline.clone().or_else(|| self.baseline.clone()),
+            snapshot_store: other
+                .snapshot_store
+                .clone()
+                .or_else(|| self.snapshot_store.clone()),
+            contracts: [&self.contracts[..], &other.contracts[..]].concat(),
             packages: merge(&self.packages, &other.packages),
             sources: [&self.sources[..], &other.sources[..]].concat(),
         }
@@ -229,8 +244,10 @@ const SCALAR_KEYS: &[&str] = &[
     "exclude",
     "fail-on",
     "baseline",
+    "snapshot-store",
     "library-packages",
     "packages",
+    "contracts",
 ];
 const TABLE_KEYS: &[&str] = &["thresholds", "rules", "layers"];
 
@@ -290,6 +307,12 @@ pub fn parse_mapping(data: &Map<String, Value>, origin: &Path) -> Result<Setting
         };
         s.baseline = Some(resolve_lenient(&base_dir.join(path)));
     }
+    if let Some(store) = data.get("snapshot-store").filter(|v| !v.is_null()) {
+        let Some(path) = store.as_str() else {
+            return err(format!("{o}: snapshot-store must be a path string"));
+        };
+        s.snapshot_store = Some(resolve_lenient(&base_dir.join(path)));
+    }
     let packages = data.get("packages").unwrap_or(&empty_table);
     match packages.as_object() {
         Some(map) if map.values().all(Value::is_string) => {
@@ -303,6 +326,8 @@ pub fn parse_mapping(data: &Map<String, Value>, origin: &Path) -> Result<Setting
         }
         _ => return err(format!("{o}: packages must map names to path strings")),
     }
+    s.contracts = parse_contracts(data.get("contracts").unwrap_or(&empty_list), &o.to_string())
+        .map_err(|e| SettingsError(e.to_string()))?;
     s.thresholds = parse_thresholds(data.get("thresholds").unwrap_or(&empty_table), origin)?;
     s.rules = parse_rules(data.get("rules").unwrap_or(&empty_table), origin)?;
     s.layers = parse_layers(data.get("layers").unwrap_or(&empty_table), origin)?;
@@ -471,6 +496,7 @@ pub fn to_runtime(settings: &Settings) -> Runtime {
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect(),
+        contracts: settings.contracts.clone(),
     }
 }
 
@@ -576,7 +602,7 @@ mod tests {
         let cases = [
             (
                 r#"{"bogus": 1}"#,
-                "unknown setting(s): bogus. Known: baseline, exclude, fail-on, layers, library-packages, packages, rules, thresholds",
+                "unknown setting(s): bogus. Known: baseline, contracts, exclude, fail-on, layers, library-packages, packages, rules, snapshot-store, thresholds",
             ),
             (
                 r#"{"fail-on": "sometimes"}"#,
@@ -636,7 +662,7 @@ mod tests {
     #[test]
     fn threshold_names_cover_every_python_tunable() {
         let names: Vec<&str> = THRESHOLD_NAMES.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names.len(), 31);
+        assert_eq!(names.len(), 32);
         for required in [
             "MAX_FUNCTION_LINES",
             "COMPLEXITY_THRESHOLD",

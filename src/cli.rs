@@ -5,25 +5,33 @@
 //! Rust doesn't, per the port proposal's §4.3).
 
 use crate::baseline::{self, BaselineEntry};
+use crate::churn::{Hotspot, churn_factor, file_churn, rank_hotspots};
 use crate::config;
 use crate::diff_filter;
 use crate::json::dumps_pretty;
 use crate::models::{Issue, ScanConfig, ScanResult, Severity, display_path};
 use crate::sarif;
 use crate::scanner::{scan_package, scan_workspace};
+use crate::scoring::file_penalties;
 use crate::settings::{self, Settings, SettingsError, resolve_lenient};
+use crate::snapshots::{
+    Comparison, Snapshot, append_snapshot, compare, find_snapshot, git_head_sha, load_snapshots,
+    take_snapshot,
+};
 use clap::Parser;
 use indexmap::IndexMap;
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "spaghetti",
     about = "Spaghetti Code Detector (Rust port)",
-    version
+    version,
+    after_help = "Subcommand: 'spaghetti mcp' serves the scan, plan, explain_rule, compare and \
+                  baseline tools over the Model Context Protocol (stdio) for coding agents."
 )]
 pub struct Args {
     /// Suppress the report banner (text-report mode only; --json is unaffected)
@@ -48,8 +56,9 @@ pub struct Args {
     #[arg(long, default_value = "info", value_parser = ["info", "warning", "error"])]
     pub severity: String,
 
-    /// Report format (default: text). 'sarif' emits SARIF 2.1.0 for code-scanning tools.
-    #[arg(long, value_parser = ["text", "json", "sarif"])]
+    /// Report format (default: text). 'sarif' emits SARIF 2.1.0 for code-scanning tools;
+    /// 'html' a self-contained page with scorecard, trend, hotspots and findings.
+    #[arg(long, value_parser = ["text", "json", "sarif", "html"])]
     pub format: Option<String>,
 
     /// Shorthand for --format json
@@ -74,6 +83,30 @@ pub struct Args {
     /// origin/main). Requires the scanned paths to be inside a git repo.
     #[arg(long, value_name = "REF")]
     pub diff_base: Option<String>,
+
+    /// Append this run (git SHA, scores, per-file penalties, finding fingerprints) to
+    /// the snapshot store so later runs can --compare against it and draw trends
+    #[arg(long)]
+    pub snapshot: bool,
+
+    /// JSONL snapshot store (default: .spaghetti/snapshots.jsonl, or [tool.spaghetti] snapshot-store)
+    #[arg(long, value_name = "PATH")]
+    pub snapshot_store: Option<PathBuf>,
+
+    /// Report the delta against a stored snapshot: 'latest', '~N' (N runs back), a git
+    /// SHA prefix or a timestamp prefix. Shows score change, findings introduced and
+    /// fixed, files that got worse.
+    #[arg(long, value_name = "REF")]
+    pub compare: Option<String>,
+
+    /// Rank files by health penalty × git change frequency (CodeScene-style hotspots)
+    /// and weight the --plan by it. Needs the scanned paths inside a git repository.
+    #[arg(long)]
+    pub hotspots: bool,
+
+    /// History window for --hotspots (default: 6 months)
+    #[arg(long, value_name = "N", allow_negative_numbers = true)]
+    pub churn_months: Option<i64>,
 
     /// Ignore any [tool.spaghetti] table found in a pyproject.toml above the cwd
     #[arg(long)]
@@ -425,6 +458,258 @@ struct JsonOutput<'a> {
     ignored: Vec<JsonIgnoredIssue>,
     diff_base: Option<JsonDiffBase>,
     baseline: Option<JsonBaseline<'a>>,
+    /// `_History.json()` — present only when comparing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compare: Option<crate::snapshots::ComparisonJson<'a>>,
+    /// `_History.json()` — present only with `--hotspots`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hotspots: Option<JsonHotspots<'a>>,
+    /// `_plan_json` — present only with `--plan --json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<Vec<JsonPlanStep>>,
+}
+
+#[derive(Serialize)]
+struct JsonHotspot<'a> {
+    file: &'a str,
+    penalty: f64,
+    commits: usize,
+    authors: usize,
+    score: f64,
+}
+
+#[derive(Serialize)]
+struct JsonHotspots<'a> {
+    months: i64,
+    files: Vec<JsonHotspot<'a>>,
+}
+
+/// One step of `cli.py::_plan_json`.
+#[derive(Serialize)]
+struct JsonPlanStep {
+    priority: &'static str,
+    rule: &'static str,
+    severity: &'static str,
+    effort: &'static str,
+    count: usize,
+    score: f64,
+    files: Vec<String>,
+    description: String,
+    fix: Option<&'static str>,
+}
+
+/// Phase 3 context: the snapshot store, the comparison and the hotspots,
+/// each optional, all surfaced in every output format — mirrors
+/// `cli.py::_History`.
+struct History {
+    store: PathBuf,
+    snapshots: Vec<Snapshot>,
+    current: Option<Snapshot>,
+    /// Whether `current` was appended to `snapshots` (`--snapshot`).
+    appended: bool,
+    comparison: Option<Comparison>,
+    hotspots: Option<Vec<Hotspot>>,
+    /// Issue file -> churn factor (absent: 1.0).
+    weights: HashMap<PathBuf, f64>,
+    months: i64,
+}
+
+impl History {
+    fn notes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(comparison) = &self.comparison {
+            out.extend(comparison.notes());
+        }
+        if let Some(spots) = &self.hotspots {
+            out.push(format!(
+                "Hotspots: {} file(s) with findings ranked by penalty \u{d7} change frequency \
+                 over {} months; --plan is churn-weighted",
+                spots.len(),
+                self.months
+            ));
+        }
+        out
+    }
+
+    fn weight(&self, path: &Path) -> f64 {
+        self.weights.get(path).copied().unwrap_or(1.0)
+    }
+
+    fn json_hotspots(&self) -> Option<JsonHotspots<'_>> {
+        self.hotspots.as_ref().map(|spots| JsonHotspots {
+            months: self.months,
+            files: spots
+                .iter()
+                .map(|h| JsonHotspot {
+                    file: &h.file,
+                    penalty: h.penalty,
+                    commits: h.commits,
+                    authors: h.authors,
+                    score: h.score,
+                })
+                .collect(),
+        })
+    }
+
+    /// Stored snapshots other than the current run — the trend history.
+    fn past(&self) -> Vec<&Snapshot> {
+        let n = self.snapshots.len() - usize::from(self.appended);
+        self.snapshots[..n].iter().collect()
+    }
+}
+
+fn resolve_store(args: &Args, settings: &Settings, cwd: &Path) -> PathBuf {
+    args.snapshot_store
+        .clone()
+        .or_else(|| settings.snapshot_store.clone())
+        .unwrap_or_else(|| cwd.join(crate::snapshots::DEFAULT_STORE))
+}
+
+/// Everything `build_history` needs from the run.
+struct RunContext<'a> {
+    args: &'a Args,
+    cwd: &'a Path,
+    workspace_root: Option<&'a Path>,
+    registry: &'a Registry,
+    selected: &'a [String],
+    per_package: &'a IndexMap<String, ScanResult>,
+    total: &'a ScanResult,
+}
+
+/// Take, store and compare snapshots; compute hotspots. Each only when asked
+/// — mirrors `cli.py::_build_history`. `Err` is a usage error.
+fn build_history(ctx: &RunContext<'_>, settings: &Settings) -> Result<History, String> {
+    let args = ctx.args;
+    let mut history = History {
+        store: resolve_store(args, settings, ctx.cwd),
+        snapshots: Vec::new(),
+        current: None,
+        appended: false,
+        comparison: None,
+        hotspots: None,
+        weights: HashMap::new(),
+        months: 0,
+    };
+    if args.snapshot || args.compare.is_some() || output_format(args) == "html" {
+        take_and_compare(ctx, &mut history)?;
+    }
+    if args.hotspots {
+        compute_hotspots(ctx, &mut history)?;
+    }
+    Ok(history)
+}
+
+fn take_and_compare(ctx: &RunContext<'_>, history: &mut History) -> Result<(), String> {
+    history.snapshots = load_snapshots(&history.store).map_err(|e| e.to_string())?;
+    let current = take_snapshot(
+        ctx.per_package,
+        ctx.total,
+        env!("CARGO_PKG_VERSION"),
+        git_head_sha(ctx.cwd),
+        crate::snapshots::utc_now_iso(),
+        ctx.workspace_root,
+    );
+    if let Some(reference) = &ctx.args.compare {
+        let against = find_snapshot(&history.snapshots, reference).map_err(|e| e.to_string())?;
+        history.comparison = Some(compare(
+            against,
+            &current,
+            &ctx.total.issues,
+            ctx.workspace_root,
+        ));
+    }
+    if ctx.args.snapshot {
+        append_snapshot(&history.store, &current)
+            .map_err(|e| format!("{}: {e}", history.store.display()))?;
+        eprintln!(
+            "Snapshot {} appended to {}",
+            current.label(),
+            history.store.display()
+        );
+        history.snapshots.push(current.clone());
+        history.appended = true;
+    }
+    history.current = Some(current);
+    Ok(())
+}
+
+fn compute_hotspots(ctx: &RunContext<'_>, history: &mut History) -> Result<(), String> {
+    history.months = match ctx.args.churn_months {
+        Some(n) if n != 0 => n,
+        _ => config::thresholds().hotspot_window_months as i64,
+    };
+    let roots: Vec<PathBuf> = ctx
+        .selected
+        .iter()
+        .map(|name| ctx.registry[name.as_str()].clone())
+        .collect();
+    let churn = file_churn(&roots, history.months).map_err(|e| format!("--hotspots: {e}"))?;
+    let penalties = file_penalties(&ctx.total.issues);
+    let mut resolved: IndexMap<PathBuf, f64> = IndexMap::new();
+    let mut display: HashMap<PathBuf, String> = HashMap::new();
+    let mut resolved_of: HashMap<&PathBuf, PathBuf> = HashMap::new();
+    for (path, penalty) in &penalties {
+        let real = resolve_lenient(path);
+        resolved.insert(real.clone(), *penalty);
+        display.insert(real.clone(), display_path(path, ctx.workspace_root));
+        resolved_of.insert(path, real);
+    }
+    history.hotspots = Some(rank_hotspots(&resolved, &churn, &display));
+    let max_commits = churn.values().map(|c| c.commits).max().unwrap_or(0);
+    for (path, real) in resolved_of {
+        if let Some(c) = churn.get(&real) {
+            history
+                .weights
+                .insert(path.clone(), churn_factor(Some(c), max_commits));
+        }
+    }
+    Ok(())
+}
+
+fn render_hotspots(history: &History, top: usize) {
+    let Some(spots) = &history.hotspots else {
+        return;
+    };
+    println!("{}", "=".repeat(config::BANNER_WIDTH));
+    println!(
+        "  HOTSPOTS \u{2014} health penalty \u{d7} change frequency (last {} months)",
+        history.months
+    );
+    println!("{}", "=".repeat(config::BANNER_WIDTH));
+    println!();
+    if spots.is_empty() {
+        println!("  No file with findings was touched in the window.");
+        println!();
+        return;
+    }
+    println!(
+        "  {:<58} {:>5} {:>4} {:>4} {:>6}",
+        "File", "Pen", "Cmt", "Auth", "Hot"
+    );
+    println!(
+        "  {} {} {} {} {}",
+        "\u{2500}".repeat(58),
+        "\u{2500}".repeat(5),
+        "\u{2500}".repeat(4),
+        "\u{2500}".repeat(4),
+        "\u{2500}".repeat(6)
+    );
+    for h in spots.iter().take(top) {
+        let chars: Vec<char> = h.file.chars().collect();
+        let name = if chars.len() <= 58 {
+            h.file.clone()
+        } else {
+            format!(
+                "\u{2026}{}",
+                chars[chars.len() - 57..].iter().collect::<String>()
+            )
+        };
+        println!(
+            "  {name:<58} {:>5.1} {:>4} {:>4} {:>6.1}",
+            h.penalty, h.commits, h.authors, h.score
+        );
+    }
+    println!();
 }
 
 const SUPPRESSION_HELP: &str = "Silence a confirmed non-issue by adding \
@@ -734,67 +1019,20 @@ pub fn run(args: Args) -> i32 {
         .filter(|i| severity_rank(i.severity.as_str()) >= min_severity)
         .collect();
 
-    if args.plan {
-        print!(
-            "{}",
-            crate::scoring::plan_report(&filtered, args.top, workspace_root.as_deref())
-        );
-    } else {
-        match output_format(&args) {
-            "json" => {
-                let output = JsonOutput {
-                    schema_version: JSON_SCHEMA_VERSION,
-                    summary: JsonPackageStats::from_result(&total),
-                    packages: JsonPackages(
-                        selected
-                            .iter()
-                            .map(|name| {
-                                (
-                                    name.clone(),
-                                    JsonPackageStats::from_result(&per_package[name.as_str()]),
-                                )
-                            })
-                            .collect(),
-                    ),
-                    issues: filtered
-                        .iter()
-                        .map(|i| JsonIssue::from_issue(i, workspace_root.as_deref()))
-                        .collect(),
-                    suppressed: total.suppressed,
-                    suppression_help: SUPPRESSION_HELP,
-                    ignored: total
-                        .ignored
-                        .iter()
-                        .map(|i| JsonIgnoredIssue {
-                            issue: JsonIssue::from_issue(i, workspace_root.as_deref()),
-                            reason: i.reason.clone(),
-                        })
-                        .collect(),
-                    diff_base: gating.json_diff_base(),
-                    baseline: gating.json_baseline(),
-                };
-                println!("{}", dumps_pretty(&output));
-            }
-            "sarif" => {
-                let document = sarif::build_sarif(
-                    &filtered,
-                    &gating.known,
-                    &total.ignored,
-                    env!("CARGO_PKG_VERSION"),
-                    &cwd,
-                    gating.baseline_used,
-                );
-                println!("{}", dumps_pretty(&document));
-            }
-            _ => render_text_report(
-                &filtered,
-                &total,
-                workspace_root.as_deref(),
-                args.quiet,
-                &gating.notes(),
-            ),
-        }
-    }
+    let ctx = RunContext {
+        args: &args,
+        cwd: &cwd,
+        workspace_root: workspace_root.as_deref(),
+        registry: &registry,
+        selected: &selected,
+        per_package: &per_package,
+        total: &total,
+    };
+    let history = match build_history(&ctx, &settings) {
+        Ok(history) => history,
+        Err(message) => return usage_error(&message),
+    };
+    emit_report(&ctx, &filtered, &gating, &history);
 
     let fail_on = args
         .fail_on
@@ -802,6 +1040,130 @@ pub fn run(args: Args) -> i32 {
         .or(settings.fail_on.as_deref())
         .unwrap_or(DEFAULT_FAIL_ON);
     exit_code(&gated, fail_on)
+}
+
+/// Mirrors `cli.py::_emit_report`.
+fn emit_report(ctx: &RunContext<'_>, filtered: &[&Issue], gating: &Gating, history: &History) {
+    let args = ctx.args;
+    let workspace_root = ctx.workspace_root;
+    let total = ctx.total;
+    let fmt = output_format(args);
+    let mut notes = gating.notes();
+    notes.extend(history.notes());
+    let weight = |path: &Path| history.weight(path);
+    if args.plan && fmt != "json" {
+        let note = history.hotspots.as_ref().map(|_| {
+            format!(
+                "Weighted by git change frequency over the last {} months",
+                history.months
+            )
+        });
+        print!(
+            "{}",
+            crate::scoring::plan_report(
+                filtered,
+                args.top,
+                workspace_root,
+                Some(&weight),
+                note.as_deref()
+            )
+        );
+    } else {
+        match fmt {
+            "json" => {
+                let plan = args.plan.then(|| {
+                    crate::scoring::build_remediation_plan(filtered, workspace_root, Some(&weight))
+                        .into_iter()
+                        .take(args.top)
+                        .map(|step| JsonPlanStep {
+                            priority: step.priority,
+                            rule: step.rule,
+                            severity: step.severity.as_str(),
+                            effort: step.effort,
+                            count: step.count,
+                            score: step.score,
+                            files: step.files,
+                            description: step.description,
+                            fix: crate::rule_docs::rule_doc(step.rule).map(|d| d.fix),
+                        })
+                        .collect()
+                });
+                let output = JsonOutput {
+                    schema_version: JSON_SCHEMA_VERSION,
+                    summary: JsonPackageStats::from_result(total),
+                    packages: JsonPackages(
+                        ctx.selected
+                            .iter()
+                            .map(|name| {
+                                (
+                                    name.clone(),
+                                    JsonPackageStats::from_result(&ctx.per_package[name.as_str()]),
+                                )
+                            })
+                            .collect(),
+                    ),
+                    issues: filtered
+                        .iter()
+                        .map(|i| JsonIssue::from_issue(i, workspace_root))
+                        .collect(),
+                    suppressed: total.suppressed,
+                    suppression_help: SUPPRESSION_HELP,
+                    ignored: total
+                        .ignored
+                        .iter()
+                        .map(|i| JsonIgnoredIssue {
+                            issue: JsonIssue::from_issue(i, workspace_root),
+                            reason: i.reason.clone(),
+                        })
+                        .collect(),
+                    diff_base: gating.json_diff_base(),
+                    baseline: gating.json_baseline(),
+                    compare: history.comparison.as_ref().map(Comparison::to_json),
+                    hotspots: history.json_hotspots(),
+                    plan,
+                };
+                println!("{}", dumps_pretty(&output));
+            }
+            "html" => {
+                let current = history.current.as_ref();
+                let past = history.past();
+                print!(
+                    "{}",
+                    crate::html_report::build_html(&crate::html_report::HtmlInput {
+                        packages: ctx.selected,
+                        per_package: ctx.per_package,
+                        total,
+                        issues: filtered,
+                        tool_version: env!("CARGO_PKG_VERSION"),
+                        sha: current.and_then(|c| c.sha.as_deref()),
+                        generated_at: current.map_or("", |c| c.timestamp.as_str()),
+                        notes: &notes,
+                        history: &past,
+                        comparison: history.comparison.as_ref(),
+                        hotspots: history.hotspots.as_deref(),
+                        hotspot_months: history.months,
+                        top: args.top,
+                        workspace_root,
+                    })
+                );
+            }
+            "sarif" => {
+                let document = sarif::build_sarif(
+                    filtered,
+                    &gating.known,
+                    &total.ignored,
+                    env!("CARGO_PKG_VERSION"),
+                    ctx.cwd,
+                    gating.baseline_used,
+                );
+                println!("{}", dumps_pretty(&document));
+            }
+            _ => {
+                render_text_report(filtered, total, workspace_root, args.quiet, &notes);
+                render_hotspots(history, args.top);
+            }
+        }
+    }
 }
 
 /// (errors, warnings, infos) — the report renders this same tally for

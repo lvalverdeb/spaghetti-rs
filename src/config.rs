@@ -54,6 +54,8 @@ pub const MIN_CLONE_TOKENS: usize = 50;
 /// Files whose Maintainability Index is below this are flagged; 10 is the
 /// Radon rank-C boundary ("low maintainability").
 pub const MIN_MAINTAINABILITY_INDEX: usize = 10;
+/// git history window for change-frequency (hotspots, churn-weighted plan).
+pub const HOTSPOT_WINDOW_MONTHS: usize = 6;
 pub const MIN_BOOLEAN_FLAGS: usize = 3;
 pub const MAX_DECORATORS: usize = 3;
 pub const MAX_CLASS_METHODS: usize = 25;
@@ -116,6 +118,7 @@ pub struct Thresholds {
     pub cognitive_complexity_threshold: usize,
     pub min_clone_tokens: usize,
     pub min_maintainability_index: usize,
+    pub hotspot_window_months: usize,
     pub max_class_methods: usize,
     pub max_class_attrs: usize,
     pub min_boolean_flags: usize,
@@ -152,6 +155,7 @@ impl Default for Thresholds {
             cognitive_complexity_threshold: COGNITIVE_COMPLEXITY_THRESHOLD,
             min_clone_tokens: MIN_CLONE_TOKENS,
             min_maintainability_index: MIN_MAINTAINABILITY_INDEX,
+            hotspot_window_months: HOTSPOT_WINDOW_MONTHS,
             max_class_methods: MAX_CLASS_METHODS,
             max_class_attrs: MAX_CLASS_ATTRS,
             min_boolean_flags: MIN_BOOLEAN_FLAGS,
@@ -205,6 +209,7 @@ pub const THRESHOLD_NAMES: &[(&str, ThresholdKind)] = &[
     ("COGNITIVE_COMPLEXITY_THRESHOLD", ThresholdKind::Int),
     ("MIN_CLONE_TOKENS", ThresholdKind::Int),
     ("MIN_MAINTAINABILITY_INDEX", ThresholdKind::Int),
+    ("HOTSPOT_WINDOW_MONTHS", ThresholdKind::Int),
     ("MAX_CLASS_METHODS", ThresholdKind::Int),
     ("MAX_CLASS_ATTRS", ThresholdKind::Int),
     ("MIN_BOOLEAN_FLAGS", ThresholdKind::Int),
@@ -268,6 +273,7 @@ impl Thresholds {
             "COGNITIVE_COMPLEXITY_THRESHOLD" => unsigned(&mut self.cognitive_complexity_threshold),
             "MIN_CLONE_TOKENS" => unsigned(&mut self.min_clone_tokens),
             "MIN_MAINTAINABILITY_INDEX" => unsigned(&mut self.min_maintainability_index),
+            "HOTSPOT_WINDOW_MONTHS" => unsigned(&mut self.hotspot_window_months),
             "MAX_CLASS_METHODS" => unsigned(&mut self.max_class_methods),
             "MAX_CLASS_ATTRS" => unsigned(&mut self.max_class_attrs),
             "MIN_BOOLEAN_FLAGS" => unsigned(&mut self.min_boolean_flags),
@@ -306,6 +312,48 @@ impl Thresholds {
             _ => false,
         }
     }
+
+    /// The live value of the Python constant `name` — `getattr(_cfg, name)`
+    /// for the tunable thresholds (what `explain_rule` reports).
+    pub fn get(&self, name: &str) -> Option<ThresholdValue> {
+        use ThresholdValue::{Float, Int};
+        let u = |v: usize| Some(Int(v as i64));
+        match name {
+            "MAX_FUNCTION_LINES" => u(self.max_function_lines),
+            "MAX_FILE_LINES" => u(self.max_file_lines),
+            "MAX_FUNC_PARAMS" => u(self.max_func_params),
+            "MAX_RETURNS" => u(self.max_returns),
+            "MAX_NESTING_DEPTH" => u(self.max_nesting_depth),
+            "LONG_FUNCTION_FLAT_NESTING_MAX" => u(self.long_function_flat_nesting_max),
+            "MAX_CROSS_LAYER_IMPORTS" => u(self.max_cross_layer_imports),
+            "COMPLEXITY_THRESHOLD" => u(self.complexity_threshold),
+            "COGNITIVE_COMPLEXITY_THRESHOLD" => u(self.cognitive_complexity_threshold),
+            "MIN_CLONE_TOKENS" => u(self.min_clone_tokens),
+            "MIN_MAINTAINABILITY_INDEX" => u(self.min_maintainability_index),
+            "HOTSPOT_WINDOW_MONTHS" => u(self.hotspot_window_months),
+            "MAX_CLASS_METHODS" => u(self.max_class_methods),
+            "MAX_CLASS_ATTRS" => u(self.max_class_attrs),
+            "MIN_BOOLEAN_FLAGS" => u(self.min_boolean_flags),
+            "DEFAULT_MIN_DUPLICATE_LINES" => u(self.default_min_duplicate_lines),
+            "DEFAULT_TWIN_SIMILARITY" => Some(Float(self.default_twin_similarity)),
+            "DEFAULT_TOP_FILES" => u(self.default_top_files),
+            "DEFAULT_PLAN_TOP" => u(self.default_plan_top),
+            "MIN_TWIN_FUNCTION_LINES" => u(self.min_twin_function_lines),
+            "MAX_PUBLIC_SYMBOLS" => u(self.max_public_symbols),
+            "MIN_CLASS_METHODS" => u(self.min_class_methods),
+            "MAX_CLASS_WMC" => Some(Int(self.max_class_wmc)),
+            "MAX_CLASS_LCOM4" => u(self.max_class_lcom4),
+            "MIN_METHODS_FOR_COHESION" => u(self.min_methods_for_cohesion),
+            "MIN_STATEFUL_METHOD_FRACTION" => Some(Float(self.min_stateful_method_fraction)),
+            "MAX_MODULE_FAN_IN" => u(self.max_module_fan_in),
+            "MAX_MODULE_FAN_OUT" => u(self.max_module_fan_out),
+            "ERROR_ESCALATION_MULTIPLIER" => Some(Float(self.error_escalation_multiplier)),
+            "MAX_MESSAGE_CHAIN_DEPTH" => Some(Int(self.max_message_chain_depth)),
+            "MAX_DECORATORS" => u(self.max_decorators),
+            "MAX_INHERITANCE_DEPTH" => u(self.max_inheritance_depth),
+            _ => None,
+        }
+    }
 }
 
 /// `{rule-id: "off" | severity}` from `[tool.spaghetti.rules]` — mirrors
@@ -334,6 +382,9 @@ pub struct Runtime {
     /// applies to; empty by default, set via `library-packages`.
     pub library_packages: BTreeSet<String>,
     pub rule_overrides: BTreeMap<String, RuleSetting>,
+    /// `config.py::CONTRACTS` — architecture contracts from
+    /// `[[tool.spaghetti.contracts]]`; empty by default.
+    pub contracts: Vec<crate::contracts::Contract>,
 }
 
 /// Mirrors `config.py::TRANSPORT_MODULES`.
@@ -368,6 +419,11 @@ pub fn layer_rules(pkg: &str) -> LayerRules {
 /// `pkg in config.py::LIBRARY_PACKAGES`.
 pub fn is_library_package(pkg: &str) -> bool {
     runtime().library_packages.contains(pkg)
+}
+
+/// `config.py::CONTRACTS`.
+pub fn contracts() -> Vec<crate::contracts::Contract> {
+    runtime().contracts.clone()
 }
 
 /// `config.py::RULE_OVERRIDES`.

@@ -16,8 +16,8 @@ use crate::ast_helpers::LineIndex;
 use crate::checks::ast_per_file::Check;
 use crate::checks::package_level::{self, ParsedFile};
 use crate::checks::workspace_level::{
-    PackageImports, build_import_graph, check_duplicate_code_ws, check_import_cycles_ws,
-    check_module_coupling_ws, collect_raw_imports,
+    PackageImports, build_import_graph, check_contracts_ws, check_duplicate_code_ws,
+    check_import_cycles_ws, check_module_coupling_ws, collect_raw_imports, dependency_edges,
 };
 use crate::checks::{ast_per_file, text_per_file};
 use crate::clones::{TokenStream, token_stream};
@@ -120,13 +120,13 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
                 let mi = maintainability_index(body, &source);
                 result.file_mi.insert(path.to_path_buf(), mi);
                 all_issues.extend(ast_per_file::low_maintainability_issue(mi, path, package));
+                let line_index = LineIndex::new(&source);
                 result
                     .raw_imports
-                    .insert(path.to_path_buf(), collect_raw_imports(body));
-                result.token_streams.insert(
-                    path.to_path_buf(),
-                    token_stream(body, &LineIndex::new(&source)),
-                );
+                    .insert(path.to_path_buf(), collect_raw_imports(body, &line_index));
+                result
+                    .token_streams
+                    .insert(path.to_path_buf(), token_stream(body, &line_index));
                 parsed_files.push(ParsedFile {
                     path: path.to_path_buf(),
                     source: source.clone(),
@@ -257,6 +257,11 @@ fn scan_workspace_with(
             config.min_clone_tokens,
             workspace_root,
         ));
+        let contracts = crate::config::contracts();
+        if !contracts.is_empty() {
+            let (edges, index) = dependency_edges(&packages);
+            found.extend(check_contracts_ws(&edges, &index, &contracts));
+        }
         found
     };
 

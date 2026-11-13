@@ -1,0 +1,141 @@
+[
+  {
+    "name": "scan",
+    "description": "Scan Python packages for structural smells. Returns the JSON report: per-package grade and score, every finding with file, line, severity, rule, message and fingerprint.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Project directory (default: the server's cwd)"
+        },
+        "packages": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Packages to scan as {name: path}; omitted, the project's [tool.spaghetti] registry or auto-discovery applies"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ],
+          "description": "Minimum severity to include (default: info)"
+        }
+      }
+    }
+  },
+  {
+    "name": "plan",
+    "description": "Prioritised remediation plan: rules ranked by severity × fix effort (× git churn with hotspots=true), each with its affected files, a fix pattern and the full finding list. Start here to decide what to fix first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Project directory (default: the server's cwd)"
+        },
+        "packages": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Packages to scan as {name: path}; omitted, the project's [tool.spaghetti] registry or auto-discovery applies"
+        },
+        "top": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Steps to return"
+        },
+        "hotspots": {
+          "type": "boolean",
+          "description": "Weight by git change frequency (needs a git checkout)"
+        }
+      }
+    }
+  },
+  {
+    "name": "explain_rule",
+    "description": "What a rule catches, why it matters, the refactoring that fixes it, its thresholds and the Pylint/Ruff/SonarQube equivalents.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "rule": {
+          "type": "string",
+          "description": "Rule id"
+        }
+      },
+      "required": [
+        "rule"
+      ]
+    }
+  },
+  {
+    "name": "compare",
+    "description": "Delta against a stored snapshot: score change, findings introduced and fixed, files that got worse. ref is 'latest', '~N', a git SHA prefix or a timestamp prefix.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Project directory (default: the server's cwd)"
+        },
+        "packages": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Packages to scan as {name: path}; omitted, the project's [tool.spaghetti] registry or auto-discovery applies"
+        },
+        "ref": {
+          "type": "string",
+          "description": "Snapshot reference"
+        },
+        "store": {
+          "type": "string",
+          "description": "Snapshot store path"
+        }
+      },
+      "required": [
+        "ref"
+      ]
+    }
+  },
+  {
+    "name": "baseline",
+    "description": "Baseline management. action='status' reports how many findings the baseline hides and which it lists as fixed; action='update' rewrites it from the current scan so only new findings fail CI from now on.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Project directory (default: the server's cwd)"
+        },
+        "packages": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Packages to scan as {name: path}; omitted, the project's [tool.spaghetti] registry or auto-discovery applies"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "status",
+            "update"
+          ]
+        },
+        "baseline": {
+          "type": "string",
+          "description": "Baseline file path"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    }
+  }
+]

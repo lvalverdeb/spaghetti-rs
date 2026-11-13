@@ -291,7 +291,9 @@ fn config_file_without_packages_mapping_errors() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unknown setting(s): not_packages. Known: baseline, exclude, fail-on"),
+        stderr.contains(
+            "unknown setting(s): not_packages. Known: baseline, contracts, exclude, fail-on"
+        ),
         "unexpected stderr: {stderr}"
     );
 }

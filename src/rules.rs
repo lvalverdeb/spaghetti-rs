@@ -263,6 +263,12 @@ pub const RULE_CATALOG: &[RuleMeta] = &[
         Workspace,
     ),
     r(
+        "contract-violation",
+        "Import forbidden by an architecture contract",
+        Error,
+        Workspace,
+    ),
+    r(
         "high-coupling",
         "Module with both high fan-in and high fan-out",
         Warning,
@@ -315,10 +321,10 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn catalog_has_45_unique_rules_with_the_audited_ones_off() {
-        assert_eq!(RULE_CATALOG.len(), 45);
+    fn catalog_has_46_unique_rules_with_the_audited_ones_off() {
+        assert_eq!(RULE_CATALOG.len(), 46);
         let ids: HashSet<&str> = RULE_CATALOG.iter().map(|m| m.id).collect();
-        assert_eq!(ids.len(), 45);
+        assert_eq!(ids.len(), 46);
         let off: HashSet<&str> = RULE_CATALOG
             .iter()
             .filter(|m| !m.enabled_by_default)

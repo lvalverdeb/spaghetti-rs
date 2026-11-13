@@ -8,11 +8,13 @@
 //! two packages is found and a single-package run reports exactly what the
 //! old per-package checks did.
 
+use crate::ast_helpers::LineIndex;
 use crate::checks::package_level::{
     ImportNode, import_targets, module_and_package_for, module_level_imports, package_prefix,
 };
 use crate::clones::{TokenStream, duplicated_regions, find_clone_groups};
 use crate::config::thresholds;
+use crate::contracts::{Contract, violation_reason};
 use crate::models::{Issue, Severity, display_path};
 use indexmap::IndexMap;
 use rustpython_ast::Stmt;
@@ -27,9 +29,12 @@ pub struct RawImport {
     pub level: Option<usize>,
     pub module: Option<String>,
     pub names: Vec<String>,
+    /// The import statement's line (`node.lineno`), for contract findings.
+    pub line: usize,
 }
 
-pub fn collect_raw_imports(module_body: &[Stmt]) -> Vec<RawImport> {
+pub fn collect_raw_imports(module_body: &[Stmt], lines: &LineIndex) -> Vec<RawImport> {
+    use rustpython_ast::Ranged;
     let mut raw = Vec::new();
     for node in module_level_imports(module_body) {
         match node {
@@ -37,13 +42,16 @@ pub fn collect_raw_imports(module_body: &[Stmt]) -> Vec<RawImport> {
                 level: Some(n.level.as_ref().map(|l| l.to_usize()).unwrap_or(0)),
                 module: n.module.as_ref().map(|m| m.to_string()),
                 names: n.names.iter().map(|a| a.name.to_string()).collect(),
+                line: lines.line_number(n.range().start()),
             }),
             ImportNode::Import(n) => {
+                let line = lines.line_number(n.range().start());
                 for alias in &n.names {
                     raw.push(RawImport {
                         level: None,
                         module: Some(alias.name.to_string()),
                         names: Vec::new(),
+                        line,
                     });
                 }
             }
@@ -118,6 +126,64 @@ pub fn build_import_graph(packages: &[PackageImports<'_>]) -> (Graph, ModuleInde
         }
     }
     (graph, index)
+}
+
+/// (importing module, imported dotted name, line) — every import, third-party included.
+pub type Edge = (String, String, usize);
+
+/// Every resolved import edge in file order, workspace and external alike,
+/// for the architecture-contract check — mirrors `dependency_edges`.
+pub fn dependency_edges(packages: &[PackageImports<'_>]) -> (Vec<Edge>, ModuleIndex) {
+    let index = module_index(packages);
+    let modules: HashSet<String> = index.keys().cloned().collect();
+    let files_of: HashMap<&str, &IndexMap<PathBuf, Vec<RawImport>>> =
+        packages.iter().map(|p| (p.name, p.files)).collect();
+    let roots: HashMap<&str, &Path> = packages.iter().map(|p| (p.name, p.root)).collect();
+    let mut edges = Vec::new();
+    for (module, (pkg_name, filepath)) in &index {
+        let (_, package) = module_and_package_for(roots[pkg_name.as_str()], filepath);
+        for raw in &files_of[pkg_name.as_str()][filepath] {
+            edges.extend(
+                resolve(raw, &package, &modules)
+                    .into_iter()
+                    .filter(|t| !t.is_empty())
+                    .map(|t| (module.clone(), t, raw.line)),
+            );
+        }
+    }
+    (edges, index)
+}
+
+/// One finding per (import, contract) pair that breaks a contract — mirrors
+/// `check_contracts_ws`.
+pub fn check_contracts_ws(
+    edges: &[Edge],
+    index: &ModuleIndex,
+    contracts: &[Contract],
+) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    for (module, target, line) in edges {
+        for contract in contracts {
+            let Some(reason) = violation_reason(contract, module, target) else {
+                continue;
+            };
+            let (pkg_name, filepath) = &index[module.as_str()];
+            issues.push(Issue::new(
+                filepath,
+                *line,
+                Severity::Error,
+                "contract-violation",
+                pkg_name,
+                format!(
+                    "Contract '{}': {module} imports {target} \u{2014} {reason}; depend on an \
+                     abstraction (e.g. a typing.Protocol) the lower layer implements and inject \
+                     it instead (Dependency Inversion Principle)",
+                    contract.name
+                ),
+            ));
+        }
+    }
+    issues
 }
 
 const CYCLE_HINT: &str = " — extract a shared abstraction (e.g. a typing.Protocol) both sides can \
@@ -302,7 +368,7 @@ mod tests {
         let Mod::Module(m) = module else {
             unreachable!()
         };
-        collect_raw_imports(&m.body)
+        collect_raw_imports(&m.body, &crate::ast_helpers::LineIndex::new(source))
     }
 
     fn graph_for(root: &str, files: &[(&str, &str)]) -> (Graph, ModuleIndex) {
