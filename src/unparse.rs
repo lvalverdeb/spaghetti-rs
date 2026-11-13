@@ -8,16 +8,121 @@
 //! (indentation + control-flow keywords) that delegates every leaf
 //! expression to that existing, working `Display for Expr`.
 //!
-//! Exact fidelity to Python's own `ast.unparse()` output doesn't matter
-//! here — the two unparsed strings are only ever compared against each
-//! other (via `similarity::sequence_matcher_ratio`), both produced by this
-//! same renderer, so what matters is that structurally-similar code
-//! produces textually-similar output and structurally-different code
-//! doesn't, not that the exact tokens match Python's own unparser
-//! byte-for-byte.
+//! The two unparsed strings are only ever compared against each other (via
+//! `similarity::sequence_matcher_ratio`), but the *ratio* is reported in the
+//! message, so where this renderer and Python's disagree on token shape the
+//! percentage drifts by a point. Every such drift found on the five-repo
+//! corpus (docstrings as `"""..."""`, `+=` spelling, bare `yield`
+//! statements without parentheses) is fixed here to match `ast.unparse`.
 
-use rustpython_ast::{Stmt, WithItem};
+use rustpython_ast::{Constant, Expr, Operator, Stmt, WithItem};
 use std::fmt::Write as _;
+
+/// `ast.unparse`'s `_write_docstring`: a body's leading string constant is
+/// rendered triple-quoted with raw newlines, not as `repr()` output.
+fn docstring_of(body: &[Stmt]) -> Option<&str> {
+    let Some(Stmt::Expr(e)) = body.first() else {
+        return None;
+    };
+    match e.value.as_ref() {
+        Expr::Constant(c) => match &c.value {
+            Constant::Str(s) => Some(s.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `ast.unparse`'s `_str_literal_helper(value, quote_types=_MULTI_QUOTES)`.
+fn docstring_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\n' | '\t' => escaped.push(c),
+            '\\' => escaped.push_str("\\\\"),
+            c if c.is_control() => {
+                let code = c as u32;
+                if code < 0x100 {
+                    let _ = write!(escaped, "\\x{code:02x}");
+                } else if code < 0x10000 {
+                    let _ = write!(escaped, "\\u{code:04x}");
+                } else {
+                    let _ = write!(escaped, "\\U{code:08x}");
+                }
+            }
+            c => escaped.push(c),
+        }
+    }
+    let mut quotes: Vec<&str> = ["\"\"\"", "'''"]
+        .into_iter()
+        .filter(|q| !escaped.contains(q))
+        .collect();
+    if quotes.is_empty() {
+        // Both triple quotes occur: Python falls back to `repr()`, which
+        // picks single quotes unless the text has one and no double quote.
+        let single = escaped.contains('\'') && !escaped.contains('"');
+        let q = if single { '"' } else { '\'' };
+        let body = escaped
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+            .replace(q, &format!("\\{q}"));
+        return format!("{q}{body}{q}");
+    }
+    if let Some(last) = escaped.chars().last() {
+        // Prefer a quote that doesn't share its first character with the
+        // text's last one; if both do, escape that last character.
+        quotes.sort_by_key(|q| q.starts_with(last));
+        if quotes[0].starts_with(last) {
+            escaped.pop();
+            escaped.push('\\');
+            escaped.push(last);
+        }
+    }
+    format!("{}{escaped}{}", quotes[0], quotes[0])
+}
+
+/// A `def`/`class` body: its docstring (if any) the way `ast.unparse` spells
+/// it, then the remaining statements.
+fn unparse_scoped_body_into(body: &[Stmt], depth: usize, out: &mut String) {
+    match docstring_of(body) {
+        Some(doc) => {
+            let _ = writeln!(out, "{}{}", indent_str(depth), docstring_literal(doc));
+            unparse_body_into(&body[1..], depth, out);
+        }
+        None => unparse_body_into(body, depth, out),
+    }
+}
+
+fn operator_symbol(op: &Operator) -> &'static str {
+    match op {
+        Operator::Add => "+",
+        Operator::Sub => "-",
+        Operator::Mult => "*",
+        Operator::MatMult => "@",
+        Operator::Div => "/",
+        Operator::Mod => "%",
+        Operator::Pow => "**",
+        Operator::LShift => "<<",
+        Operator::RShift => ">>",
+        Operator::BitOr => "|",
+        Operator::BitXor => "^",
+        Operator::BitAnd => "&",
+        Operator::FloorDiv => "//",
+    }
+}
+
+/// An expression statement: `ast.unparse` sets `yield` precedence on the
+/// value, so a bare `yield x` / `yield from x` statement carries no
+/// parentheses, unlike the same expression nested anywhere else (which
+/// `Display for Expr` always parenthesises).
+fn unparse_expr_stmt(value: &Expr) -> String {
+    let text = value.to_string();
+    if matches!(value, Expr::Yield(_) | Expr::YieldFrom(_)) {
+        text[1..text.len() - 1].to_string()
+    } else {
+        text
+    }
+}
 
 fn indent_str(depth: usize) -> String {
     "    ".repeat(depth)
@@ -118,7 +223,7 @@ fn unparse_stmt_into(stmt: &Stmt, depth: usize, out: &mut String) {
                 unparse_params(&f.args),
                 return_annotation(&f.returns)
             );
-            unparse_body_into(&f.body, depth + 1, out);
+            unparse_scoped_body_into(&f.body, depth + 1, out);
         }
         Stmt::AsyncFunctionDef(f) => {
             write_decorators(&f.decorator_list, &pad, out);
@@ -129,12 +234,12 @@ fn unparse_stmt_into(stmt: &Stmt, depth: usize, out: &mut String) {
                 unparse_params(&f.args),
                 return_annotation(&f.returns)
             );
-            unparse_body_into(&f.body, depth + 1, out);
+            unparse_scoped_body_into(&f.body, depth + 1, out);
         }
         Stmt::ClassDef(c) => {
             write_decorators(&c.decorator_list, &pad, out);
             let _ = writeln!(out, "{pad}class {}:", c.name);
-            unparse_body_into(&c.body, depth + 1, out);
+            unparse_scoped_body_into(&c.body, depth + 1, out);
         }
         Stmt::Return(r) => match &r.value {
             Some(v) => {
@@ -156,7 +261,13 @@ fn unparse_stmt_into(stmt: &Stmt, depth: usize, out: &mut String) {
             let _ = writeln!(out, "{pad}type {} = {}", t.name, t.value);
         }
         Stmt::AugAssign(a) => {
-            let _ = writeln!(out, "{pad}{} {:?}= {}", a.target, a.op, a.value);
+            let _ = writeln!(
+                out,
+                "{pad}{} {}= {}",
+                a.target,
+                operator_symbol(&a.op),
+                a.value
+            );
         }
         Stmt::AnnAssign(a) => match &a.value {
             Some(v) => {
@@ -314,7 +425,7 @@ fn unparse_stmt_into(stmt: &Stmt, depth: usize, out: &mut String) {
             let _ = writeln!(out, "{pad}nonlocal {}", names.join(", "));
         }
         Stmt::Expr(e) => {
-            let _ = writeln!(out, "{pad}{}", e.value);
+            let _ = writeln!(out, "{pad}{}", unparse_expr_stmt(&e.value));
         }
         Stmt::Pass(_) => {
             let _ = writeln!(out, "{pad}pass");
@@ -343,6 +454,11 @@ fn unparse_body_into(body: &[Stmt], depth: usize, out: &mut String) {
 pub fn unparse_function(stmt: &Stmt) -> String {
     let mut out = String::new();
     unparse_stmt_into(stmt, 0, &mut out);
+    // `ast.unparse` joins lines with "\n" and has no trailing newline; one
+    // extra character shifts the reported similarity ratio by a point.
+    if out.ends_with('\n') {
+        out.pop();
+    }
     out
 }
 

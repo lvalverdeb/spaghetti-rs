@@ -17,9 +17,11 @@ use crate::checks::package_level::{self, ParsedFile};
 use crate::checks::{ast_per_file, text_per_file};
 use crate::config::{RuleSetting, rule_overrides};
 use crate::models::{Issue, ScanConfig, ScanResult, Severity};
+use crate::rules::{is_enabled_by_default, is_known_rule};
 use crate::suppression::is_suppressed;
 use regex::Regex;
 use sha1::{Digest, Sha1};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -155,7 +157,7 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
         .map(|(p, s)| (p.as_path(), s.lines().collect()))
         .collect();
 
-    let mut all_issues = apply_rule_overrides(all_issues);
+    let mut all_issues = apply_rule_overrides(all_issues, &rule_overrides());
     for issue in &mut all_issues {
         normalize_columns(issue, lines_by_file.get(issue.file.as_path()));
     }
@@ -178,15 +180,16 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
     result
 }
 
-/// Honour `[tool.spaghetti.rules]`: drop rules set to `off`, rewrite the
-/// severity of the rest — mirrors `detector._apply_rule_overrides`. Runs
-/// before fingerprinting so a severity change doesn't alter a finding's
-/// identity (the fingerprint ignores severity).
-fn apply_rule_overrides(issues: Vec<Issue>) -> Vec<Issue> {
-    let overrides = rule_overrides();
-    if overrides.is_empty() {
-        return issues;
-    }
+/// Honour the catalog's `enabled_by_default` and `[tool.spaghetti.rules]`:
+/// drop rules that ship off unless opted in, drop rules set to `off`,
+/// rewrite the severity of the rest — mirrors `detector._apply_rule_overrides`.
+/// Runs before fingerprinting so a severity change doesn't alter a finding's
+/// identity (the fingerprint ignores severity). A rule not in the catalog
+/// is never dropped silently.
+fn apply_rule_overrides(
+    issues: Vec<Issue>,
+    overrides: &BTreeMap<String, RuleSetting>,
+) -> Vec<Issue> {
     issues
         .into_iter()
         .filter_map(|mut issue| match overrides.get(issue.rule) {
@@ -195,6 +198,7 @@ fn apply_rule_overrides(issues: Vec<Issue>) -> Vec<Issue> {
                 issue.severity = *severity;
                 Some(issue)
             }
+            None if is_known_rule(issue.rule) && !is_enabled_by_default(issue.rule) => None,
             None => Some(issue),
         })
         .collect()
@@ -441,11 +445,15 @@ mod location_and_fingerprint_tests {
     #[test]
     fn unlocated_rules_leave_columns_none() {
         let pkg = fresh_pkg("unlocated");
-        std::fs::write(pkg.join("m.py"), "import os  # TODO: drop\n").unwrap();
+        std::fs::write(
+            pkg.join("m.py"),
+            "# TODO: drop\ndef f() -> int:\n    return 1\n    x = 2\n",
+        )
+        .unwrap();
         let result = scan_package("pkg", &pkg, &config());
         std::fs::remove_dir_all(pkg.parent().unwrap()).ok();
 
-        for rule in ["todo-marker", "unused-import"] {
+        for rule in ["todo-marker", "dead-code"] {
             let issue = result
                 .issues
                 .iter()
@@ -500,5 +508,59 @@ mod location_and_fingerprint_tests {
             .find(|i| i.rule == "missing-return-type")
             .unwrap();
         assert_eq!(issue.fingerprint, "87723ab8afbf36e7");
+    }
+}
+
+#[cfg(test)]
+mod rule_override_tests {
+    // Mirrors tests/test_calibration.py's enabled_by_default plumbing tests.
+    use super::apply_rule_overrides;
+    use crate::config::RuleSetting;
+    use crate::models::{Issue, Severity};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn issue(rule: &'static str) -> Issue {
+        Issue::new(
+            Path::new("f.py"),
+            1,
+            Severity::Info,
+            rule,
+            "pkg",
+            "m".into(),
+        )
+    }
+
+    #[test]
+    fn rules_off_by_default_are_dropped_unless_opted_in() {
+        let issues = vec![
+            issue("magic-number"),
+            issue("missing-else"),
+            issue("dead-code"),
+        ];
+        let kept: Vec<&str> = apply_rule_overrides(issues.clone(), &BTreeMap::new())
+            .iter()
+            .map(|i| i.rule)
+            .collect();
+        assert_eq!(kept, ["dead-code"]);
+
+        let overrides = BTreeMap::from([(
+            "magic-number".to_string(),
+            RuleSetting::Severity(Severity::Warning),
+        )]);
+        let kept = apply_rule_overrides(issues, &overrides);
+        let magic: Vec<&Issue> = kept.iter().filter(|i| i.rule == "magic-number").collect();
+        assert!(!magic.is_empty());
+        assert!(magic.iter().all(|i| i.severity == Severity::Warning));
+        assert!(!kept.iter().any(|i| i.rule == "missing-else"));
+    }
+
+    #[test]
+    fn apply_rule_overrides_keeps_unknown_rules() {
+        // A rule not in the catalog (e.g. a future experimental one) is never
+        // dropped silently.
+        let kept = apply_rule_overrides(vec![issue("future-rule")], &BTreeMap::new());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].rule, "future-rule");
     }
 }

@@ -423,6 +423,22 @@ pub fn walk_keyword_children<V: Visitor + ?Sized>(visitor: &mut V, node: rustpyt
 // pattern again — a no-op). A magic number or Name usage inside a `with`
 // statement's own context-manager expression (e.g. `with
 // open(path, encoding="utf-8") as f:`) would be invisible without this.
+/// `generic_visit_match_case` is a no-op in rustpython-ast 0.4, so a `match`
+/// arm's guard and body are invisible to every visitor unless walked by
+/// hand — `ast.walk` descends into them like any other statement list.
+pub fn walk_match_case_children<V: Visitor + ?Sized>(
+    visitor: &mut V,
+    node: rustpython_ast::MatchCase,
+) {
+    visitor.visit_pattern(node.pattern);
+    if let Some(guard) = node.guard {
+        visitor.visit_expr(*guard);
+    }
+    for stmt in node.body {
+        visitor.visit_stmt(stmt);
+    }
+}
+
 pub fn walk_withitem_children<V: Visitor + ?Sized>(
     visitor: &mut V,
     node: rustpython_ast::WithItem,
@@ -458,6 +474,9 @@ impl Visitor for ComplexityVisitor {
     }
     fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
         walk_withitem_children(self, node);
+    }
+    fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
+        walk_match_case_children(self, node);
     }
     fn visit_stmt_if(&mut self, node: StmtIf) {
         self.complexity += 1;
@@ -657,4 +676,102 @@ pub fn is_test_file(filepath: &std::path::Path) -> bool {
     filepath
         .parent()
         .is_some_and(|parent| parent.components().any(|c| c.as_os_str() == "tests"))
+}
+
+// ── `ast.walk` over statements ───────────────────────────────────────────────
+
+/// A node on the breadth-first frontier of `ast.walk`. Expressions never
+/// contain statements, so walking statement-level nodes alone reproduces
+/// the relative order `ast.walk(tree)` yields them in; `ExceptHandler` and
+/// `match_case` are AST nodes of their own in Python, so they add a level
+/// of depth and must be queued as such for that order to match exactly.
+pub enum WalkNode<'a> {
+    Stmt(&'a Stmt),
+    Handler(&'a rustpython_ast::ExceptHandler),
+    Case(&'a rustpython_ast::MatchCase),
+}
+
+/// Every `ClassDef` in the module in `ast.walk` (breadth-first) order.
+pub fn collect_classes_bfs(module_body: &[Stmt]) -> Vec<&rustpython_ast::StmtClassDef> {
+    walk_stmts_bfs(module_body)
+        .into_iter()
+        .filter_map(|node| match node {
+            WalkNode::Stmt(Stmt::ClassDef(c)) => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `ExceptHandler` in the module in `ast.walk` (breadth-first) order.
+pub fn collect_except_handlers_bfs(
+    module_body: &[Stmt],
+) -> Vec<&rustpython_ast::ExceptHandlerExceptHandler> {
+    walk_stmts_bfs(module_body)
+        .into_iter()
+        .filter_map(|node| match node {
+            WalkNode::Handler(rustpython_ast::ExceptHandler::ExceptHandler(h)) => Some(h),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every statement-level node under `module_body` in `ast.walk` order.
+pub fn walk_stmts_bfs(module_body: &[Stmt]) -> Vec<WalkNode<'_>> {
+    let mut queue: VecDeque<WalkNode<'_>> = module_body.iter().map(WalkNode::Stmt).collect();
+    let mut visited = Vec::new();
+    while let Some(node) = queue.pop_front() {
+        let stmt = match node {
+            WalkNode::Stmt(stmt) => stmt,
+            WalkNode::Handler(rustpython_ast::ExceptHandler::ExceptHandler(h)) => {
+                queue.extend(h.body.iter().map(WalkNode::Stmt));
+                visited.push(node);
+                continue;
+            }
+            WalkNode::Case(case) => {
+                queue.extend(case.body.iter().map(WalkNode::Stmt));
+                visited.push(node);
+                continue;
+            }
+        };
+        visited.push(WalkNode::Stmt(stmt));
+        // Children in `_fields` order, as `ast.iter_child_nodes` yields them.
+        match stmt {
+            Stmt::ClassDef(c) => queue.extend(c.body.iter().map(WalkNode::Stmt)),
+            Stmt::FunctionDef(f) => queue.extend(f.body.iter().map(WalkNode::Stmt)),
+            Stmt::AsyncFunctionDef(f) => queue.extend(f.body.iter().map(WalkNode::Stmt)),
+            Stmt::For(f) => {
+                queue.extend(f.body.iter().map(WalkNode::Stmt));
+                queue.extend(f.orelse.iter().map(WalkNode::Stmt));
+            }
+            Stmt::AsyncFor(f) => {
+                queue.extend(f.body.iter().map(WalkNode::Stmt));
+                queue.extend(f.orelse.iter().map(WalkNode::Stmt));
+            }
+            Stmt::While(w) => {
+                queue.extend(w.body.iter().map(WalkNode::Stmt));
+                queue.extend(w.orelse.iter().map(WalkNode::Stmt));
+            }
+            Stmt::If(i) => {
+                queue.extend(i.body.iter().map(WalkNode::Stmt));
+                queue.extend(i.orelse.iter().map(WalkNode::Stmt));
+            }
+            Stmt::With(w) => queue.extend(w.body.iter().map(WalkNode::Stmt)),
+            Stmt::AsyncWith(w) => queue.extend(w.body.iter().map(WalkNode::Stmt)),
+            Stmt::Match(m) => queue.extend(m.cases.iter().map(WalkNode::Case)),
+            Stmt::Try(t) => {
+                queue.extend(t.body.iter().map(WalkNode::Stmt));
+                queue.extend(t.handlers.iter().map(WalkNode::Handler));
+                queue.extend(t.orelse.iter().map(WalkNode::Stmt));
+                queue.extend(t.finalbody.iter().map(WalkNode::Stmt));
+            }
+            Stmt::TryStar(t) => {
+                queue.extend(t.body.iter().map(WalkNode::Stmt));
+                queue.extend(t.handlers.iter().map(WalkNode::Handler));
+                queue.extend(t.orelse.iter().map(WalkNode::Stmt));
+                queue.extend(t.finalbody.iter().map(WalkNode::Stmt));
+            }
+            _ => {}
+        }
+    }
+    visited
 }

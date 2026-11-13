@@ -499,7 +499,7 @@ fn baseline_roundtrip_hides_known_and_reports_fixed() {
     let baseline: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&baseline_path).unwrap()).unwrap();
     let n = baseline["findings"].as_object().unwrap().len();
-    assert!(n >= 5);
+    assert!(n >= 4);
     assert!(
         std::fs::read_to_string(&baseline_path)
             .unwrap()
@@ -582,7 +582,7 @@ fn diff_base_restricts_to_changed_lines() {
             .all(|i| i["message"].as_str().unwrap().starts_with("g()"))
     );
     assert_eq!(report["diff_base"]["ref"], "HEAD");
-    assert!(report["diff_base"]["hidden"].as_u64().unwrap() >= 5);
+    assert!(report["diff_base"]["hidden"].as_u64().unwrap() >= 4);
     assert!(String::from_utf8_lossy(&text.stdout).contains("Changed lines only (vs HEAD)"));
 }
 
@@ -645,4 +645,38 @@ fn sarif_output_is_well_formed() {
         .collect();
     assert!(uris.iter().all(|u| !u.starts_with('/')));
     assert!(uris.contains(&"src/mylib/m.py"));
+}
+
+#[test]
+fn rules_table_opts_an_off_by_default_rule_back_in() {
+    // Mirrors tests/test_calibration.py::test_rules_off_by_default_are_dropped_unless_opted_in
+    let root = project("optin");
+    let source =
+        "def f() -> int:\n    x = 42\n    if x:\n        y = 1\n        z = 2\n    return x\n";
+    std::fs::write(root.join("src/mylib/m.py"), source).unwrap();
+    let pyproject = |rules: &str| {
+        format!(
+            "[tool.spaghetti]\nfail-on = \"never\"\n[tool.spaghetti.packages]\nmylib = \
+             \"src/mylib\"\n{rules}"
+        )
+    };
+    std::fs::write(root.join("pyproject.toml"), pyproject("")).unwrap();
+    let rules = rules_and_severities(&json_of(&run_cli(&root, &["--json"])));
+    assert!(
+        !rules
+            .iter()
+            .any(|(r, _)| r == "magic-number" || r == "missing-else")
+    );
+
+    std::fs::write(
+        root.join("pyproject.toml"),
+        pyproject("[tool.spaghetti.rules]\nmagic-number = \"warning\"\n"),
+    )
+    .unwrap();
+    let rules = rules_and_severities(&json_of(&run_cli(&root, &["--json"])));
+    std::fs::remove_dir_all(root.parent().unwrap()).ok();
+    let magic: Vec<&(String, String)> = rules.iter().filter(|(r, _)| r == "magic-number").collect();
+    assert!(!magic.is_empty());
+    assert!(magic.iter().all(|(_, s)| s == "warning"));
+    assert!(!rules.iter().any(|(r, _)| r == "missing-else"));
 }

@@ -4,10 +4,10 @@
 //! Mirrors `spaghetti/checks/package_level.py`.
 
 use crate::ast_helpers::{
-    FuncNode, LineIndex, NodeLoc, collect_functions, collect_functions_with_class_context,
-    dump_stmts, is_trivial_body, line_count,
+    FuncNode, LineIndex, NodeLoc, collect_classes_bfs, collect_functions,
+    collect_functions_with_class_context, dump_stmts, is_trivial_body, line_count,
 };
-use crate::config::{Thresholds, thresholds};
+use crate::config::{Thresholds, is_dunder, thresholds};
 use crate::models::{Issue, Severity, display_path};
 use crate::similarity::sequence_matcher_ratio;
 use crate::unparse::unparse_function;
@@ -102,47 +102,61 @@ fn module_and_package_for(pkg_root: &Path, filepath: &Path) -> (String, String) 
 
 /// Resolves an `ImportFrom` to the dotted module name(s) it depends on —
 /// mirrors `_import_targets`, including the relative-import (`level`) math.
-fn import_targets(package: &str, node: &rustpython_ast::StmtImportFrom) -> Vec<String> {
+///
+/// `from pkg import name` binds the *submodule* `pkg.name` when one exists,
+/// so with `modules` (the package's known module names) the edge points at
+/// that submodule rather than at `pkg`'s `__init__` — the ubiquitous
+/// `__init__` re-export pattern is then not a cycle.
+fn import_targets(
+    package: &str,
+    node: &rustpython_ast::StmtImportFrom,
+    modules: &HashMap<String, &Path>,
+) -> Vec<String> {
     let level = node.level.as_ref().map(|l| l.to_usize()).unwrap_or(0);
-    if level == 0 {
-        return node
-            .module
+    let base = if level == 0 {
+        node.module
             .as_ref()
-            .map(|m| vec![m.to_string()])
-            .unwrap_or_default();
-    }
-    let mut pkg_parts: Vec<&str> = if package.is_empty() {
-        Vec::new()
+            .map(|m| m.to_string())
+            .unwrap_or_default()
     } else {
-        package.split('.').collect()
-    };
-    let up = level - 1;
-    if up > 0 {
-        if up <= pkg_parts.len() {
-            pkg_parts.truncate(pkg_parts.len() - up);
+        let mut pkg_parts: Vec<&str> = if package.is_empty() {
+            Vec::new()
         } else {
-            pkg_parts.clear();
+            package.split('.').collect()
+        };
+        let up = level - 1;
+        if up > 0 {
+            if up <= pkg_parts.len() {
+                pkg_parts.truncate(pkg_parts.len() - up);
+            } else {
+                pkg_parts.clear();
+            }
         }
+        let joined = pkg_parts.join(".");
+        match &node.module {
+            Some(m) if joined.is_empty() => m.to_string(),
+            Some(m) => format!("{joined}.{m}"),
+            None => joined,
+        }
+    };
+    if base.is_empty() {
+        return node.names.iter().map(|a| a.name.to_string()).collect();
     }
-    let base = pkg_parts.join(".");
-    if let Some(m) = &node.module {
-        vec![if base.is_empty() {
-            m.to_string()
-        } else {
-            format!("{base}.{m}")
-        }]
-    } else {
-        node.names
-            .iter()
-            .map(|a| {
-                if base.is_empty() {
-                    a.name.to_string()
-                } else {
-                    format!("{base}.{}", a.name)
-                }
-            })
-            .collect()
-    }
+    let mut targets: Vec<String> = node
+        .names
+        .iter()
+        .map(|a| {
+            let candidate = format!("{base}.{}", a.name);
+            if modules.contains_key(&candidate) {
+                candidate
+            } else {
+                base.clone()
+            }
+        })
+        .collect();
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 fn is_type_checking_guard(test: &rustpython_ast::Expr) -> bool {
@@ -154,6 +168,13 @@ fn is_type_checking_guard(test: &rustpython_ast::Expr) -> bool {
     }
 }
 
+/// `if __name__ == "__main__":` — never executes when the module is imported.
+/// Mirrors `_is_main_guard`: any `Compare` whose left operand is `__name__`.
+fn is_main_guard(test: &rustpython_ast::Expr) -> bool {
+    use rustpython_ast::Expr;
+    matches!(test, Expr::Compare(c) if matches!(c.left.as_ref(), Expr::Name(n) if n.id.as_str() == "__name__"))
+}
+
 enum ImportNode {
     Import(rustpython_ast::StmtImport),
     ImportFrom(rustpython_ast::StmtImportFrom),
@@ -161,7 +182,8 @@ enum ImportNode {
 
 /// Imports that actually execute at module-import time — mirrors
 /// `_module_level_imports`: stops at nested function/lambda boundaries and
-/// skips `if TYPE_CHECKING:` guards entirely (no recursion into either).
+/// skips `if TYPE_CHECKING:` and `if __name__ == "__main__":` guards
+/// entirely (no recursion into any of them).
 struct ModuleLevelImportCollector {
     imports: Vec<ImportNode>,
 }
@@ -170,7 +192,7 @@ impl Visitor for ModuleLevelImportCollector {
     fn visit_stmt_async_function_def(&mut self, _node: rustpython_ast::StmtAsyncFunctionDef) {}
     fn visit_expr_lambda(&mut self, _node: rustpython_ast::ExprLambda) {}
     fn visit_stmt_if(&mut self, node: rustpython_ast::StmtIf) {
-        if is_type_checking_guard(&node.test) {
+        if is_type_checking_guard(&node.test) || is_main_guard(&node.test) {
             return;
         }
         self.generic_visit_stmt_if(node);
@@ -212,13 +234,19 @@ fn build_import_graph<'a>(
     let prefix = package_prefix(pkg_root);
     let stem = prefix.trim_end_matches('.');
 
+    // Every module name first, so `from pkg import name` can be resolved to
+    // the submodule `pkg.name` when that is what the import binds.
+    for f in files {
+        let (mod_name, _) = module_and_package_for(pkg_root, &f.path);
+        file_for_module.insert(mod_name, f.path.as_path());
+    }
+
     for f in files {
         let (mod_name, package) = module_and_package_for(pkg_root, &f.path);
-        file_for_module.insert(mod_name.clone(), f.path.as_path());
         for node in module_level_imports(module_body(&f.module)) {
             match node {
                 ImportNode::ImportFrom(n) => {
-                    for resolved in import_targets(&package, &n) {
+                    for resolved in import_targets(&package, &n, &file_for_module) {
                         if resolved == stem || resolved.starts_with(&format!("{stem}.")) {
                             graph.entry(mod_name.clone()).or_default().insert(resolved);
                         }
@@ -390,78 +418,6 @@ pub fn check_module_coupling_pkg(
 
 // ── Orphan Interfaces (whole-package) ────────────────────────────────────────
 
-/// A node on the breadth-first frontier of `ast.walk`. Only statements can
-/// contain a `ClassDef`, but `ExceptHandler` and `match_case` are AST nodes of
-/// their own in Python, so they add a level of depth and must be queued as
-/// such for the class order to match `ast.walk(tree)` exactly.
-enum WalkNode<'a> {
-    Stmt(&'a Stmt),
-    Handler(&'a rustpython_ast::ExceptHandler),
-    Case(&'a rustpython_ast::MatchCase),
-}
-
-/// Every `ClassDef` in the module in `ast.walk` (breadth-first) order.
-fn collect_classes_bfs(module_body: &[Stmt]) -> Vec<&rustpython_ast::StmtClassDef> {
-    use std::collections::VecDeque;
-    let mut queue: VecDeque<WalkNode<'_>> = module_body.iter().map(WalkNode::Stmt).collect();
-    let mut classes = Vec::new();
-    while let Some(node) = queue.pop_front() {
-        let stmt = match node {
-            WalkNode::Stmt(stmt) => stmt,
-            WalkNode::Handler(rustpython_ast::ExceptHandler::ExceptHandler(h)) => {
-                queue.extend(h.body.iter().map(WalkNode::Stmt));
-                continue;
-            }
-            WalkNode::Case(case) => {
-                queue.extend(case.body.iter().map(WalkNode::Stmt));
-                continue;
-            }
-        };
-        // Children in `_fields` order, as `ast.iter_child_nodes` yields them.
-        match stmt {
-            Stmt::ClassDef(c) => {
-                classes.push(c);
-                queue.extend(c.body.iter().map(WalkNode::Stmt));
-            }
-            Stmt::FunctionDef(f) => queue.extend(f.body.iter().map(WalkNode::Stmt)),
-            Stmt::AsyncFunctionDef(f) => queue.extend(f.body.iter().map(WalkNode::Stmt)),
-            Stmt::For(f) => {
-                queue.extend(f.body.iter().map(WalkNode::Stmt));
-                queue.extend(f.orelse.iter().map(WalkNode::Stmt));
-            }
-            Stmt::AsyncFor(f) => {
-                queue.extend(f.body.iter().map(WalkNode::Stmt));
-                queue.extend(f.orelse.iter().map(WalkNode::Stmt));
-            }
-            Stmt::While(w) => {
-                queue.extend(w.body.iter().map(WalkNode::Stmt));
-                queue.extend(w.orelse.iter().map(WalkNode::Stmt));
-            }
-            Stmt::If(i) => {
-                queue.extend(i.body.iter().map(WalkNode::Stmt));
-                queue.extend(i.orelse.iter().map(WalkNode::Stmt));
-            }
-            Stmt::With(w) => queue.extend(w.body.iter().map(WalkNode::Stmt)),
-            Stmt::AsyncWith(w) => queue.extend(w.body.iter().map(WalkNode::Stmt)),
-            Stmt::Match(m) => queue.extend(m.cases.iter().map(WalkNode::Case)),
-            Stmt::Try(t) => {
-                queue.extend(t.body.iter().map(WalkNode::Stmt));
-                queue.extend(t.handlers.iter().map(WalkNode::Handler));
-                queue.extend(t.orelse.iter().map(WalkNode::Stmt));
-                queue.extend(t.finalbody.iter().map(WalkNode::Stmt));
-            }
-            Stmt::TryStar(t) => {
-                queue.extend(t.body.iter().map(WalkNode::Stmt));
-                queue.extend(t.handlers.iter().map(WalkNode::Handler));
-                queue.extend(t.orelse.iter().map(WalkNode::Stmt));
-                queue.extend(t.finalbody.iter().map(WalkNode::Stmt));
-            }
-            _ => {}
-        }
-    }
-    classes
-}
-
 /// `base.id` for a `Name`, `base.attr` for an `Attribute`, else `None` —
 /// the two spellings the Python check recognises.
 fn simple_name(expr: &rustpython_ast::Expr) -> Option<&str> {
@@ -564,6 +520,9 @@ pub fn check_duplicate_functions_pkg(
             let lines = line_count(&line_index, func.start, func.end());
             if lines < min_lines || is_trivial_body(func.body()) {
                 continue;
+            }
+            if is_dunder(&func.name) {
+                continue; // `__repr__`/`__eq__` across sibling classes are protocol hooks
             }
             let key = dump_stmts(func.body());
             groups.entry(key).or_default().push((
@@ -799,5 +758,93 @@ mod module_coupling_tests {
         ];
         let issues = check_module_coupling_pkg("my-lib", &files, Path::new("/pkg/my_lib"));
         assert!(issues.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    //! Mirrors the package-level half of the Python repo's tests/test_calibration.py.
+    use super::{
+        ParsedFile, build_import_graph, check_duplicate_functions_pkg, check_import_cycles_pkg,
+    };
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    const ROOT: &str = "/tmp/pkg";
+
+    fn pkg(files: &[(&str, &str)]) -> Vec<ParsedFile> {
+        let mut parsed: Vec<ParsedFile> = files
+            .iter()
+            .map(|(name, source)| {
+                let path = PathBuf::from(ROOT).join(name);
+                let module =
+                    rustpython_parser::parse(source, rustpython_parser::Mode::Module, name)
+                        .expect("test source must parse");
+                ParsedFile {
+                    path,
+                    source: source.to_string(),
+                    module,
+                }
+            })
+            .collect();
+        parsed.sort_by(|a, b| a.path.cmp(&b.path));
+        parsed
+    }
+
+    #[test]
+    fn main_guard_imports_do_not_create_cycles() {
+        let files = pkg(&[
+            ("__init__.py", ""),
+            ("console.py", "from .pager import Pager\n"),
+            (
+                "pager.py",
+                "class Pager: ...\nif __name__ == \"__main__\":\n    from .console import Console\n",
+            ),
+        ]);
+        assert!(check_import_cycles_pkg("pkg", &files, Path::new(ROOT)).is_empty());
+    }
+
+    #[test]
+    fn init_reexport_of_submodules_is_not_a_cycle() {
+        // pkg/__init__ imports its submodules; a submodule does `from pkg
+        // import other` to reach a *sibling module*. That binds pkg.other,
+        // not pkg.
+        let files = pkg(&[
+            ("__init__.py", "from .a import A\nfrom .b import B\n"),
+            ("a.py", "from pkg import b\nclass A: ...\n"),
+            ("b.py", "class B: ...\n"),
+        ]);
+        let (graph, _) = build_import_graph(&files, Path::new(ROOT));
+        assert_eq!(graph["pkg.a"], HashSet::from(["pkg.b".to_string()]));
+        assert!(check_import_cycles_pkg("pkg", &files, Path::new(ROOT)).is_empty());
+    }
+
+    #[test]
+    fn real_cycle_is_still_reported() {
+        let files = pkg(&[
+            ("__init__.py", ""),
+            ("a.py", "from .b import B\n"),
+            ("b.py", "from .a import A\n"),
+        ]);
+        let rules: Vec<&str> = check_import_cycles_pkg("pkg", &files, Path::new(ROOT))
+            .iter()
+            .map(|i| i.rule)
+            .collect();
+        assert_eq!(rules, ["import-cycle"]);
+    }
+
+    #[test]
+    fn duplicate_function_body_skips_dunder_protocol_hooks() {
+        let body = "    def __repr__(self):\n        a = 1\n        b = 2\n        c = 3\n        \
+                    return f'{a}{b}{c}'\n";
+        let a = format!("class A:\n{body}");
+        let b = format!("class B:\n{body}");
+        let files = pkg(&[("a.py", &a), ("b.py", &b)]);
+        assert!(check_duplicate_functions_pkg("pkg", &files, 5).is_empty());
+        let files = pkg(&[
+            ("a.py", &a.replace("__repr__", "render")),
+            ("b.py", &b.replace("__repr__", "render")),
+        ]);
+        assert_eq!(check_duplicate_functions_pkg("pkg", &files, 5).len(), 1);
     }
 }

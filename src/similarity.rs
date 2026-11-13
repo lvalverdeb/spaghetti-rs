@@ -17,13 +17,14 @@
 //! mismatch until this was added. Verified against all three of Phase 0's
 //! ground-truth ratios after adding it — all three now match exactly.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 struct Matcher<'a> {
     a: &'a [char],
     b: &'a [char],
+    /// Positions of each character in `b`, minus the "popular" ones
+    /// (autojunk) — exactly `SequenceMatcher.b2j` after `__chain_b`.
     b2j: HashMap<char, Vec<usize>>,
-    bpopular: HashSet<char>,
 }
 
 impl<'a> Matcher<'a> {
@@ -33,26 +34,13 @@ impl<'a> Matcher<'a> {
             b2j.entry(ch).or_default().push(j);
         }
 
-        let mut bpopular = HashSet::new();
         let n = b.len();
         if n >= 200 {
             let ntest = n / 100 + 1;
-            bpopular.extend(
-                b2j.iter()
-                    .filter(|(_, idxs)| idxs.len() > ntest)
-                    .map(|(&ch, _)| ch),
-            );
-            for ch in &bpopular {
-                b2j.remove(ch);
-            }
+            b2j.retain(|_, idxs| idxs.len() <= ntest);
         }
 
-        Matcher {
-            a,
-            b,
-            b2j,
-            bpopular,
-        }
+        Matcher { a, b, b2j }
     }
 
     /// Longest matching block within a[alo..ahi] / b[blo..bhi].
@@ -99,36 +87,21 @@ impl<'a> Matcher<'a> {
         // Extend through matching characters at the boundaries — needed
         // because "popular" characters were removed from b2j above, so a
         // match touching one wouldn't otherwise be found by the scan loop.
-        // Mirrors CPython's two extension passes (non-popular first, then
-        // popular) in `difflib.SequenceMatcher.find_longest_match`.
-        while besti > alo
-            && bestj > blo
-            && !self.bpopular.contains(&self.b[bestj - 1])
-            && self.a[besti - 1] == self.b[bestj - 1]
-        {
+        // CPython's `find_longest_match` has two extension passes gated on
+        // `isbjunk`, which tests the *junk* set (`isjunk=None` here, so it
+        // is empty) — not the popular set. Popular characters therefore
+        // extend a match like any other; treating them as junk (the earlier
+        // port) stopped the first pass at a popular character and the
+        // second at a non-popular one, splitting blocks `difflib` keeps
+        // whole and making the ratio asymmetric. Found on httpx's
+        // `iter_raw`/`aiter_raw` (0.930 vs difflib's 0.939).
+        while besti > alo && bestj > blo && self.a[besti - 1] == self.b[bestj - 1] {
             besti -= 1;
             bestj -= 1;
             bestsize += 1;
         }
         while besti + bestsize < ahi
             && bestj + bestsize < bhi
-            && !self.bpopular.contains(&self.b[bestj + bestsize])
-            && self.a[besti + bestsize] == self.b[bestj + bestsize]
-        {
-            bestsize += 1;
-        }
-        while besti > alo
-            && bestj > blo
-            && self.bpopular.contains(&self.b[bestj - 1])
-            && self.a[besti - 1] == self.b[bestj - 1]
-        {
-            besti -= 1;
-            bestj -= 1;
-            bestsize += 1;
-        }
-        while besti + bestsize < ahi
-            && bestj + bestsize < bhi
-            && self.bpopular.contains(&self.b[bestj + bestsize])
             && self.a[besti + bestsize] == self.b[bestj + bestsize]
         {
             bestsize += 1;
@@ -171,4 +144,27 @@ pub fn sequence_matcher_ratio(a: &str, b: &str) -> f64 {
     let matcher = Matcher::new(&a_chars, &b_chars);
     let matched = matcher.total_matched();
     2.0 * matched as f64 / total_len as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sequence_matcher_ratio;
+
+    #[test]
+    fn popular_characters_extend_a_match_like_difflib() {
+        // Both inputs are over the 200-character autojunk threshold, so `a`
+        // is "popular" and dropped from `b2j`. difflib still extends a match
+        // through popular characters (they are not *junk*); treating them
+        // as junk gave 0.0299 here, and an asymmetric ratio on real code.
+        // Expected value: `difflib.SequenceMatcher(None, a, b).ratio()`.
+        let a = "zaaaaaaaaaaaaaaaaaaaaayaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaazxxyyaaaaaaaaaaaaaaaaaaaaaaaayxxyyqqqzzaaaaaaaaaaaaaaayyyyqqaaaaaaaaaaaazzxaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaqq";
+        let b = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaxaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaayzzqqqqxaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaxaaaaaaaaaaaaaaaaaaaaaaaaaaaaazxxyyqaaaaaaaaaaaaaaaa";
+        assert_eq!(a.len(), 200);
+        assert_eq!(b.len(), 201);
+        let expected = 2.0 * 35.0 / 401.0;
+        assert!((sequence_matcher_ratio(a, b) - expected).abs() < 1e-12);
+        // Swapped, every character of the new `b` is popular, so `b2j` is
+        // empty and difflib finds nothing at all — ratio() is not symmetric.
+        assert_eq!(sequence_matcher_ratio(b, a), 0.0);
+    }
 }

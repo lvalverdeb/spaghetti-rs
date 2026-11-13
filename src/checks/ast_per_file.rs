@@ -13,9 +13,10 @@
 //! (see §7.6/§10 of the proposal).
 
 use crate::ast_helpers::{
-    FuncNode, LineIndex, collect_functions, count_nested_returns, cyclomatic_complexity,
-    dump_stmts, is_private, is_test_file, is_test_function, line_count, nesting_depth,
-    walk_arguments_children, walk_comprehension_children, walk_keyword_children,
+    FuncNode, LineIndex, collect_classes_bfs, collect_except_handlers_bfs, collect_functions,
+    count_nested_returns, cyclomatic_complexity, dump_stmts, is_private, is_test_file,
+    is_test_function, line_count, nesting_depth, walk_arguments_children,
+    walk_comprehension_children, walk_keyword_children, walk_match_case_children,
     walk_withitem_children,
 };
 use crate::config::{
@@ -253,14 +254,7 @@ pub fn check_excessive_params(
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
-        let args = func.args();
-        let mut total = args.args.len() + args.kwonlyargs.len();
-        if args.vararg.is_some() {
-            total += 1;
-        }
-        if args.kwarg.is_some() {
-            total += 1;
-        }
+        let total = required_positional_params(func.args()).len();
         if total > max_func_params {
             issues.push(issue_at(
                 filepath,
@@ -270,14 +264,30 @@ pub fn check_excessive_params(
                 "too-many-params",
                 package,
                 format!(
-                    "{}() has {total} params (max {max_func_params}) — consider a Parameter \
-                     Object (a dataclass or Pydantic model bundling the related fields) instead",
+                    "{}() has {total} required positional params (max {max_func_params}) — \
+                     consider a Parameter Object (a dataclass or Pydantic model bundling the \
+                     related fields) instead",
                     func.name
                 ),
             ));
         }
     }
     issues
+}
+
+/// Parameters a caller must supply positionally: no default, not keyword-only,
+/// not `self`/`cls` — mirrors `_required_positional_params`. Keyword-only
+/// options and defaulted parameters are the idiomatic way to offer many
+/// independent options and are not the positional-confusion smell a
+/// Parameter Object addresses.
+fn required_positional_params(args: &Arguments) -> Vec<&str> {
+    args.posonlyargs
+        .iter()
+        .chain(&args.args)
+        .filter(|a| a.default.is_none())
+        .map(|a| a.def.arg.as_str())
+        .filter(|name| !matches!(*name, "self" | "cls"))
+        .collect()
 }
 
 // ── Rule: Excessive Return Points ────────────────────────────────────────────
@@ -376,13 +386,8 @@ pub fn check_boolean_flag_params(
                 flags.push(arg.def.arg.as_str());
             }
         }
-        for arg in &args.kwonlyargs {
-            if let Some(default) = &arg.default
-                && is_bool_constant(default)
-            {
-                flags.push(arg.def.arg.as_str());
-            }
-        }
+        // Keyword-only booleans are deliberately not counted: a caller has
+        // to name them, so `f(True, False)` call-site ambiguity can't occur.
         if flags.len() >= min_boolean_flags {
             issues.push(issue_at(
                 filepath,
@@ -654,6 +659,9 @@ fn collect_imported_names(module: &Mod) -> HashMap<String, rustpython_ast::text_
         fn visit_stmt_import(&mut self, node: rustpython_ast::StmtImport) {
             let pos = node.range().start();
             for alias in &node.names {
+                if alias.asname.as_ref() == Some(&alias.name) {
+                    continue; // `import x as x`: explicit re-export
+                }
                 let name = alias
                     .asname
                     .as_ref()
@@ -677,6 +685,9 @@ fn collect_imported_names(module: &Mod) -> HashMap<String, rustpython_ast::text_
                 if alias.name.as_str() == "*" {
                     continue;
                 }
+                if alias.asname.as_ref() == Some(&alias.name) {
+                    continue; // `from x import A as A`: the explicit re-export idiom
+                }
                 let name = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
                 if name != "_" {
                     self.imported.insert(name, pos);
@@ -694,13 +705,53 @@ fn collect_imported_names(module: &Mod) -> HashMap<String, rustpython_ast::text_
     collector.imported
 }
 
+/// Names referenced by a forward-reference string, or nothing if it isn't
+/// one — mirrors `_names_in_string_annotation`.
+fn names_in_string_annotation(text: &str) -> HashSet<String> {
+    if text.is_empty() || text.chars().count() > 200 || text.contains('\n') {
+        return HashSet::new();
+    }
+    use rustpython_parser::Parse;
+    let Ok(expr) = Expr::parse(text, "<annotation>") else {
+        return HashSet::new();
+    };
+    struct NameCollector {
+        names: HashSet<String>,
+    }
+    impl Visitor for NameCollector {
+        fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
+            walk_comprehension_children(self, node);
+        }
+        fn visit_arguments(&mut self, node: Arguments) {
+            walk_arguments_children(self, node);
+        }
+        fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
+            walk_keyword_children(self, node);
+        }
+        fn visit_expr_name(&mut self, node: rustpython_ast::ExprName) {
+            self.names.insert(node.id.to_string());
+        }
+    }
+    let mut collector = NameCollector {
+        names: HashSet::new(),
+    };
+    collector.visit_expr(expr);
+    collector.names
+}
+
 /// Every name referenced by the module — either directly, or listed in an
-/// `__all__ = [...]` re-export declaration.
+/// `__all__ = [...]` re-export declaration, or inside a string annotation
+/// (`"Console"`, `"list[Foo]"`).
 fn collect_used_names(module: &Mod) -> HashSet<String> {
     struct UsageCollector {
         used: HashSet<String>,
     }
     impl Visitor for UsageCollector {
+        fn visit_expr_constant(&mut self, node: rustpython_ast::ExprConstant) {
+            if let Constant::Str(s) = &node.value {
+                self.used.extend(names_in_string_annotation(s));
+            }
+        }
         fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
             walk_comprehension_children(self, node);
         }
@@ -712,6 +763,9 @@ fn collect_used_names(module: &Mod) -> HashSet<String> {
         }
         fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
             walk_withitem_children(self, node);
+        }
+        fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
+            walk_match_case_children(self, node);
         }
         fn visit_expr_name(&mut self, node: rustpython_ast::ExprName) {
             self.used.insert(node.id.to_string());
@@ -788,13 +842,6 @@ pub fn check_unused_imports(
 
 // ── Rule: Swallowed Exceptions ────────────────────────────────────────────────
 
-struct SwallowedExceptionVisitor<'a> {
-    line_index: &'a LineIndex,
-    filepath: &'a Path,
-    package: &'a str,
-    issues: Vec<Issue>,
-}
-
 fn is_pass_or_ellipsis_only(body: &[Stmt]) -> bool {
     if body.len() != 1 {
         return false;
@@ -809,30 +856,57 @@ fn is_pass_or_ellipsis_only(body: &[Stmt]) -> bool {
     }
 }
 
-impl<'a> Visitor for SwallowedExceptionVisitor<'a> {
-    fn visit_excepthandler_except_handler(
-        &mut self,
-        node: rustpython_ast::ExceptHandlerExceptHandler,
-    ) {
-        if is_pass_or_ellipsis_only(&node.body) {
-            let exc_name = match &node.type_ {
-                Some(t) => match t.as_ref() {
-                    Expr::Name(n) => n.id.to_string(),
-                    _ => "Exception".to_string(),
-                },
-                None => "Exception".to_string(),
-            };
-            self.issues.push(issue_at(
-                self.filepath,
-                self.line_index,
-                node.range(),
-                Severity::Warning,
-                "swallowed-exception",
-                self.package,
-                format!("except {exc_name}: silently discards the error with no log/reraise"),
-            ));
-        }
-        self.generic_visit_excepthandler_except_handler(node);
+/// True if any line in the 1-based inclusive range carries a `#` comment —
+/// mirrors `_has_comment`, deliberately crude: a `#` counts unless a quote
+/// character appears before it on the same line.
+fn has_comment(source_lines: &[&str], start: usize, end: usize) -> bool {
+    source_lines
+        .iter()
+        .take(end)
+        .skip(start.saturating_sub(1))
+        .any(|line| {
+            line.split_once('#')
+                .is_some_and(|(code, _)| !code.contains('"') && !code.contains('\''))
+        })
+}
+
+/// `ast.dump(expr, annotate_fields=False)` for the expression shapes an
+/// `except` clause realistically names: `pkg.Error`, `(A, B)`, constants
+/// and names. Python falls back to this when the type has no `.id`.
+fn py_dump_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Name(n) => format!("Name({}, Load())", py_repr_str(n.id.as_str())),
+        Expr::Attribute(a) => format!(
+            "Attribute({}, {}, Load())",
+            py_dump_expr(&a.value),
+            py_repr_str(a.attr.as_str())
+        ),
+        Expr::Tuple(t) => format!(
+            "Tuple([{}], Load())",
+            t.elts
+                .iter()
+                .map(py_dump_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Constant(c) => match &c.value {
+            Constant::Str(s) => format!("Constant({})", py_repr_str(s)),
+            Constant::Int(i) => format!("Constant({i})"),
+            Constant::Bool(b) => format!("Constant({})", if *b { "True" } else { "False" }),
+            Constant::None => "Constant(None)".to_string(),
+            other => format!("Constant({other:?})"),
+        },
+        other => format!("{other:?}"),
+    }
+}
+
+/// Python `repr()` of a plain string: single quotes unless the text holds a
+/// single quote and no double quote.
+fn py_repr_str(s: &str) -> String {
+    if s.contains('\'') && !s.contains('"') {
+        format!("\"{s}\"")
+    } else {
+        format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
     }
 }
 
@@ -843,16 +917,36 @@ pub fn check_swallowed_exceptions(
     package: &str,
 ) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
-    let mut visitor = SwallowedExceptionVisitor {
-        line_index: &line_index,
-        filepath,
-        package,
-        issues: Vec::new(),
-    };
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
+    let source_lines: Vec<&str> = source.lines().collect();
+    let mut issues = Vec::new();
+    // `ast.walk` order, not a depth-first visit: a handler nested inside an
+    // earlier `try` must not jump ahead of a later sibling handler.
+    for handler in collect_except_handlers_bfs(module_body(module)) {
+        // A handler that carries a comment is a documented decision (EAFP
+        // fallback, optional dependency probe), not a swallowed failure —
+        // the same convention SonarQube uses for its empty-block rules.
+        let loc = line_index.node_loc(handler.range());
+        if has_comment(&source_lines, loc.line, loc.end_line)
+            || !is_pass_or_ellipsis_only(&handler.body)
+        {
+            continue;
+        }
+        let exc_name = match handler.type_.as_deref() {
+            Some(Expr::Name(n)) => n.id.to_string(),
+            Some(other) => py_dump_expr(other),
+            None => "Exception".to_string(),
+        };
+        issues.push(issue_at(
+            filepath,
+            &line_index,
+            handler.range(),
+            Severity::Warning,
+            "swallowed-exception",
+            package,
+            format!("except {exc_name}: silently discards the error with no log/reraise"),
+        ));
     }
-    visitor.issues
+    issues
 }
 
 // ── Rule: Star Imports ────────────────────────────────────────────────────────
@@ -863,6 +957,10 @@ pub fn check_star_imports(
     filepath: &Path,
     package: &str,
 ) -> Vec<Issue> {
+    // `__init__.py` is skipped (re-exports).
+    if filepath.file_name().and_then(|n| n.to_str()) == Some("__init__.py") {
+        return Vec::new();
+    }
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for stmt in module_body(module) {
@@ -938,8 +1036,11 @@ pub fn check_global_mutations(
                 continue;
             }
             for target in &assign.targets {
+                // UPPER_CASE names are constants by convention (lookup
+                // tables, name sets) — not state anyone mutates.
                 if let Expr::Name(name) = target
                     && !name.id.as_str().starts_with('_')
+                    && !py_isupper(name.id.as_str())
                 {
                     issues.push(issue_at(
                         filepath,
@@ -962,7 +1063,27 @@ pub fn check_global_mutations(
     issues
 }
 
+/// Python's `str.isupper()`: at least one cased character, and every cased
+/// character is uppercase (`_`, digits and other uncased characters are
+/// ignored).
+fn py_isupper(s: &str) -> bool {
+    let mut cased = false;
+    for c in s.chars() {
+        if c.is_lowercase() {
+            return false;
+        }
+        if c.is_uppercase() {
+            cased = true;
+        }
+    }
+    cased
+}
+
 // ── Rule: Scope Mutation ──────────────────────────────────────────────────────
+//
+// `nonlocal` is deliberately not counted: a closure updating its enclosing
+// function's accumulator is scoped, idiomatic Python, not the module-wide
+// shared state this rule exists to catch.
 //
 // Mirrors Python's `_walk_own_scope`: a DFS that stops at nested
 // function/class boundaries, so an inner def's own globals/assignments
@@ -971,7 +1092,6 @@ pub fn check_global_mutations(
 #[derive(Default)]
 struct OwnScopeCollector {
     global_names: HashSet<String>,
-    nonlocal_names: HashSet<String>,
     // (name, statement span, is_lazy_singleton_init)
     assignments: Vec<(String, TextRange, bool)>,
 }
@@ -1003,10 +1123,6 @@ impl Visitor for OwnScopeCollector {
     fn visit_stmt_class_def(&mut self, _node: rustpython_ast::StmtClassDef) {}
     fn visit_stmt_global(&mut self, node: rustpython_ast::StmtGlobal) {
         self.global_names
-            .extend(node.names.iter().map(|n| n.to_string()));
-    }
-    fn visit_stmt_nonlocal(&mut self, node: rustpython_ast::StmtNonlocal) {
-        self.nonlocal_names
             .extend(node.names.iter().map(|n| n.to_string()));
     }
     fn visit_stmt_assign(&mut self, node: rustpython_ast::StmtAssign) {
@@ -1075,11 +1191,7 @@ pub fn check_scope_mutations(
         for stmt in func.body() {
             collector.visit_stmt(stmt.clone());
         }
-        let outer_names: HashSet<&String> = collector
-            .global_names
-            .iter()
-            .chain(collector.nonlocal_names.iter())
-            .collect();
+        let outer_names = &collector.global_names;
         if outer_names.is_empty() {
             continue;
         }
@@ -1091,13 +1203,6 @@ pub fn check_scope_mutations(
                     outer_names.contains(name) && !is_lazy_singleton_init
                 })
         {
-            let mut declared_by = Vec::new();
-            if collector.global_names.contains(target_name) {
-                declared_by.push("global");
-            }
-            if collector.nonlocal_names.contains(target_name) {
-                declared_by.push("nonlocal");
-            }
             issues.push(issue_at(
                 filepath,
                 &line_index,
@@ -1106,10 +1211,8 @@ pub fn check_scope_mutations(
                 "scope-mutation",
                 package,
                 format!(
-                    "{}() mutates outer-scope variable '{}' via {} — shared mutable state makes control flow hard to trace",
-                    func.name,
-                    target_name,
-                    declared_by.join("/")
+                    "{}() mutates outer-scope variable '{}' via global — shared mutable state makes control flow hard to trace",
+                    func.name, target_name
                 ),
             ));
         }
@@ -1180,6 +1283,10 @@ mod scope_mutation_tests {
 // body/orelse (and, only for plain `Try` — not `TryStar` — each handler's
 // body), one level deep, not recursively further.
 
+fn is_bare_yield(stmt: &Stmt) -> bool {
+    matches!(stmt, Stmt::Expr(e) if matches!(e.value.as_ref(), Expr::Yield(_) | Expr::YieldFrom(_)))
+}
+
 fn is_unreachable_after(stmt: &Stmt) -> bool {
     matches!(
         stmt,
@@ -1197,6 +1304,9 @@ fn scan_body_for_dead_code(
     for (i, stmt) in body.iter().enumerate() {
         if is_unreachable_after(stmt) {
             for next in &body[i + 1..] {
+                if is_bare_yield(next) {
+                    continue; // `raise ...; yield` turns the function into a generator
+                }
                 issues.push(issue(
                     filepath,
                     line_index.line_number(next.range().start()),
@@ -1439,6 +1549,13 @@ fn lazy_class_has_orm_columns(node: &rustpython_ast::StmtClassDef) -> bool {
 /// doesn't apply). Never flagged regardless of method count.
 fn is_lazy_class_exempt(node: &rustpython_ast::StmtClassDef) -> bool {
     if lazy_class_has_orm_columns(node) {
+        return true;
+    }
+    if !node.bases.is_empty() || !node.keywords.is_empty() || !node.decorator_list.is_empty() {
+        // Subclasses (exceptions, Protocols, TypedDicts, Pydantic models,
+        // marker types, `class Config(Base)`) and decorated classes have a
+        // purpose their base/decorator supplies; the smell is a bare
+        // `class X:` that holds one function.
         return true;
     }
     if base_names(&node.bases).iter().any(|b| {
@@ -1876,6 +1993,9 @@ impl Visitor for MagicStringVisitor {
     fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
         walk_withitem_children(self, node);
     }
+    fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
+        walk_match_case_children(self, node);
+    }
     fn visit_expr_compare(&mut self, node: rustpython_ast::ExprCompare) {
         if let Some(result) = magic_string_comparison(&node) {
             self.comparisons.push(result);
@@ -2210,6 +2330,8 @@ struct EncapsulationVisitor<'a> {
     package: &'a str,
     class_stack: Vec<String>,
     first_param_stack: Vec<Option<String>>,
+    /// Class name → the `self._x` attributes its own methods assign.
+    own_private_attrs: HashMap<String, HashSet<String>>,
     issues: Vec<Issue>,
 }
 impl<'a> EncapsulationVisitor<'a> {
@@ -2240,6 +2362,17 @@ impl<'a> Visitor for EncapsulationVisitor<'a> {
         if let Some(attr) =
             direct_private_access(&node, self.current_class(), self.current_first_param())
         {
+            // `other._x` inside class C where C itself assigns `self._x`:
+            // the same class reaching into another instance of itself
+            // (`__eq__`, `merge`, `copy`) is not an encapsulation break.
+            let own = self
+                .current_class()
+                .and_then(|c| self.own_private_attrs.get(c))
+                .is_some_and(|attrs| attrs.contains(attr));
+            if own {
+                self.generic_visit_expr_attribute(node);
+                return;
+            }
             self.issues.push(issue_at(
                 self.filepath,
                 self.line_index,
@@ -2280,6 +2413,9 @@ impl<'a> Visitor for EncapsulationVisitor<'a> {
     fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
         walk_withitem_children(self, node);
     }
+    fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
+        walk_match_case_children(self, node);
+    }
 }
 
 pub fn check_encapsulation_violations(
@@ -2289,12 +2425,24 @@ pub fn check_encapsulation_violations(
     package: &str,
 ) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
+    // Same insertion semantics as the Python dict comprehension over
+    // `ast.walk`: a later same-named class replaces an earlier one.
+    let mut own_private_attrs: HashMap<String, HashSet<String>> = HashMap::new();
+    for class in collect_classes_bfs(module_body(module)) {
+        let methods: Vec<&Stmt> = class
+            .body
+            .iter()
+            .filter(|s| matches!(s, Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_)))
+            .collect();
+        own_private_attrs.insert(class.name.to_string(), self_attrs_assigned(&methods));
+    }
     let mut visitor = EncapsulationVisitor {
         line_index: &line_index,
         filepath,
         package,
         class_stack: Vec::new(),
         first_param_stack: Vec::new(),
+        own_private_attrs,
         issues: Vec::new(),
     };
     for stmt in module_body(module) {
@@ -2304,6 +2452,46 @@ pub fn check_encapsulation_violations(
 }
 
 // ── Rule: God Class ───────────────────────────────────────────────────────────
+
+/// Every `self.<attr> = ...` target across `methods` — mirrors
+/// `_self_attrs_assigned`.
+fn self_attrs_assigned(methods: &[&Stmt]) -> HashSet<String> {
+    struct SelfAttrVisitor {
+        attrs: HashSet<String>,
+    }
+    impl Visitor for SelfAttrVisitor {
+        fn visit_expr_attribute(&mut self, node: rustpython_ast::ExprAttribute) {
+            if matches!(node.ctx, rustpython_ast::ExprContext::Store)
+                && matches!(node.value.as_ref(), Expr::Name(n) if n.id.as_str() == "self")
+            {
+                self.attrs.insert(node.attr.to_string());
+            }
+            self.generic_visit_expr_attribute(node);
+        }
+        fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
+            walk_comprehension_children(self, node);
+        }
+        fn visit_arguments(&mut self, node: Arguments) {
+            walk_arguments_children(self, node);
+        }
+        fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
+            walk_keyword_children(self, node);
+        }
+        fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
+            walk_withitem_children(self, node);
+        }
+        fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
+            walk_match_case_children(self, node);
+        }
+    }
+    let mut visitor = SelfAttrVisitor {
+        attrs: HashSet::new(),
+    };
+    for method in methods {
+        visitor.visit_stmt((*method).clone());
+    }
+    visitor.attrs
+}
 
 struct GodClassVisitor<'a> {
     line_index: &'a LineIndex,
@@ -2326,37 +2514,7 @@ impl<'a> Visitor for GodClassVisitor<'a> {
             .filter(|s| matches!(s, Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_)))
             .collect();
 
-        struct SelfAttrVisitor {
-            attrs: HashSet<String>,
-        }
-        impl Visitor for SelfAttrVisitor {
-            fn visit_expr_attribute(&mut self, node: rustpython_ast::ExprAttribute) {
-                if matches!(node.ctx, rustpython_ast::ExprContext::Store)
-                    && matches!(node.value.as_ref(), Expr::Name(n) if n.id.as_str() == "self")
-                {
-                    self.attrs.insert(node.attr.to_string());
-                }
-                self.generic_visit_expr_attribute(node);
-            }
-            fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-                walk_comprehension_children(self, node);
-            }
-            fn visit_arguments(&mut self, node: Arguments) {
-                walk_arguments_children(self, node);
-            }
-            fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
-                walk_keyword_children(self, node);
-            }
-            fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
-                walk_withitem_children(self, node);
-            }
-        }
-        let mut attr_visitor = SelfAttrVisitor {
-            attrs: HashSet::new(),
-        };
-        for method in &methods {
-            attr_visitor.visit_stmt((*method).clone());
-        }
+        let attrs = self_attrs_assigned(&methods);
 
         let wmc: i64 = methods
             .iter()
@@ -2369,14 +2527,11 @@ impl<'a> Visitor for GodClassVisitor<'a> {
             })
             .sum();
 
-        if methods.len() > max_class_methods
-            || attr_visitor.attrs.len() > max_class_attrs
-            || wmc > max_class_wmc
+        if methods.len() > max_class_methods || attrs.len() > max_class_attrs || wmc > max_class_wmc
         {
             let severity = if methods.len() as f64
                 > max_class_methods as f64 * error_escalation_multiplier
-                || attr_visitor.attrs.len() as f64
-                    > max_class_attrs as f64 * error_escalation_multiplier
+                || attrs.len() as f64 > max_class_attrs as f64 * error_escalation_multiplier
                 || wmc as f64 > max_class_wmc as f64 * error_escalation_multiplier
             {
                 Severity::Error
@@ -2394,7 +2549,7 @@ impl<'a> Visitor for GodClassVisitor<'a> {
                     "class {} has {} methods, {} attributes, and total complexity (WMC) {} (max {max_class_methods}/{max_class_attrs}/{max_class_wmc}) — consider splitting responsibilities",
                     node.name,
                     methods.len(),
-                    attr_visitor.attrs.len(),
+                    attrs.len(),
                     wmc
                 ),
             ));
@@ -2724,6 +2879,13 @@ mod god_module_tests {
 // length — an unusual metric, but it's what Python actually computes, so
 // it's what gets ported.
 
+const EXCEPTION_NAME_SUFFIXES: &[&str] = &["Error", "Exception", "Warning"];
+
+fn is_exception_type_name(name: &str) -> bool {
+    matches!(name, "BaseException" | "Exception")
+        || EXCEPTION_NAME_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
 fn base_names(bases: &[Expr]) -> Vec<String> {
     bases
         .iter()
@@ -2789,6 +2951,9 @@ pub fn check_deep_inheritance(
             }
         }
         let total_depth = seen.len();
+        if seen.iter().any(|n| is_exception_type_name(n)) {
+            continue; // exception hierarchies are deliberately deep taxonomies
+        }
         if total_depth >= max_inheritance_depth {
             issues.push(issue_at(
                 filepath,
@@ -3142,8 +3307,9 @@ pub enum Check {
 pub type PkgRootCheck = fn(&Mod, &str, &Path, &str, &Path) -> Vec<Issue>;
 
 /// Every per-file AST check, in the Python original's order (its
-/// `ALL_CHECKS` list, then `check_magic_numbers`, which `detector.py` calls
-/// right after it) — the order findings are reported in, so it must match.
+/// `ALL_CHECKS` list, then `SOURCE_AWARE_CHECKS` — `swallowed-exception`
+/// and `magic-number`, which `detector.py` runs right after it) — the order
+/// findings are reported in, so it must match.
 pub const ALL_CHECKS: &[Check] = &[
     Check::PerFile(check_long_functions),
     Check::PerFile(check_complexity),
@@ -3154,7 +3320,6 @@ pub const ALL_CHECKS: &[Check] = &[
     Check::PerFile(check_deep_nesting),
     Check::PerFile(check_untyped_dicts),
     Check::PerFile(check_unused_imports),
-    Check::PerFile(check_swallowed_exceptions),
     Check::PerFile(check_duplicate_branches),
     Check::PerFile(check_encapsulation_violations),
     Check::PerFile(check_god_class),
@@ -3175,6 +3340,7 @@ pub const ALL_CHECKS: &[Check] = &[
     Check::PerFile(check_lazy_class),
     Check::PerFile(check_deep_inheritance),
     Check::PerFile(check_pass_through_methods),
+    Check::PerFile(check_swallowed_exceptions),
     Check::PerFile(check_magic_numbers),
 ];
 
@@ -3907,11 +4073,19 @@ mod lazy_class_tests {
     }
 
     #[test]
-    fn still_flags_unrelated_base() {
-        // Sanity check: the pydantic/dataclass exemption must not swallow
-        // genuine hits — an unrelated base class doesn't grant an exemption.
-        let issues = issues_for("class C(SomeOtherBase):\n    x = 1\n");
+    fn still_flags_bare_class() {
+        // Sanity check: the exemptions must not swallow genuine hits — a
+        // bare `class X:` with no base, keyword or decorator is the smell.
+        let issues = issues_for("class C:\n    x = 1\n");
         assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn allows_any_subclass_or_decorated_class() {
+        // Any base/keyword/decorator supplies a purpose the class exists for.
+        assert!(issues_for("class C(SomeOtherBase):\n    x = 1\n").is_empty());
+        assert!(issues_for("class C(metaclass=M):\n    x = 1\n").is_empty());
+        assert!(issues_for("@final\nclass C:\n    x = 1\n").is_empty());
     }
 
     #[test]
@@ -4023,5 +4197,171 @@ mod pass_through_tests {
             "class Wrapper:\n    def get(self, key):\n        '''Docstring.'''\n        return self._inner.get(key)\n",
         );
         assert_eq!(issues.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    //! Behaviour fixed or narrowed by the 2026-11 precision audit — mirrors
+    //! the per-file half of the Python repo's tests/test_calibration.py.
+    use super::*;
+    use rustpython_parser::Mode;
+
+    fn parse(source: &str) -> Mod {
+        rustpython_parser::parse(source, Mode::Module, "f.py").expect("test source must parse")
+    }
+
+    #[test]
+    fn unused_import_sees_string_annotations_and_type_checking_blocks() {
+        let source = "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from .console import \
+                      Console\n    from .style import Style\ndef f(c: 'Console') -> 'list[Style]':\n    \
+                      return []\n";
+        assert!(check_unused_imports(&parse(source), source, Path::new("f.py"), "pkg").is_empty());
+    }
+
+    #[test]
+    fn unused_import_honours_explicit_reexport_alias() {
+        let source = "from .models import Foo as Foo\nimport os as os\n";
+        assert!(check_unused_imports(&parse(source), source, Path::new("f.py"), "pkg").is_empty());
+    }
+
+    #[test]
+    fn unused_import_still_flags_a_genuinely_unused_name() {
+        let source = "import os\nimport sys\nprint(sys.argv)\n";
+        let issues = check_unused_imports(&parse(source), source, Path::new("f.py"), "pkg");
+        let messages: Vec<&str> = issues.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(messages, ["'os' imported but never used"]);
+    }
+
+    #[test]
+    fn string_annotation_limits_match_python() {
+        assert!(names_in_string_annotation("Console").contains("Console"));
+        assert!(names_in_string_annotation("list[Style]").contains("Style"));
+        assert!(names_in_string_annotation("not an expression!").is_empty());
+        assert!(names_in_string_annotation("a\nb").is_empty());
+        assert!(names_in_string_annotation(&"x".repeat(201)).is_empty());
+    }
+
+    #[test]
+    fn too_many_params_counts_only_required_positional() {
+        let source = "def f(self, a, b, c, d, e=1, *, f, g, h):\n    pass\n";
+        assert!(
+            check_excessive_params(&parse(source), source, Path::new("f.py"), "pkg").is_empty()
+        );
+        let source = "def f(a, b, c, d, e, f, g, h):\n    pass\n";
+        let issues = check_excessive_params(&parse(source), source, Path::new("f.py"), "pkg");
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0]
+                .message
+                .starts_with("f() has 8 required positional params (max 6)")
+        );
+    }
+
+    #[test]
+    fn boolean_flags_count_only_positional_booleans() {
+        let source = "def f(a, *, verbose=False, dry_run=False, force=False):\n    pass\n";
+        assert!(
+            check_boolean_flag_params(&parse(source), source, Path::new("f.py"), "pkg").is_empty()
+        );
+        let source = "def f(a, verbose=False, dry_run=False, force=False):\n    pass\n";
+        assert_eq!(
+            check_boolean_flag_params(&parse(source), source, Path::new("f.py"), "pkg").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn dead_code_allows_yield_after_raise_generator_idiom() {
+        let source = "def gen():\n    raise StopIteration\n    yield\n";
+        assert!(check_dead_code(&parse(source), source, Path::new("f.py"), "pkg").is_empty());
+        let source = "def f():\n    return 1\n    print('never')\n";
+        assert_eq!(
+            check_dead_code(&parse(source), source, Path::new("f.py"), "pkg").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn deep_inheritance_skips_exception_hierarchies() {
+        let source = "class A(Exception): ...\nclass B(A): ...\nclass C(B): ...\nclass D(C): ...\n\
+                      class E(D): ...\n";
+        assert!(
+            check_deep_inheritance(&parse(source), source, Path::new("f.py"), "pkg").is_empty()
+        );
+        let source =
+            "class A: ...\nclass B(A): ...\nclass C(B): ...\nclass D(C): ...\nclass E(D): ...\n";
+        assert!(
+            !check_deep_inheritance(&parse(source), source, Path::new("f.py"), "pkg").is_empty()
+        );
+    }
+
+    #[test]
+    fn encapsulation_allows_same_class_private_access() {
+        let source = "class P:\n    def __init__(self):\n        self._x = 1\n    def __eq__(self, \
+                      other):\n        return self._x == other._x\n    def leak(self, stranger):\n        \
+                      return stranger._secret\n";
+        let issues =
+            check_encapsulation_violations(&parse(source), source, Path::new("f.py"), "pkg");
+        let messages: Vec<&str> = issues.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            ["Accesses private member '._secret' through something other than self/cls"]
+        );
+    }
+
+    #[test]
+    fn star_import_skips_package_init() {
+        let source = "from .models import *\n";
+        assert!(
+            check_star_imports(&parse(source), source, Path::new("__init__.py"), "pkg").is_empty()
+        );
+        assert_eq!(
+            check_star_imports(&parse(source), source, Path::new("m.py"), "pkg").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn swallowed_exception_skips_commented_handlers() {
+        let source = "try:\n    pass\nexcept ImportError:\n    pass  # optional dependency\n";
+        assert!(
+            check_swallowed_exceptions(&parse(source), source, Path::new("f.py"), "pkg").is_empty()
+        );
+        let source = "try:\n    pass\nexcept ImportError:\n    pass\n";
+        assert_eq!(
+            check_swallowed_exceptions(&parse(source), source, Path::new("f.py"), "pkg").len(),
+            1
+        );
+        // A `#` inside a string literal is not a comment.
+        let source = "try:\n    pass\nexcept ImportError:  # noqa\n    pass\n";
+        assert!(
+            check_swallowed_exceptions(&parse(source), source, Path::new("f.py"), "pkg").is_empty()
+        );
+        assert!(!has_comment(&["x = '#'"], 1, 1));
+        assert!(has_comment(&["x = 1  # '#'"], 1, 1));
+    }
+
+    #[test]
+    fn global_mutable_skips_upper_case_constants() {
+        let source = "TABLE = {}\nNAMES_2 = []\nregistry = {}\n";
+        let issues = check_global_mutations(&parse(source), source, Path::new("f.py"), "pkg");
+        let messages: Vec<&str> = issues.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("'registry'"));
+        assert!(py_isupper("A_B2"));
+        assert!(!py_isupper("_"));
+        assert!(!py_isupper("Ab"));
+    }
+
+    #[test]
+    fn scope_mutation_ignores_nonlocal() {
+        let source =
+            "def outer():\n    n = 0\n    def inner():\n        nonlocal n\n        n += 1\n";
+        assert!(check_scope_mutations(&parse(source), source, Path::new("f.py"), "pkg").is_empty());
+        let source = "def f():\n    global N\n    N = 1\n";
+        let issues = check_scope_mutations(&parse(source), source, Path::new("f.py"), "pkg");
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("via global"));
     }
 }

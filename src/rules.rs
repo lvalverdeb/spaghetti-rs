@@ -46,6 +46,20 @@ const fn r(id: &'static str, summary: &'static str, sev: Severity, tier: Tier) -
     }
 }
 
+/// A rule that exists and can be switched on via `[tool.spaghetti.rules]`
+/// but ships off: the 2026-11 precision audit over five public codebases
+/// (Python repo `docs/precision.md`) found it at or near zero precision, or
+/// Ruff already owns it (`unused-import`, `star-import`).
+const fn off(id: &'static str, summary: &'static str, sev: Severity, tier: Tier) -> RuleMeta {
+    RuleMeta {
+        id,
+        summary,
+        default_severity: sev,
+        tier,
+        enabled_by_default: false,
+    }
+}
+
 use Severity::{Error, Info, Warning};
 use Tier::{Ast, Infra, Package, Text};
 
@@ -102,7 +116,7 @@ pub const RULE_CATALOG: &[RuleMeta] = &[
         Ast,
     ),
     r("untyped-dict", "Bare dict in a type hint", Info, Ast),
-    r(
+    off(
         "unused-import",
         "Imported name never referenced",
         Warning,
@@ -144,7 +158,7 @@ pub const RULE_CATALOG: &[RuleMeta] = &[
         Error,
         Ast,
     ),
-    r(
+    off(
         "potential-circular-import",
         "Child module imports its parent package",
         Warning,
@@ -163,7 +177,7 @@ pub const RULE_CATALOG: &[RuleMeta] = &[
         Warning,
         Ast,
     ),
-    r("star-import", "from x import *", Warning, Ast),
+    off("star-import", "from x import *", Warning, Ast),
     r(
         "global-mutable",
         "Mutable state assigned at module scope",
@@ -194,14 +208,14 @@ pub const RULE_CATALOG: &[RuleMeta] = &[
         Info,
         Ast,
     ),
-    r("magic-number", "Unexplained numeric literal", Info, Ast),
-    r(
+    off("magic-number", "Unexplained numeric literal", Info, Ast),
+    off(
         "magic-string",
         "Same string literal compared for equality in several places",
         Info,
         Ast,
     ),
-    r("missing-else", "Multi-statement if without else", Info, Ast),
+    off("missing-else", "Multi-statement if without else", Info, Ast),
     r("lazy-class", "Class with fewer than two methods", Info, Ast),
     r(
         "deep-inheritance",
@@ -209,19 +223,18 @@ pub const RULE_CATALOG: &[RuleMeta] = &[
         Warning,
         Ast,
     ),
-    r(
+    off(
         "pass-through-method",
         "Method whose body only delegates with unchanged arguments",
         Info,
         Ast,
     ),
-    RuleMeta {
-        id: "low-cohesion",
-        summary: "Class whose methods split into unrelated groups (LCOM4)",
-        default_severity: Info,
-        tier: Ast,
-        enabled_by_default: false,
-    },
+    off(
+        "low-cohesion",
+        "Class whose methods split into unrelated groups (LCOM4)",
+        Info,
+        Ast,
+    ),
     // ── per-file source text ──
     r("long-file", "File exceeds the line limit", Warning, Text),
     r("todo-marker", "TODO/FIXME/XXX/HACK comment", Info, Text),
@@ -271,22 +284,39 @@ pub fn is_known_rule(id: &str) -> bool {
     rule_meta(id).is_some()
 }
 
+/// `id in rules.py::DEFAULT_RULE_IDS`.
+pub fn is_enabled_by_default(id: &str) -> bool {
+    rule_meta(id).is_some_and(|m| m.enabled_by_default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
 
     #[test]
-    fn catalog_has_42_unique_rules_with_one_off_by_default() {
+    fn catalog_has_42_unique_rules_with_the_audited_ones_off() {
         assert_eq!(RULE_CATALOG.len(), 42);
         let ids: HashSet<&str> = RULE_CATALOG.iter().map(|m| m.id).collect();
         assert_eq!(ids.len(), 42);
-        let off: Vec<&str> = RULE_CATALOG
+        let off: HashSet<&str> = RULE_CATALOG
             .iter()
             .filter(|m| !m.enabled_by_default)
             .map(|m| m.id)
             .collect();
-        assert_eq!(off, ["low-cohesion"]);
+        assert_eq!(
+            off,
+            HashSet::from([
+                "low-cohesion",
+                "missing-else",
+                "pass-through-method",
+                "magic-string",
+                "magic-number",
+                "star-import",
+                "unused-import",
+                "potential-circular-import",
+            ])
+        );
     }
 
     #[test]
