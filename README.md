@@ -6,7 +6,7 @@ This is a from-scratch reimplementation of [`spaghetti-detector`](https://github
 
 The [Python original](https://github.com/lvalverdeb/spaghetti) remains the actively maintained **spec of record**: when the two disagree, the Python behaviour is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/spaghetti/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioural quirk (some quite subtle — e.g. `difflib.SequenceMatcher.ratio()`'s asymmetry under `autojunk`) uncovered and matched along the way.
 
-**Status**: all 46 catalogued rules ported and verified — `--json`, `--format sarif`, `--format html`, `--plan` (text and `--json`), the baseline file and the snapshot store are byte-for-byte identical to Python's output on the same input, and `spaghetti mcp` answers the same JSON-RPC lines (Phases 1-4 of the Python [ROADMAP](https://github.com/lvalverdeb/spaghetti/blob/main/ROADMAP.md): settings, baseline, changed-lines mode, SARIF, `--fail-on`, Radon-exact complexity, cognitive complexity, clone detection, the workspace import graph, the Maintainability Index, snapshots and `--compare`, churn-weighted hotspots, the HTML report, architecture contracts and the MCP server), and output is reproducible run-to-run.
+**Status**: all 47 catalogued rules ported and verified — `--json`, `--format sarif`, `--format html`, `--plan` (text and `--json`), the baseline file and the snapshot store are byte-for-byte identical to Python's output on the same input, and `spaghetti mcp` answers the same JSON-RPC lines (Phases 1-4 of the Python [ROADMAP](https://github.com/lvalverdeb/spaghetti/blob/main/ROADMAP.md): settings, baseline, changed-lines mode, SARIF, `--fail-on`, Radon-exact complexity, cognitive complexity, clone detection, the workspace import graph, the Maintainability Index, snapshots and `--compare`, churn-weighted hotspots, the HTML report, architecture contracts and the MCP server; Phase 5: the incremental cache, scan limits, fuzzing and the corpus conformance check), and output is reproducible run-to-run. Over the pinned eight-repository corpus (django, pandas, airflow, httpx, rich, FastAPI, pydantic, black) plus the Python port's own source, `--json` and `--plan --json` are byte-identical between the two ports; CI checks this on every push.
 
 ## Why It Exists
 
@@ -50,6 +50,7 @@ spaghetti --snapshot && spaghetti --compare latest
 spaghetti --hotspots --plan
 spaghetti --format html > report.html
 spaghetti --plan --json
+spaghetti --cache
 spaghetti mcp
 ```
 
@@ -74,6 +75,9 @@ Exit codes: `0` (clean), `1` (warnings present), `2` (errors present) — safe t
 | `--compare` | none | Delta against a stored snapshot: `latest`, `~N`, a git SHA prefix or a timestamp prefix |
 | `--hotspots` | off | Rank files by health penalty × git change frequency and weight `--plan` by it |
 | `--churn-months` | `6` | History window for `--hotspots` |
+| `--cache` | off | Reuse per-file results for files whose content and settings are unchanged (store: `.spaghetti/cache`); see [Incremental cache](#incremental-cache) |
+| `--no-cache` | off | Ignore `cache = true` from the settings for this run |
+| `--cache-dir` | `.spaghetti/cache` | Where `--cache` stores its entries (implies `--cache`; or `cache-dir` in `[tool.spaghetti]`) |
 | `--no-pyproject` | off | Ignore any `[tool.spaghetti]` table found above the working directory |
 | `--quiet` / `-q` | off | Suppress the report banner (text-report mode only; `--json` is unaffected) |
 | `--top` | `5` | Number of worst files/rules to list |
@@ -159,6 +163,8 @@ exclude = ["tests/", "migrations/"]
 fail-on = "error"                        # error | warning | info | never
 baseline = ".spaghetti-baseline.json"    # relative to this file
 snapshot-store = ".spaghetti/snapshots.jsonl"  # relative to this file
+cache = true                             # incremental per-file cache (--cache)
+cache-dir = ".spaghetti/cache"           # relative to this file
 library-packages = ["my-lib"]            # packages `transport-in-library` applies to
 
 [tool.spaghetti.packages]                # same mapping as --config's `packages:`
@@ -293,13 +299,62 @@ spaghetti --format html > report.html      # one self-contained page: scorecard,
 - **HTML** needs no server or account. Trend sparklines come from the snapshot store when
   one exists.
 
+## Incremental cache
+
+```bash
+spaghetti --cache                 # per-file results reused when content and settings are unchanged
+spaghetti --cache-dir .cache/sp   # elsewhere (implies --cache); or `cache = true` in [tool.spaghetti]
+```
+
+Same design as the Python original: entries live under a directory named by a hash of the applied
+settings, the tool version and the Python language version, so a threshold change or an upgrade
+invalidates everything at once. A hit skips the thirty-odd per-file checks; the file is still
+parsed because the cross-file checks need the tree, and those always run. Writes are atomic (temp
+file + rename), a damaged entry is a miss, never an error, and stderr reports
+`Cache: N hit(s), M miss(es) in DIR/KEY`. On the benchmark corpus (11-core laptop) a warm run
+takes 2.7 s against 3.5 s uncached and 4.4 s cold (writing the entries); the remainder is the
+workspace-wide clone detection, which always runs.
+
+Differences from the Python port, both deliberate: the configuration key has the same structure
+(`{"schema", "tool", "python", "overrides"}`, canonical JSON, first 16 hex digits of its SHA-1) but
+its `tool` is `"<version>-rs"`, so the two ports never read each other's entries even in the same
+`.spaghetti/cache`; and an entry is named by the SHA-1 of the file's package, path and content
+rather than the content alone, because several per-file checks depend on the path (test files,
+`__init__.py`, the module path behind `potential-circular-import`, layer rules) — two identical
+files at different paths must not share findings. The entry JSON has the same shape as Python's
+(`schema_version` 1), so either can be inspected the same way.
+
+## Performance, robustness and conformance
+
+- **Benchmark.** The Python repo's `scripts/bench.py --rust BIN` scans django, pandas and airflow
+  (1.07 M lines, pinned in its `scripts/corpus.lock`). On an 11-core laptop the Rust port takes
+  8.2 s for all three in the published table ([docs/benchmark.md](https://github.com/lvalverdeb/spaghetti/blob/main/docs/benchmark.md)),
+  against 81.6 s for Python; scanning each package's files in parallel brought that to 3.5 s in
+  this release. CI runs it with `--rust-budget 10` (the ROADMAP budget: 10 s for Rust, 90 s for
+  Python, on a 4-core runner).
+- **Limits.** A file over `max-file-bytes` (1 MiB) or nested past the point where the Python
+  port's recursive checks hit CPython's recursion limit yields one `scan-limit` info finding
+  instead of a stall; the Rust checks are iterative where depth is unbounded and the scanner runs
+  on large-stack threads, so even a 1 MiB expression nested a million levels deep is reported,
+  never a crash. CPython's tokenizer limits (NUL bytes, a BOM, more than 200 nested brackets, a
+  hundredth indentation level) are mirrored as `syntax-error`, as Python reports them.
+- **Fuzzing.** `tests/fuzz.rs` (proptest) scans arbitrary bytes, Python-shaped token soup and
+  randomly mutated programs; the property is that the scanner never panics and every input yields
+  a well-formed report. It also runs the Python repo's fixed edge-case list (empty file, BOM,
+  CRLF, NUL, 150 nested `if`s, 3000 nested brackets, 500 bases, 300 nested lambdas, 2000 call
+  arguments, a 5000-term sum, lone-surrogate string annotations) and checks each yields exactly
+  the findings Python reports. CI's fuzz job sets `SPAGHETTI_FUZZ_SECONDS=600`.
+- **Conformance.** CI checks out the Python port next to this one and runs its
+  `scripts/conformance.py --rust target/release/spaghetti`, which fails on any byte difference in
+  `--json` or `--plan --json` over the whole corpus.
+
 ## Rules
 
-All 46 catalogued rules from the Python original, across five tiers: 34 per-file AST checks (including `high-complexity` — McCabe cyclomatic complexity, identical to `radon cc` — and `high-cognitive-complexity` — SonarSource cognitive complexity, default 15 — plus `pass-through-method`, `layer-violation` driven by the `layers` setting and `transport-in-library` driven by `library-packages`), 3 source-text checks (`long-file`, `todo-marker`, `low-maintainability` — SEI/Radon Maintainability Index under 10; the per-package mean is also reported as `maintainability_index`), 2 infrastructure checks (`syntax-error`, `unreadable-file`), 3 cross-file package checks (`orphan-interface`, `duplicate-function-body`, `sync-async-duplication`) and 4 workspace checks run once over every registered package: `import-cycle` and `high-coupling` on the union import graph, so a cycle between two packages is found; `contract-violation` for the [architecture contracts](#architecture-contracts) you declare; and `duplicate-code`, a PMD-CPD-style type-2 clone detector over a normalised AST token stream that finds copies with renamed variables (default window 50 tokens, `min-clone-tokens`; `info` by default because duplication is a density signal and mature libraries carry deliberate copies). The rule catalog (`src/rules.rs`) mirrors Python's `rules.py` entry for entry. See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
+All 47 catalogued rules from the Python original, across five tiers: 34 per-file AST checks (including `high-complexity` — McCabe cyclomatic complexity, identical to `radon cc` — and `high-cognitive-complexity` — SonarSource cognitive complexity, default 15 — plus `pass-through-method`, `layer-violation` driven by the `layers` setting and `transport-in-library` driven by `library-packages`), 3 source-text checks (`long-file`, `todo-marker`, `low-maintainability` — SEI/Radon Maintainability Index under 10; the per-package mean is also reported as `maintainability_index`), 3 infrastructure checks (`syntax-error`, `unreadable-file`, and `scan-limit` — info: a file over `max-file-bytes`, default 1 MiB, or nested past the analysis recursion limit is skipped and said so, rather than stalling the scan; infrastructure findings take their severity from the catalog), 3 cross-file package checks (`orphan-interface`, `duplicate-function-body`, `sync-async-duplication`) and 4 workspace checks run once over every registered package: `import-cycle` and `high-coupling` on the union import graph, so a cycle between two packages is found; `contract-violation` for the [architecture contracts](#architecture-contracts) you declare; and `duplicate-code`, a PMD-CPD-style type-2 clone detector over a normalised AST token stream that finds copies with renamed variables (default window 50 tokens, `min-clone-tokens`; `info` by default because duplication is a density signal and mature libraries carry deliberate copies). The rule catalog (`src/rules.rs`) mirrors Python's `rules.py` entry for entry. See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
 
 ### Rules off by default
 
-The Python project's 2026-11 precision audit over five public codebases (httpx, rich, FastAPI, pydantic, black — see its [`docs/precision.md`](https://github.com/lvalverdeb/spaghetti/blob/main/docs/precision.md)) switched eight catalogued rules off by default; this port follows it exactly, so 38 rules run out of the box and SARIF lists those 38. The others — `low-cohesion`, `missing-else`, `pass-through-method`, `magic-string`, `magic-number`, `star-import`, `unused-import` and `potential-circular-import` — are kept in the catalog and re-enabled per rule by naming them in `[tool.spaghetti.rules]` with a severity (an `"off"` entry keeps them off):
+The Python project's 2026-11 precision audit over five public codebases (httpx, rich, FastAPI, pydantic, black — see its [`docs/precision.md`](https://github.com/lvalverdeb/spaghetti/blob/main/docs/precision.md)) switched eight catalogued rules off by default; this port follows it exactly, so 39 rules run out of the box and SARIF lists those 39. The others — `low-cohesion`, `missing-else`, `pass-through-method`, `magic-string`, `magic-number`, `star-import`, `unused-import` and `potential-circular-import` — are kept in the catalog and re-enabled per rule by naming them in `[tool.spaghetti.rules]` with a severity (an `"off"` entry keeps them off):
 
 ```toml
 [tool.spaghetti.rules]

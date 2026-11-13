@@ -43,3 +43,122 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --check
+
+  fuzz:
+    name: Fuzz (proptest, ~10 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Scanner never panics on generated inputs
+        env:
+          SPAGHETTI_FUZZ_SECONDS: "600"
+        run: cargo test --release --test fuzz -- --nocapture
+
+  conformance:
+    name: Conformance with the Python port (pinned corpus)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the Rust port
+        uses: actions/checkout@v4
+        with:
+          path: spaghetti-rs
+
+      - name: Check out the Python port
+        uses: actions/checkout@v4
+        with:
+          repository: lvalverdeb/spaghetti
+          ref: main
+          path: spaghetti
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spaghetti-rs
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: spaghetti/uv.lock
+
+      - name: Install the Python port
+        working-directory: spaghetti
+        run: uv sync --locked --group dev
+
+      - name: Build the Rust release binary
+        working-directory: spaghetti-rs
+        run: cargo build --release
+
+      - name: Cache the pinned corpus
+        uses: actions/cache@v4
+        with:
+          path: spaghetti/.spaghetti/corpus
+          key: corpus-${{ hashFiles('spaghetti/scripts/corpus.lock') }}
+
+      - name: Python and Rust reports are byte-identical on the corpus
+        working-directory: spaghetti
+        run: uv run python scripts/conformance.py --rust ../spaghetti-rs/target/release/spaghetti
+
+  benchmark:
+    name: Benchmark budget (django + pandas + airflow)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the Rust port
+        uses: actions/checkout@v4
+        with:
+          path: spaghetti-rs
+
+      - name: Check out the Python port
+        uses: actions/checkout@v4
+        with:
+          repository: lvalverdeb/spaghetti
+          ref: main
+          path: spaghetti
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spaghetti-rs
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: spaghetti/uv.lock
+
+      - name: Install the Python port
+        working-directory: spaghetti
+        run: uv sync --locked --group dev
+
+      - name: Build the Rust release binary
+        working-directory: spaghetti-rs
+        run: cargo build --release
+
+      - name: Cache the pinned corpus
+        uses: actions/cache@v4
+        with:
+          path: spaghetti/.spaghetti/corpus
+          key: corpus-${{ hashFiles('spaghetti/scripts/corpus.lock') }}
+
+      - name: Rust port under 10 s on the combined corpus
+        working-directory: spaghetti
+        run: uv run python scripts/bench.py --rust ../spaghetti-rs/target/release/spaghetti --rust-budget 10

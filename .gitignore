@@ -1,2 +1,4 @@
 /target
 .env.publish
+.spaghetti/
+proptest-regressions/

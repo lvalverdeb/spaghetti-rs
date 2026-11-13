@@ -255,6 +255,12 @@ pub const RULE_CATALOG: &[RuleMeta] = &[
     // ── infrastructure ──
     r("syntax-error", "File failed to parse", Error, Infra),
     r("unreadable-file", "File could not be read", Error, Infra),
+    r(
+        "scan-limit",
+        "File skipped: over the size or nesting limit",
+        Info,
+        Infra,
+    ),
     // ── per-package cross-file ──
     r(
         "import-cycle",
@@ -321,10 +327,10 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn catalog_has_46_unique_rules_with_the_audited_ones_off() {
-        assert_eq!(RULE_CATALOG.len(), 46);
+    fn catalog_has_47_unique_rules_with_the_audited_ones_off() {
+        assert_eq!(RULE_CATALOG.len(), 47);
         let ids: HashSet<&str> = RULE_CATALOG.iter().map(|m| m.id).collect();
-        assert_eq!(ids.len(), 46);
+        assert_eq!(ids.len(), 47);
         let off: HashSet<&str> = RULE_CATALOG
             .iter()
             .filter(|m| !m.enabled_by_default)

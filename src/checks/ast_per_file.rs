@@ -22,6 +22,7 @@ use crate::config::{
 };
 use crate::models::{Issue, Severity};
 use crate::pyast::{Node, walk, walk_module};
+use crate::unparse::py_repr_str;
 use indexmap::IndexMap;
 use rustpython_ast::text_size::TextRange;
 use rustpython_ast::{Arguments, Constant, Expr, Mod, Ranged, Stmt};
@@ -837,46 +838,6 @@ fn has_comment(source_lines: &[&str], start: usize, end: usize) -> bool {
         })
 }
 
-/// `ast.dump(expr, annotate_fields=False)` for the expression shapes an
-/// `except` clause realistically names: `pkg.Error`, `(A, B)`, constants
-/// and names. Python falls back to this when the type has no `.id`.
-fn py_dump_expr(expr: &Expr) -> String {
-    match expr {
-        Expr::Name(n) => format!("Name({}, Load())", py_repr_str(n.id.as_str())),
-        Expr::Attribute(a) => format!(
-            "Attribute({}, {}, Load())",
-            py_dump_expr(&a.value),
-            py_repr_str(a.attr.as_str())
-        ),
-        Expr::Tuple(t) => format!(
-            "Tuple([{}], Load())",
-            t.elts
-                .iter()
-                .map(py_dump_expr)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Expr::Constant(c) => match &c.value {
-            Constant::Str(s) => format!("Constant({})", py_repr_str(s)),
-            Constant::Int(i) => format!("Constant({i})"),
-            Constant::Bool(b) => format!("Constant({})", if *b { "True" } else { "False" }),
-            Constant::None => "Constant(None)".to_string(),
-            other => format!("Constant({other:?})"),
-        },
-        other => format!("{other:?}"),
-    }
-}
-
-/// Python `repr()` of a plain string: single quotes unless the text holds a
-/// single quote and no double quote.
-fn py_repr_str(s: &str) -> String {
-    if s.contains('\'') && !s.contains('"') {
-        format!("\"{s}\"")
-    } else {
-        format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
-    }
-}
-
 pub fn check_swallowed_exceptions(
     module: &Mod,
     source: &str,
@@ -900,7 +861,7 @@ pub fn check_swallowed_exceptions(
         }
         let exc_name = match handler.type_.as_deref() {
             Some(Expr::Name(n)) => n.id.to_string(),
-            Some(other) => py_dump_expr(other),
+            Some(other) => crate::pydump::dump_expr(other),
             None => "Exception".to_string(),
         };
         issues.push(issue_at(
@@ -1745,9 +1706,10 @@ pub fn check_magic_strings(
                 "magic-string",
                 package,
                 format!(
-                    "magic string '{value}' compared {count} times — consider a Value \
+                    "magic string {} compared {count} times — consider a Value \
                      Object that canonicalizes it once (e.g. a Pydantic model with a \
-                     @field_validator) instead of repeated string comparisons"
+                     @field_validator) instead of repeated string comparisons",
+                    py_repr_str(value)
                 ),
             )
         })
@@ -2627,17 +2589,7 @@ mod message_chain_tests {
 
 // ── Rule: Pass-Through Methods ───────────────────────────────────────────────
 //
-// `ast.unparse(call_node.func)` in Python only ever needs to render a
-// Name/Attribute chain here (the delegation target) — a small dedicated
-// renderer for just those two shapes stands in for a full unparser.
-
-fn render_call_target(expr: &Expr) -> String {
-    match expr {
-        Expr::Name(n) => n.id.to_string(),
-        Expr::Attribute(a) => format!("{}.{}", render_call_target(&a.value), a.attr),
-        _ => "<expr>".to_string(),
-    }
-}
+// The delegation target is named by `ast.unparse(call_node.func)`.
 
 fn extract_call(stmt: &Stmt) -> Option<&rustpython_ast::ExprCall> {
     let value = match stmt {
@@ -2712,7 +2664,7 @@ impl<'a> PassThroughVisitor<'a> {
         }
 
         if is_pure_delegation_call(call_node) {
-            let target = render_call_target(&call_node.func);
+            let target = crate::unparse::unparse_expr(&call_node.func);
             self.issues.push(issue_at(
                 self.filepath,
                 self.line_index,

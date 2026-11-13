@@ -13,6 +13,8 @@
 //! fail-on = "error"                       # error | warning | info | never
 //! baseline = ".spaghetti-baseline.json"   # relative to the settings file
 //! snapshot-store = ".spaghetti/snapshots.jsonl"  # relative to the settings file
+//! cache = true                            # incremental per-file cache (--cache)
+//! cache-dir = ".spaghetti/cache"          # relative to the settings file
 //!
 //! [[tool.spaghetti.contracts]]            # architecture contracts, see contracts
 //! name = "domain stays framework-free"
@@ -83,6 +85,9 @@ pub struct Settings {
     pub fail_on: Option<String>,
     pub baseline: Option<PathBuf>,
     pub snapshot_store: Option<PathBuf>,
+    /// `cache = true`: the incremental per-file cache is on by default.
+    pub cache: Option<bool>,
+    pub cache_dir: Option<PathBuf>,
     pub contracts: Vec<Contract>,
     pub packages: IndexMap<String, PathBuf>,
     pub sources: Vec<PathBuf>,
@@ -114,6 +119,8 @@ impl Settings {
                 .snapshot_store
                 .clone()
                 .or_else(|| self.snapshot_store.clone()),
+            cache: other.cache.or(self.cache),
+            cache_dir: other.cache_dir.clone().or_else(|| self.cache_dir.clone()),
             contracts: [&self.contracts[..], &other.contracts[..]].concat(),
             packages: merge(&self.packages, &other.packages),
             sources: [&self.sources[..], &other.sources[..]].concat(),
@@ -245,6 +252,8 @@ const SCALAR_KEYS: &[&str] = &[
     "fail-on",
     "baseline",
     "snapshot-store",
+    "cache",
+    "cache-dir",
     "library-packages",
     "packages",
     "contracts",
@@ -301,18 +310,15 @@ pub fn parse_mapping(data: &Map<String, Value>, origin: &Path) -> Result<Setting
             }
         }
     }
-    if let Some(baseline) = data.get("baseline").filter(|v| !v.is_null()) {
-        let Some(path) = baseline.as_str() else {
-            return err(format!("{o}: baseline must be a path string"));
+    if let Some(cache) = data.get("cache").filter(|v| !v.is_null()) {
+        let Some(enabled) = cache.as_bool() else {
+            return err(format!("{o}: cache must be true or false"));
         };
-        s.baseline = Some(resolve_lenient(&base_dir.join(path)));
+        s.cache = Some(enabled);
     }
-    if let Some(store) = data.get("snapshot-store").filter(|v| !v.is_null()) {
-        let Some(path) = store.as_str() else {
-            return err(format!("{o}: snapshot-store must be a path string"));
-        };
-        s.snapshot_store = Some(resolve_lenient(&base_dir.join(path)));
-    }
+    s.baseline = path_setting(data, "baseline", origin)?;
+    s.cache_dir = path_setting(data, "cache-dir", origin)?;
+    s.snapshot_store = path_setting(data, "snapshot-store", origin)?;
     let packages = data.get("packages").unwrap_or(&empty_table);
     match packages.as_object() {
         Some(map) if map.values().all(Value::is_string) => {
@@ -332,6 +338,23 @@ pub fn parse_mapping(data: &Map<String, Value>, origin: &Path) -> Result<Setting
     s.rules = parse_rules(data.get("rules").unwrap_or(&empty_table), origin)?;
     s.layers = parse_layers(data.get("layers").unwrap_or(&empty_table), origin)?;
     Ok(s)
+}
+
+/// An optional path-valued key, resolved against the settings file's
+/// directory — mirrors `_path_setting`.
+fn path_setting(
+    data: &Map<String, Value>,
+    key: &str,
+    origin: &Path,
+) -> Result<Option<PathBuf>, SettingsError> {
+    let Some(value) = data.get(key).filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let Some(path) = value.as_str() else {
+        return err(format!("{}: {key} must be a path string", origin.display()));
+    };
+    let base_dir = origin.parent().unwrap_or_else(|| Path::new(""));
+    Ok(Some(resolve_lenient(&base_dir.join(path))))
 }
 
 fn str_list(value: &Value, origin: &Path, key: &str) -> Result<Vec<String>, SettingsError> {
@@ -602,7 +625,7 @@ mod tests {
         let cases = [
             (
                 r#"{"bogus": 1}"#,
-                "unknown setting(s): bogus. Known: baseline, contracts, exclude, fail-on, layers, library-packages, packages, rules, snapshot-store, thresholds",
+                "unknown setting(s): bogus. Known: baseline, cache, cache-dir, contracts, exclude, fail-on, layers, library-packages, packages, rules, snapshot-store, thresholds",
             ),
             (
                 r#"{"fail-on": "sometimes"}"#,
@@ -662,7 +685,7 @@ mod tests {
     #[test]
     fn threshold_names_cover_every_python_tunable() {
         let names: Vec<&str> = THRESHOLD_NAMES.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names.len(), 32);
+        assert_eq!(names.len(), 33);
         for required in [
             "MAX_FUNCTION_LINES",
             "COMPLEXITY_THRESHOLD",

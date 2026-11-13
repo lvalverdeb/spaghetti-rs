@@ -98,6 +98,9 @@ pub struct ScanConfig {
     pub twin_similarity: f64,
     pub recursive: bool,
     pub min_clone_tokens: usize,
+    /// Root of the incremental per-file cache (see `cache`); `None` disables it.
+    pub cache_dir: Option<PathBuf>,
+    pub cache_key: String,
 }
 
 /// A single prioritized remediation action — mirrors `models.py`'s
@@ -128,6 +131,8 @@ pub struct ScanResult {
     pub ignored: Vec<Issue>,
     /// Maintainability Index per parsed file (see `metrics::maintainability_index`).
     pub file_mi: IndexMap<PathBuf, f64>,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
     /// Transport from worker to parent for the workspace-level import graph; cleared after use.
     pub raw_imports: IndexMap<PathBuf, Vec<RawImport>>,
     /// Transport from worker to parent for clone detection; cleared after use.
@@ -176,5 +181,7 @@ impl ScanResult {
         self.ignored.extend(other.ignored.iter().cloned());
         self.file_mi
             .extend(other.file_mi.iter().map(|(p, mi)| (p.clone(), *mi)));
+        self.cache_hits += other.cache_hits;
+        self.cache_misses += other.cache_misses;
     }
 }

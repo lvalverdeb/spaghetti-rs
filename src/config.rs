@@ -56,6 +56,9 @@ pub const MIN_CLONE_TOKENS: usize = 50;
 pub const MIN_MAINTAINABILITY_INDEX: usize = 10;
 /// git history window for change-frequency (hotspots, churn-weighted plan).
 pub const HOTSPOT_WINDOW_MONTHS: usize = 6;
+/// Files larger than this are not analysed (a `scan-limit` info finding is
+/// emitted instead).
+pub const MAX_FILE_BYTES: usize = 1_048_576;
 pub const MIN_BOOLEAN_FLAGS: usize = 3;
 pub const MAX_DECORATORS: usize = 3;
 pub const MAX_CLASS_METHODS: usize = 25;
@@ -119,6 +122,7 @@ pub struct Thresholds {
     pub min_clone_tokens: usize,
     pub min_maintainability_index: usize,
     pub hotspot_window_months: usize,
+    pub max_file_bytes: usize,
     pub max_class_methods: usize,
     pub max_class_attrs: usize,
     pub min_boolean_flags: usize,
@@ -156,6 +160,7 @@ impl Default for Thresholds {
             min_clone_tokens: MIN_CLONE_TOKENS,
             min_maintainability_index: MIN_MAINTAINABILITY_INDEX,
             hotspot_window_months: HOTSPOT_WINDOW_MONTHS,
+            max_file_bytes: MAX_FILE_BYTES,
             max_class_methods: MAX_CLASS_METHODS,
             max_class_attrs: MAX_CLASS_ATTRS,
             min_boolean_flags: MIN_BOOLEAN_FLAGS,
@@ -210,6 +215,7 @@ pub const THRESHOLD_NAMES: &[(&str, ThresholdKind)] = &[
     ("MIN_CLONE_TOKENS", ThresholdKind::Int),
     ("MIN_MAINTAINABILITY_INDEX", ThresholdKind::Int),
     ("HOTSPOT_WINDOW_MONTHS", ThresholdKind::Int),
+    ("MAX_FILE_BYTES", ThresholdKind::Int),
     ("MAX_CLASS_METHODS", ThresholdKind::Int),
     ("MAX_CLASS_ATTRS", ThresholdKind::Int),
     ("MIN_BOOLEAN_FLAGS", ThresholdKind::Int),
@@ -274,6 +280,7 @@ impl Thresholds {
             "MIN_CLONE_TOKENS" => unsigned(&mut self.min_clone_tokens),
             "MIN_MAINTAINABILITY_INDEX" => unsigned(&mut self.min_maintainability_index),
             "HOTSPOT_WINDOW_MONTHS" => unsigned(&mut self.hotspot_window_months),
+            "MAX_FILE_BYTES" => unsigned(&mut self.max_file_bytes),
             "MAX_CLASS_METHODS" => unsigned(&mut self.max_class_methods),
             "MAX_CLASS_ATTRS" => unsigned(&mut self.max_class_attrs),
             "MIN_BOOLEAN_FLAGS" => unsigned(&mut self.min_boolean_flags),
@@ -331,6 +338,7 @@ impl Thresholds {
             "MIN_CLONE_TOKENS" => u(self.min_clone_tokens),
             "MIN_MAINTAINABILITY_INDEX" => u(self.min_maintainability_index),
             "HOTSPOT_WINDOW_MONTHS" => u(self.hotspot_window_months),
+            "MAX_FILE_BYTES" => u(self.max_file_bytes),
             "MAX_CLASS_METHODS" => u(self.max_class_methods),
             "MAX_CLASS_ATTRS" => u(self.max_class_attrs),
             "MIN_BOOLEAN_FLAGS" => u(self.min_boolean_flags),

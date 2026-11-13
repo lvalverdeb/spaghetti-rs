@@ -276,7 +276,7 @@ fn push_unicode_escape(out: &mut String, c: char) {
 }
 
 /// Python's `repr(b)` for a `bytes`.
-fn py_repr_bytes(b: &[u8]) -> String {
+pub fn py_repr_bytes(b: &[u8]) -> String {
     let quote = if b.contains(&b'\'') && !b.contains(&b'"') {
         b'"'
     } else {
@@ -363,6 +363,30 @@ fn py_complex_repr(real: f64, imag: f64) -> String {
         let im = py_float_repr(imag, false);
         let sign = if im.starts_with('-') { "" } else { "+" };
         format!("({}{sign}{im}j)", py_float_repr(real, false))
+    }
+}
+
+/// Python's `repr(value)` for a constant (no `1e309` substitution).
+pub fn write_constant_repr(value: &rustpython_ast::Constant) -> String {
+    use rustpython_ast::Constant as C;
+    match value {
+        C::None => "None".to_string(),
+        C::Bool(true) => "True".to_string(),
+        C::Bool(false) => "False".to_string(),
+        C::Str(s) => py_repr_str(s),
+        C::Bytes(b) => py_repr_bytes(b),
+        C::Int(i) => i.to_string(),
+        C::Float(f) => py_float_repr(*f, true),
+        C::Complex { real, imag } => py_complex_repr(*real, *imag),
+        C::Ellipsis => "Ellipsis".to_string(),
+        C::Tuple(items) => {
+            let inner: Vec<String> = items.iter().map(write_constant_repr).collect();
+            if inner.len() == 1 {
+                format!("({},)", inner[0])
+            } else {
+                format!("({})", inner.join(", "))
+            }
+        }
     }
 }
 

@@ -108,6 +108,19 @@ pub struct Args {
     #[arg(long, value_name = "N", allow_negative_numbers = true)]
     pub churn_months: Option<i64>,
 
+    /// Reuse per-file results for files whose content and configuration have not
+    /// changed (store: .spaghetti/cache, or --cache-dir / [tool.spaghetti] cache-dir)
+    #[arg(long)]
+    pub cache: bool,
+
+    /// Ignore `cache = true` from the settings for this run
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Where --cache stores its entries (implies --cache)
+    #[arg(long, value_name = "PATH")]
+    pub cache_dir: Option<PathBuf>,
+
     /// Ignore any [tool.spaghetti] table found in a pyproject.toml above the cwd
     #[arg(long)]
     pub no_pyproject: bool,
@@ -558,6 +571,24 @@ impl History {
     }
 }
 
+/// `None` when the cache is off: it is opt-in by flag or by `cache = true` —
+/// mirrors `_resolve_cache_dir`.
+fn resolve_cache_dir(args: &Args, settings: &Settings, cwd: &Path) -> Option<PathBuf> {
+    if let Some(dir) = &args.cache_dir {
+        return Some(dir.clone());
+    }
+    let enabled = args.cache || (settings.cache == Some(true) && !args.no_cache);
+    if !enabled {
+        return None;
+    }
+    Some(
+        settings
+            .cache_dir
+            .clone()
+            .unwrap_or_else(|| cwd.join(crate::cache::DEFAULT_CACHE_DIR)),
+    )
+}
+
 fn resolve_store(args: &Args, settings: &Settings, cwd: &Path) -> PathBuf {
     args.snapshot_store
         .clone()
@@ -925,12 +956,21 @@ pub fn run(args: Args) -> i32 {
     // machinery that exists there only to get real parallelism past the GIL.
     // Rust has no GIL, so `rayon`'s thread pool is the whole story; the
     // settings installed above are process-global, so every worker sees them.
+    let cache_dir = resolve_cache_dir(&args, &settings, &cwd);
     let base_config = ScanConfig {
         exclude: run_exclude.clone(),
         min_duplicate_lines: args.min_duplicate_lines,
         twin_similarity: args.twin_similarity,
         recursive: true,
         min_clone_tokens: config::thresholds().min_clone_tokens,
+        cache_key: match &cache_dir {
+            Some(_) => crate::cache::cache_key(
+                &crate::cache::overrides_json(&settings),
+                env!("CARGO_PKG_VERSION"),
+            ),
+            None => String::new(),
+        },
+        cache_dir: cache_dir.clone(),
     };
     let scanned: Vec<(String, ScanResult)> = selected
         .par_iter()
@@ -957,6 +997,14 @@ pub fn run(args: Args) -> i32 {
     let mut total = ScanResult::default();
     for name in &selected {
         total.extend(&per_package[name.as_str()]);
+    }
+    if let Some(dir) = &cache_dir {
+        eprintln!(
+            "Cache: {} hit(s), {} miss(es) in {}",
+            total.cache_hits,
+            total.cache_misses,
+            dir.join(&base_config.cache_key).display()
+        );
     }
 
     // ── Gating: baseline, then changed lines ────────────────────────────────

@@ -13,6 +13,7 @@
 //! so it needs the same final passes everything else gets.
 
 use crate::ast_helpers::LineIndex;
+use crate::cache::{FileCache, FileEntry};
 use crate::checks::ast_per_file::Check;
 use crate::checks::package_level::{self, ParsedFile};
 use crate::checks::workspace_level::{
@@ -24,9 +25,10 @@ use crate::clones::{TokenStream, token_stream};
 use crate::config::{RuleSetting, rule_overrides};
 use crate::metrics::maintainability_index;
 use crate::models::{Issue, ScanConfig, ScanResult, Severity};
-use crate::rules::{is_enabled_by_default, is_known_rule};
+use crate::rules::{is_enabled_by_default, is_known_rule, rule_meta};
 use crate::suppression::is_suppressed;
 use indexmap::IndexMap;
+use rayon::prelude::*;
 use regex::Regex;
 use rustpython_ast::{Mod, Stmt};
 use sha1::{Digest, Sha1};
@@ -45,6 +47,10 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
     let mut all_issues: Vec<Issue> = Vec::new();
     let mut source_by_file: HashMap<PathBuf, String> = HashMap::new();
     let mut parsed_files: Vec<ParsedFile> = Vec::new();
+    let cache = config
+        .cache_dir
+        .as_ref()
+        .map(|dir| FileCache::new(dir, &config.cache_key));
 
     // Sorted, matching Python's `sorted(pkg_path.rglob("*.py"))` — the
     // package-level checks' output (`sync-async-duplication`'s cross-file
@@ -63,91 +69,67 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
     } else {
         walker.max_depth(1)
     };
-    for entry in walker.into_iter().filter_map(Result::ok) {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("py") {
-            continue;
-        }
-        let path_str = path.to_string_lossy();
-        if path_str.contains("__pycache__") {
-            continue;
-        }
-        if config
-            .exclude
-            .iter()
-            .any(|pat| path_str.contains(pat.as_str()))
-        {
-            continue;
-        }
-
-        result.files_scanned += 1;
-        // Read bytes and decode lossily so invalid UTF-8 reaches the parser
-        // and surfaces as `syntax-error`, matching Python's
-        // `read_text(errors="replace")`. Only a genuine I/O failure (broken
-        // symlink, permission denied, ...) becomes `unreadable-file`.
-        let source = match std::fs::read(path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) => {
-                all_issues.push(Issue::new(
-                    path,
-                    1,
-                    Severity::Error,
-                    "unreadable-file",
-                    package,
-                    format!("Failed to read file — {e}"),
-                ));
-                continue;
+    let files: Vec<PathBuf> = walker
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .filter(|path| {
+            if path.extension().and_then(|e| e.to_str()) != Some("py") {
+                return false;
             }
+            let path_str = path.to_string_lossy();
+            !path_str.contains("__pycache__")
+                && !config
+                    .exclude
+                    .iter()
+                    .any(|pat| path_str.contains(pat.as_str()))
+        })
+        .collect();
+
+    // Files are independent until the package-level checks, so they are
+    // scanned in parallel and folded back in sorted order — the result is
+    // identical to a sequential scan.
+    let scanned: Vec<FileScan> = files
+        .par_iter()
+        .map(|path| {
+            let mut file = FileScan::default();
+            file.outcome = scan_one_file(
+                path,
+                package,
+                root,
+                &mut file.result,
+                &mut file.issues,
+                cache.as_ref(),
+            );
+            file
+        })
+        .collect();
+    for (path, file) in files.iter().zip(scanned) {
+        let FileScan {
+            result: part,
+            issues,
+            outcome,
+        } = file;
+        result.files_scanned += part.files_scanned;
+        result.functions_scanned += part.functions_scanned;
+        result.total_lines += part.total_lines;
+        result.cache_hits += part.cache_hits;
+        result.cache_misses += part.cache_misses;
+        result.file_mi.extend(part.file_mi);
+        result.raw_imports.extend(part.raw_imports);
+        result.token_streams.extend(part.token_streams);
+        all_issues.extend(issues);
+        let Some((source, module)) = outcome else {
+            continue;
         };
-        result.total_lines += crate::pyast::py_splitlines(&source).len();
-
-        all_issues.extend(text_per_file::check_long_file(&source, path, package));
-        all_issues.extend(text_per_file::check_todo_markers(&source, path, package));
-
-        match rustpython_parser::parse(&source, rustpython_parser::Mode::Module, &path_str) {
-            Ok(module) => {
-                result.functions_scanned += ast_per_file::count_functions(&module);
-                for check in ast_per_file::ALL_CHECKS {
-                    all_issues.extend(match check {
-                        Check::PerFile(f) => f(&module, &source, path, package),
-                        Check::WithPkgRoot(f) => f(&module, &source, path, package, root),
-                    });
-                }
-                let body: &[Stmt] = match &module {
-                    Mod::Module(m) => &m.body,
-                    _ => &[],
-                };
-                let mi = maintainability_index(body, &source);
-                result.file_mi.insert(path.to_path_buf(), mi);
-                all_issues.extend(ast_per_file::low_maintainability_issue(mi, path, package));
-                let line_index = LineIndex::new(&source);
-                result
-                    .raw_imports
-                    .insert(path.to_path_buf(), collect_raw_imports(body, &line_index));
-                result
-                    .token_streams
-                    .insert(path.to_path_buf(), token_stream(body, &source, &line_index));
-                parsed_files.push(ParsedFile {
-                    path: path.to_path_buf(),
-                    source: source.clone(),
-                    module,
-                });
-            }
-            // The parser's own message is dropped: Python reports the bare
-            // "syntax error" too, so the fingerprint and message match.
-            Err(_) => {
-                all_issues.push(Issue::new(
-                    path,
-                    1,
-                    Severity::Error,
-                    "syntax-error",
-                    package,
-                    "Failed to parse file — syntax error".to_string(),
-                ));
-            }
+        if let Some(module) = module {
+            parsed_files.push(ParsedFile {
+                path: path.clone(),
+                source: source.clone(),
+                module,
+            });
         }
-
-        source_by_file.insert(path.to_path_buf(), source);
+        source_by_file.insert(path.clone(), source);
     }
 
     all_issues.extend(package_level::check_orphan_interfaces_pkg(
@@ -177,6 +159,225 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
         &mut result,
     );
     result
+}
+
+/// One file's share of a package scan, before it is folded in.
+#[derive(Default)]
+struct FileScan {
+    result: ScanResult,
+    issues: Vec<Issue>,
+    outcome: Option<(String, Option<Mod>)>,
+}
+
+/// A finding about the file itself (`syntax-error`, `unreadable-file`,
+/// `scan-limit`), at line 1 with the catalog's severity — mirrors
+/// `detector._infra_issue`.
+fn infra_issue(path: &Path, package: &str, rule: &'static str, message: String) -> Issue {
+    let severity = rule_meta(rule).map_or(Severity::Error, |m| m.default_severity);
+    Issue::new(path, 1, severity, rule, package, message)
+}
+
+/// `OSError.strerror`: the OS message without Rust's " (os error N)".
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.rfind(" (os error ") {
+        Some(at) if text.ends_with(')') => text[..at].to_string(),
+        _ => text,
+    }
+}
+
+/// `Path.read_text(encoding="utf-8", errors="replace")`: lossy UTF-8 and
+/// universal newlines (`\r\n` and `\r` become `\n`).
+fn read_python_text(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.into_owned()
+    })
+}
+
+/// Run every per-file check on `path`, appending findings to `issues` —
+/// mirrors `detector._scan_one_file`. Returns `(source, tree)` — `tree` is
+/// `None` when the file failed to parse or was skipped for exceeding a
+/// limit — or `None` when the file could not be read at all.
+fn scan_one_file(
+    path: &Path,
+    package: &str,
+    root: &Path,
+    result: &mut ScanResult,
+    issues: &mut Vec<Issue>,
+    cache: Option<&FileCache>,
+) -> Option<(String, Option<Mod>)> {
+    result.files_scanned += 1;
+    let source = match read_python_text(path) {
+        Ok(source) => source,
+        Err(e) => {
+            issues.push(infra_issue(
+                path,
+                package,
+                "unreadable-file",
+                format!("Failed to read file — {}", strerror(&e)),
+            ));
+            return None;
+        }
+    };
+    result.total_lines += crate::pyast::py_splitlines(&source).len();
+
+    let max_file_bytes = crate::config::thresholds().max_file_bytes;
+    if source.len() > max_file_bytes {
+        issues.push(infra_issue(
+            path,
+            package,
+            "scan-limit",
+            format!(
+                "File skipped — {} bytes exceeds max-file-bytes ({max_file_bytes}); exclude it \
+                 if generated, or raise the limit",
+                source.len()
+            ),
+        ));
+        return Some((source, None));
+    }
+
+    if let Some(cache) = cache {
+        if let Some(entry) = cache.load(&source, path, package) {
+            result.cache_hits += 1;
+            apply_cached(path, result, issues, entry);
+            let module = parse_quietly(&source, path);
+            return Some((source, module));
+        }
+        result.cache_misses += 1;
+    }
+
+    let start = issues.len();
+    let functions_before = result.functions_scanned;
+    let Ok(module) = check_one_file(&source, path, package, root, result, issues) else {
+        issues.truncate(start);
+        result.functions_scanned = functions_before;
+        result.file_mi.shift_remove(path);
+        result.raw_imports.shift_remove(path);
+        result.token_streams.shift_remove(path);
+        issues.push(infra_issue(
+            path,
+            package,
+            "scan-limit",
+            "File skipped — nesting deeper than the analysis limit; exclude it if generated"
+                .to_string(),
+        ));
+        return Some((source, None));
+    };
+    if let Some(cache) = cache {
+        cache.store(
+            &source,
+            path,
+            package,
+            &FileEntry {
+                issues: issues[start..].to_vec(),
+                parsed: module.is_some(),
+                functions: result.functions_scanned - functions_before,
+                mi: result.file_mi.get(path).copied(),
+                raw_imports: result.raw_imports.get(path).cloned(),
+                tokens: result.token_streams.get(path).cloned(),
+            },
+        );
+    }
+    Some((source, module))
+}
+
+/// The analysis gave up on a file nested past Python's recursion limit.
+struct NestingLimit;
+
+/// Every per-file check, uncached — mirrors `detector._check_one_file`.
+/// `Ok(None)` on a syntax error.
+fn check_one_file(
+    source: &str,
+    path: &Path,
+    package: &str,
+    root: &Path,
+    result: &mut ScanResult,
+    issues: &mut Vec<Issue>,
+) -> Result<Option<Mod>, NestingLimit> {
+    issues.extend(text_per_file::check_long_file(source, path, package));
+    issues.extend(text_per_file::check_todo_markers(source, path, package));
+
+    let path_str = path.to_string_lossy();
+    let parsed = if crate::limits::cpython_rejects(source) {
+        None
+    } else {
+        rustpython_parser::parse(source, rustpython_parser::Mode::Module, &path_str).ok()
+    };
+    // The parser's own message is dropped: Python reports the bare
+    // "syntax error" too, so the fingerprint and message match.
+    let Some(module) = parsed else {
+        issues.push(infra_issue(
+            path,
+            package,
+            "syntax-error",
+            "Failed to parse file — syntax error".to_string(),
+        ));
+        return Ok(None);
+    };
+    let body: &[Stmt] = match &module {
+        Mod::Module(m) => &m.body,
+        _ => &[],
+    };
+    if crate::limits::exceeds_nesting_limit(body) {
+        return Err(NestingLimit);
+    }
+
+    result.functions_scanned += ast_per_file::count_functions(&module);
+    for check in ast_per_file::ALL_CHECKS {
+        issues.extend(match check {
+            Check::PerFile(f) => f(&module, source, path, package),
+            Check::WithPkgRoot(f) => f(&module, source, path, package, root),
+        });
+    }
+    let mi = maintainability_index(body, source);
+    result.file_mi.insert(path.to_path_buf(), mi);
+    issues.extend(ast_per_file::low_maintainability_issue(mi, path, package));
+    let line_index = LineIndex::new(source);
+    result
+        .raw_imports
+        .insert(path.to_path_buf(), collect_raw_imports(body, &line_index));
+    result
+        .token_streams
+        .insert(path.to_path_buf(), token_stream(body, source, &line_index));
+    Ok(Some(module))
+}
+
+/// Fold a cache hit into `result` — mirrors `detector._apply_cached`.
+fn apply_cached(path: &Path, result: &mut ScanResult, issues: &mut Vec<Issue>, entry: FileEntry) {
+    issues.extend(entry.issues);
+    result.functions_scanned += entry.functions;
+    if let Some(mi) = entry.mi {
+        result.file_mi.insert(path.to_path_buf(), mi);
+    }
+    if let Some(raw) = entry.raw_imports {
+        result.raw_imports.insert(path.to_path_buf(), raw);
+    }
+    if let Some(tokens) = entry.tokens {
+        result.token_streams.insert(path.to_path_buf(), tokens);
+    }
+}
+
+/// The tree for the package-level checks on a cache hit; the syntax-error
+/// finding itself came from the cache — mirrors `detector._parse_quietly`.
+fn parse_quietly(source: &str, path: &Path) -> Option<Mod> {
+    if crate::limits::cpython_rejects(source) {
+        return None;
+    }
+    let module = rustpython_parser::parse(
+        source,
+        rustpython_parser::Mode::Module,
+        &path.to_string_lossy(),
+    )
+    .ok()?;
+    let body: &[Stmt] = match &module {
+        Mod::Module(m) => &m.body,
+        _ => &[],
+    };
+    (!crate::limits::exceeds_nesting_limit(body)).then_some(module)
 }
 
 /// Rule overrides, character columns, fingerprints, inline suppressions —
@@ -424,6 +625,8 @@ mod recursive_flag_tests {
             twin_similarity: 0.6,
             recursive: false,
             min_clone_tokens: 50,
+            cache_dir: None,
+            cache_key: String::new(),
         };
         let result = scan_package("root", &root, &config);
 
@@ -451,6 +654,8 @@ mod unreadable_file_tests {
             twin_similarity: 0.6,
             recursive: true,
             min_clone_tokens: 50,
+            cache_dir: None,
+            cache_key: String::new(),
         }
     }
 
@@ -519,6 +724,8 @@ mod location_and_fingerprint_tests {
             twin_similarity: 0.6,
             recursive: true,
             min_clone_tokens: 50,
+            cache_dir: None,
+            cache_key: String::new(),
         }
     }
 
@@ -714,6 +921,8 @@ mod workspace_tests {
             twin_similarity: 0.6,
             recursive: true,
             min_clone_tokens: 30,
+            cache_dir: None,
+            cache_key: String::new(),
         }
     }
 

@@ -454,6 +454,15 @@ pub const RULE_DOCS: &[(&str, RuleDoc)] = &[
         },
     ),
     (
+        "scan-limit",
+        RuleDoc {
+            why: "A file over the size limit or nested past the interpreter's recursion limit is almost always generated code or data; analysing it would cost minutes and say nothing about the hand-written code around it.",
+            fix: "Exclude generated files with `exclude`, or raise `max-file-bytes` if the file is genuinely hand-written. Nothing in it was checked.",
+            equivalents: &[],
+            thresholds: &["MAX_FILE_BYTES"],
+        },
+    ),
+    (
         "unreadable-file",
         RuleDoc {
             why: "A file that cannot be read (permissions, invalid encoding) is a blind spot in every report.",
