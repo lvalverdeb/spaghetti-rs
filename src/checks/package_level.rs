@@ -525,3 +525,42 @@ mod calibration_tests {
         assert_eq!(check_duplicate_functions_pkg("pkg", &files, 5).len(), 1);
     }
 }
+
+#[cfg(test)]
+mod twin_order_tests {
+    //! Mirrors tests/test_package_level.py::test_twin_pairs_are_reported_in_a_seed_independent_order.
+    use super::{ParsedFile, check_sync_async_twins_pkg};
+    use std::path::PathBuf;
+
+    #[test]
+    fn twin_pairs_are_reported_in_sorted_candidate_order() {
+        let body = |kw: &str, name: &str, call: &str| {
+            format!(
+                "{kw}def {name}(key):\n    value = {call}(key)\n    if value is None:\n        raise KeyError(key)\n    return decode(value)\n\n"
+            )
+        };
+        let source = format!(
+            "{}{}{}",
+            body("", "get", "store.read"),
+            body("async ", "aget", "await store.aread"),
+            body("async ", "get_async", "await store.aread"),
+        );
+        let module =
+            rustpython_parser::parse(&source, rustpython_parser::Mode::Module, "m.py").unwrap();
+        let files = vec![ParsedFile {
+            path: PathBuf::from("/tmp/pkg/m.py"),
+            source,
+            module,
+        }];
+        let messages: Vec<String> = check_sync_async_twins_pkg("pkg", &files, 0.6)
+            .into_iter()
+            .map(|i| i.message)
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].starts_with("get() and aget()"), "{messages:?}");
+        assert!(
+            messages[1].starts_with("get() and get_async()"),
+            "{messages:?}"
+        );
+    }
+}

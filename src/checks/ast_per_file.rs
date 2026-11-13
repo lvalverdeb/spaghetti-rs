@@ -1742,6 +1742,11 @@ fn bare_dict_names(annotation: &Expr) -> Vec<TextRange> {
     let mut found = Vec::new();
     let mut stack = vec![Node::Expr(annotation)];
     while let Some(node) = stack.pop() {
+        // Annotated[dict[str, int], Field(default_factory=dict)]: the call is
+        // metadata and its `dict` is a value, not a type.
+        if matches!(node, Node::Expr(Expr::Call(_))) {
+            continue;
+        }
         if let Node::Expr(Expr::Subscript(sub)) = node
             && matches!(sub.value.as_ref(), Expr::Name(n) if n.id.as_str() == "dict")
         {
@@ -3799,13 +3804,14 @@ mod walk_order_tests {
     }
 
     #[test]
-    fn untyped_dict_reports_breadth_first_and_sees_annotated_defaults() {
-        // The module-level AnnAssign (line 3) is shallower than the parameter
-        // annotation of the def on line 1; `Field(default_factory=dict)`
-        // inside `Annotated[...]` counts, as in Python.
+    fn untyped_dict_reports_breadth_first_and_skips_values_in_annotation_metadata() {
+        // The module-level AnnAssigns are shallower than the parameter
+        // annotation of the def on line 1.
         let source = "def f(a: dict) -> None:\n    pass\nx: dict = {}\n\
-                      y: Annotated[dict[str, int], Field(default_factory=dict)]\n";
-        assert_eq!(lines(check_untyped_dicts, source), vec![3, 4, 1]);
+                      y: Annotated[dict[str, int], Field(default_factory=dict)]\n\
+                      z: Annotated[dict, Field(default_factory=dict)]\n";
+        // A `dict` inside a call in the annotation is a value, not a type.
+        assert_eq!(lines(check_untyped_dicts, source), vec![3, 5, 1]);
     }
 
     #[test]
