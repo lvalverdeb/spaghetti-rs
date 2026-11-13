@@ -77,7 +77,7 @@ pub fn file_churn(roots: &[PathBuf], months: i64) -> Result<IndexMap<PathBuf, Ch
     let mut authors: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     let mut resolved: HashMap<&str, PathBuf> = HashMap::new();
     let mut author = "";
-    for line in py_splitlines(&log) {
+    for line in git_lines(&log) {
         if let Some(name) = line.strip_prefix('\0') {
             author = name;
             continue;
@@ -107,10 +107,11 @@ pub fn file_churn(roots: &[PathBuf], months: i64) -> Result<IndexMap<PathBuf, Ch
         .collect())
 }
 
-/// `str.splitlines()` for git's output (`\n`, `\r\n`, `\r`).
-fn py_splitlines(text: &str) -> impl Iterator<Item = &str> {
-    text.split('\n')
-        .flat_map(|l| l.strip_suffix('\r').unwrap_or(l).split('\r'))
+/// Lines of git's output split on `"\n"` only, trailing `"\r"` stripped —
+/// not `splitlines()`, which also breaks at U+2028/U+2029/U+0085 and
+/// `\v`/`\f` that a path may contain.
+fn git_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split('\n').map(|l| l.trim_end_matches('\r'))
 }
 
 /// Multiplier in [1, 2] applied to a finding's priority: 1 for an untouched
@@ -210,8 +211,19 @@ mod tests {
         std::fs::write(&odd, "z = 1\n").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "non-ascii"]);
+        let separators = repo.join("pkg/a\u{2028}b.py");
+        std::fs::write(&separators, "z = 1\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "u2028"]);
         let churn = file_churn(&[repo.join("pkg")], 6).unwrap();
         std::fs::remove_dir_all(&repo).ok();
+        assert_eq!(
+            churn.get(&separators),
+            Some(&Churn {
+                commits: 1,
+                authors: 1
+            })
+        );
         assert_eq!(
             churn.get(&odd),
             Some(&Churn {

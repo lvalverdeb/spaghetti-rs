@@ -32,7 +32,10 @@ impl fmt::Display for DiffError {
 impl std::error::Error for DiffError {}
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String, DiffError> {
+    // core.quotePath=false: otherwise a non-ASCII path appears in the diff
+    // header quoted and octal-escaped and never matches a scanned file.
     let output = Command::new("git")
+        .args(["-c", "core.quotePath=false"])
         .args(args)
         .current_dir(cwd)
         .output()
@@ -81,8 +84,13 @@ pub fn changed_lines(
 pub fn parse_unified_diff(diff: &str, toplevel: &Path) -> HashMap<PathBuf, HashSet<usize>> {
     let mut changed: HashMap<PathBuf, HashSet<usize>> = HashMap::new();
     let mut current: Option<PathBuf> = None;
-    for line in diff.lines() {
+    // Split on "\n" only, trailing "\r" stripped, exactly like the Python
+    // original: paths may contain U+2028 and other separators.
+    for line in diff.split('\n') {
+        let line = line.trim_end_matches('\r');
         if let Some(target) = line.strip_prefix("+++ ") {
+            // git appends "\t" after a path that contains whitespace.
+            let target = target.trim_end_matches('\t');
             if target == "/dev/null" {
                 current = None;
                 continue;
@@ -170,6 +178,37 @@ new file mode 100644
 @@ -0,0 +1 @@
 +z = 1
 ";
+
+    #[test]
+    fn changed_lines_sees_non_ascii_paths() {
+        let repo = std::env::temp_dir().join(format!("spaghetti_rs_diff_{}", std::process::id()));
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        let target = repo.join("pkg/caf\u{e9}  x.py");
+        std::fs::write(&target, "a = 1\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(&target, "a = 1\nb = 2\n").unwrap();
+        let changed = changed_lines("HEAD", &repo.join("pkg")).unwrap();
+        std::fs::remove_dir_all(&repo).ok();
+        let expected: HashMap<PathBuf, HashSet<usize>> =
+            [(target, HashSet::from([2]))].into_iter().collect();
+        assert_eq!(changed, expected);
+    }
 
     #[test]
     fn parse_unified_diff_collects_added_and_modified_lines() {
