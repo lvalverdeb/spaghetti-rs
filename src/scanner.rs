@@ -62,8 +62,26 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
             continue;
         }
 
-        let source = std::fs::read_to_string(path).unwrap_or_default();
         result.files_scanned += 1;
+        // Read bytes and decode lossily so invalid UTF-8 reaches the parser
+        // and surfaces as `syntax-error`, matching Python's
+        // `read_text(errors="replace")`. Only a genuine I/O failure (broken
+        // symlink, permission denied, ...) becomes `unreadable-file`.
+        let source = match std::fs::read(path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) => {
+                all_issues.push(Issue {
+                    file: path.to_path_buf(),
+                    line: 1,
+                    severity: Severity::Error,
+                    rule: "unreadable-file",
+                    message: format!("Failed to read file — {e}"),
+                    package: package.to_string(),
+                    reason: None,
+                });
+                continue;
+            }
+        };
         result.total_lines += source.lines().count();
 
         all_issues.extend(text_per_file::check_long_file(&source, path, package));
@@ -183,5 +201,69 @@ mod recursive_flag_tests {
                 .filter(|i| i.rule == "bare-except")
                 .all(|i| i.file == root.join("loose.py"))
         );
+    }
+}
+
+#[cfg(test)]
+mod unreadable_file_tests {
+    use super::scan_package;
+    use crate::models::{ScanConfig, Severity};
+
+    fn config() -> ScanConfig {
+        ScanConfig {
+            exclude: vec![],
+            min_duplicate_lines: 5,
+            twin_similarity: 0.6,
+            recursive: true,
+        }
+    }
+
+    fn fresh_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "spaghetti_rs_scan_{tag}_{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_is_reported_not_swallowed() {
+        // Regression: `read_to_string(..).unwrap_or_default()` used to treat
+        // an unreadable file as empty, counting it as scanned with no
+        // finding — indistinguishable from a genuinely clean file.
+        let root = fresh_root("broken_symlink");
+        std::fs::write(root.join("ok.py"), "X = 1\n").unwrap();
+        std::os::unix::fs::symlink(root.join("does-not-exist.py"), root.join("dangling.py"))
+            .unwrap();
+
+        let result = scan_package("pkg", &root, &config());
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(result.files_scanned, 2);
+        let unreadable: Vec<_> = result
+            .issues
+            .iter()
+            .filter(|i| i.rule == "unreadable-file")
+            .collect();
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(unreadable[0].file, root.join("dangling.py"));
+        assert_eq!(unreadable[0].severity, Severity::Error);
+        assert_eq!(unreadable[0].line, 1);
+    }
+
+    #[test]
+    fn invalid_utf8_is_a_syntax_error_like_python() {
+        let root = fresh_root("invalid_utf8");
+        std::fs::write(root.join("latin.py"), b"\xff\xfe\x00garbage\n").unwrap();
+
+        let result = scan_package("pkg", &root, &config());
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(result.files_scanned, 1);
+        assert!(result.issues.iter().any(|i| i.rule == "syntax-error"));
+        assert!(result.issues.iter().all(|i| i.rule != "unreadable-file"));
     }
 }

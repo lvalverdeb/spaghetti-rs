@@ -91,6 +91,7 @@ fn fix_effort(rule: &str) -> f64 {
         "long-file" => 2.5,
         "todo-marker" => 0.5,
         "syntax-error" => 1.0,
+        "unreadable-file" => 1.0,
         "dead-code" => 0.5,
         "magic-number" => 0.5,
         "magic-string" => 0.5,

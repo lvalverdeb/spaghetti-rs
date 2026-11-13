@@ -6,7 +6,7 @@ This is a from-scratch reimplementation of [`spaghetti-detector`](https://github
 
 The [Python original](https://github.com/lvalverdeb/spaghetti) remains the actively maintained **spec of record**: when the two disagree, the Python behaviour is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/spaghetti/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioural quirk (some quite subtle — e.g. `difflib.SequenceMatcher.ratio()`'s asymmetry under `autojunk`) uncovered and matched along the way.
 
-**Status**: all 39 rules ported and verified — 674/674 issues identical to Python's own output across a real multi-package codebase, output is reproducible run-to-run, and `--plan` output is byte-for-byte identical to Python's.
+**Status**: all 40 rules ported and verified — 674/674 issues identical to Python's own output across a real multi-package codebase, output is reproducible run-to-run, and `--plan` output is byte-for-byte identical to Python's.
 
 ## Why It Exists
 
@@ -113,7 +113,7 @@ With `--json`, the report is a single JSON object to stdout — the same shape a
 
 ## Rules
 
-All 39 rules from the Python original: 31 per-file AST checks (including `pass-through-method`), 2 source-text checks, 1 infrastructure check (`syntax-error`), and 5 cross-file package checks (`import-cycle`, `high-coupling`, `orphan-interface`, `duplicate-function-body`, `sync-async-duplication`). A `low-cohesion` (LCOM4) check also exists in the codebase but is intentionally not enabled by default — see the rule's own doc comment for why. See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
+All 40 rules from the Python original: 31 per-file AST checks (including `pass-through-method`), 2 source-text checks, 2 infrastructure checks (`syntax-error`, `unreadable-file`), and 5 cross-file package checks (`import-cycle`, `high-coupling`, `orphan-interface`, `duplicate-function-body`, `sync-async-duplication`). A `low-cohesion` (LCOM4) check also exists in the codebase but is intentionally not enabled by default — see the rule's own doc comment for why. See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
 
 ## Development
 
