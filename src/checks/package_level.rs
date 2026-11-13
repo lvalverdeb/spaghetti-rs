@@ -3,15 +3,14 @@
 //! Mirrors `spaghetti/checks/package_level.py`.
 
 use crate::ast_helpers::{
-    FuncNode, LineIndex, collect_functions, collect_functions_with_class_context, dump_stmts,
-    is_trivial_body, line_count,
+    FuncNode, LineIndex, NodeLoc, collect_functions, collect_functions_with_class_context,
+    dump_stmts, is_trivial_body, line_count,
 };
-use crate::config::{
-    MAX_MODULE_FAN_IN, MAX_MODULE_FAN_OUT, MIN_TWIN_FUNCTION_LINES, allowed_import_prefix,
-};
+use crate::config::{MAX_MODULE_FAN_IN, MAX_MODULE_FAN_OUT, MIN_TWIN_FUNCTION_LINES};
 use crate::models::{Issue, Severity, display_path};
 use crate::similarity::sequence_matcher_ratio;
 use crate::unparse::unparse_function;
+use indexmap::IndexMap;
 use rustpython_ast::{Mod, Stmt, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -39,15 +38,37 @@ fn issue(
     package: &str,
     message: String,
 ) -> Issue {
-    Issue {
-        file: filepath.to_path_buf(),
-        line,
-        severity,
-        rule,
-        message,
-        package: package.to_string(),
-        reason: None,
-    }
+    Issue::new(filepath, line, severity, rule, package, message)
+}
+
+/// An issue located at a node's span — mirrors `line=node.lineno, **_loc(node)`.
+fn issue_at(
+    filepath: &Path,
+    loc: NodeLoc,
+    severity: Severity,
+    rule: &'static str,
+    package: &str,
+    message: String,
+) -> Issue {
+    let mut issue = Issue::new(filepath, loc.line, severity, rule, package, message);
+    issue.column = Some(loc.column);
+    issue.end_line = Some(loc.end_line);
+    issue.end_column = Some(loc.end_column);
+    issue
+}
+
+/// Dotted prefix of the package's own modules, e.g. `"my_lib."` — mirrors
+/// `package_level.py::_package_prefix`.
+///
+/// Derived from the registered package directory's name, which is also how
+/// `module_and_package_for` names modules — so an import is intra-package
+/// exactly when it starts with this.
+fn package_prefix(pkg_root: &Path) -> String {
+    let name = pkg_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{name}.")
 }
 
 // ── Import Cycles (real cycle detection via DFS) ─────────────────────────────
@@ -182,15 +203,12 @@ fn module_level_imports(module_body: &[Stmt]) -> Vec<ImportNode> {
 /// `file_for_module`, just absent from `graph` (equivalent to an empty
 /// adjacency set — callers use `graph.get(module)`).
 fn build_import_graph<'a>(
-    pkg_name: &str,
     files: &'a [ParsedFile],
     pkg_root: &Path,
 ) -> (HashMap<String, HashSet<String>>, HashMap<String, &'a Path>) {
     let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
     let mut file_for_module: HashMap<String, &Path> = HashMap::new();
-    let Some(prefix) = allowed_import_prefix(pkg_name) else {
-        return (graph, file_for_module);
-    };
+    let prefix = package_prefix(pkg_root);
     let stem = prefix.trim_end_matches('.');
 
     for f in files {
@@ -228,7 +246,7 @@ pub fn check_import_cycles_pkg(
     files: &[ParsedFile],
     pkg_root: &Path,
 ) -> Vec<Issue> {
-    let (graph, file_for_module) = build_import_graph(pkg_name, files, pkg_root);
+    let (graph, file_for_module) = build_import_graph(files, pkg_root);
     if file_for_module.is_empty() {
         return Vec::new();
     }
@@ -324,7 +342,7 @@ pub fn check_module_coupling_pkg(
     files: &[ParsedFile],
     pkg_root: &Path,
 ) -> Vec<Issue> {
-    let (graph, file_for_module) = build_import_graph(pkg_name, files, pkg_root);
+    let (graph, file_for_module) = build_import_graph(files, pkg_root);
     if file_for_module.is_empty() {
         return Vec::new();
     }
@@ -374,7 +392,10 @@ pub fn check_duplicate_functions_pkg(
     files: &[ParsedFile],
     min_lines: usize,
 ) -> Vec<Issue> {
-    let mut groups: HashMap<String, Vec<(&Path, String, usize)>> = HashMap::new();
+    // Insertion-ordered like Python's dict: issues come out in the order each
+    // duplicate group was first seen, which (with `collect_functions` in
+    // `ast.walk` order) is the order the original reports them in.
+    let mut groups: IndexMap<String, Vec<(&Path, String, NodeLoc)>> = IndexMap::new();
 
     for f in files {
         let line_index = LineIndex::new(&f.source);
@@ -384,11 +405,11 @@ pub fn check_duplicate_functions_pkg(
                 continue;
             }
             let key = dump_stmts(func.body());
-            let line_no = line_index.line_number(func.start);
-            groups
-                .entry(key)
-                .or_default()
-                .push((f.path.as_path(), func.name.clone(), line_no));
+            groups.entry(key).or_default().push((
+                f.path.as_path(),
+                func.name.clone(),
+                line_index.node_loc(func.range()),
+            ));
         }
     }
 
@@ -397,15 +418,17 @@ pub fn check_duplicate_functions_pkg(
         if occurrences.len() < MIN_DUPLICATE_OCCURRENCES {
             continue;
         }
-        occurrences.sort_by(|a, b| (a.0.to_string_lossy(), a.2).cmp(&(b.0.to_string_lossy(), b.2)));
+        occurrences.sort_by(|a, b| {
+            (a.0.to_string_lossy(), a.2.line).cmp(&(b.0.to_string_lossy(), b.2.line))
+        });
         let locations: Vec<String> = occurrences
             .iter()
-            .map(|(fp, name, line_no)| format!("{}:{line_no} ({name})", display_path(fp, None)))
+            .map(|(fp, name, loc)| format!("{}:{} ({name})", display_path(fp, None), loc.line))
             .collect();
-        let (first_fp, _, first_line) = occurrences[0];
-        issues.push(issue(
+        let (first_fp, _, first_loc) = occurrences[0];
+        issues.push(issue_at(
             first_fp,
-            first_line,
+            first_loc,
             Severity::Warning,
             "duplicate-function-body",
             pkg_name,
@@ -416,13 +439,6 @@ pub fn check_duplicate_functions_pkg(
             ),
         ));
     }
-    // `groups` is a plain `HashMap`, whose iteration order is randomized
-    // per-process — without this, the resulting issue order (and thus
-    // which duplicate group appears first) was non-reproducible across
-    // runs of the same binary on the same input. Sorting by (file, line)
-    // gives a stable, deterministic order; it doesn't need to match
-    // Python's own dict-insertion-order output, just be repeatable.
-    issues.sort_by_key(|a| (a.file.clone(), a.line));
     issues
 }
 
@@ -578,23 +594,23 @@ mod module_coupling_tests {
         let n = MAX_MODULE_FAN_IN + 1; // also > MAX_MODULE_FAN_OUT since both are equal
         let mut files = Vec::new();
         for i in 0..n {
-            files.push(parsed_file(&format!("/pkg/boti_data/dep{i}.py"), "x = 1\n"));
+            files.push(parsed_file(&format!("/pkg/my_lib/dep{i}.py"), "x = 1\n"));
         }
         let hub_source: String = (0..n)
             .map(|i| format!("from .dep{i} import x as x{i}\n"))
             .collect();
-        files.push(parsed_file("/pkg/boti_data/hub.py", &hub_source));
+        files.push(parsed_file("/pkg/my_lib/hub.py", &hub_source));
         for i in 0..n {
             files.push(parsed_file(
-                &format!("/pkg/boti_data/user{i}.py"),
+                &format!("/pkg/my_lib/user{i}.py"),
                 "from .hub import hub\n",
             ));
         }
 
-        let issues = check_module_coupling_pkg("boti-data", &files, Path::new("/pkg/boti_data"));
+        let issues = check_module_coupling_pkg("my-lib", &files, Path::new("/pkg/my_lib"));
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].rule, "high-coupling");
-        assert!(issues[0].message.contains("boti_data.hub"));
+        assert!(issues[0].message.contains("my_lib.hub"));
     }
 
     #[test]
@@ -602,24 +618,24 @@ mod module_coupling_tests {
         // Sanity check: fan-in alone (a legitimately central util everyone
         // imports) must not trigger — only both fan-in AND fan-out high does.
         let n = MAX_MODULE_FAN_IN + 1;
-        let mut files = vec![parsed_file("/pkg/boti_data/util.py", "x = 1\n")];
+        let mut files = vec![parsed_file("/pkg/my_lib/util.py", "x = 1\n")];
         for i in 0..n {
             files.push(parsed_file(
-                &format!("/pkg/boti_data/user{i}.py"),
+                &format!("/pkg/my_lib/user{i}.py"),
                 "from .util import x\n",
             ));
         }
-        let issues = check_module_coupling_pkg("boti-data", &files, Path::new("/pkg/boti_data"));
+        let issues = check_module_coupling_pkg("my-lib", &files, Path::new("/pkg/my_lib"));
         assert!(issues.is_empty());
     }
 
     #[test]
     fn clean() {
         let files = vec![
-            parsed_file("/pkg/boti_data/a.py", "x = 1\n"),
-            parsed_file("/pkg/boti_data/b.py", "from .a import x\n"),
+            parsed_file("/pkg/my_lib/a.py", "x = 1\n"),
+            parsed_file("/pkg/my_lib/b.py", "from .a import x\n"),
         ];
-        let issues = check_module_coupling_pkg("boti-data", &files, Path::new("/pkg/boti_data"));
+        let issues = check_module_coupling_pkg("my-lib", &files, Path::new("/pkg/my_lib"));
         assert!(issues.is_empty());
     }
 }

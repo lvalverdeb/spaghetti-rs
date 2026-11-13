@@ -7,15 +7,14 @@ use std::path::Path;
 pub fn check_long_file(source: &str, filepath: &Path, package: &str) -> Vec<Issue> {
     let count = source.lines().count();
     if count > MAX_FILE_LINES {
-        vec![Issue {
-            file: filepath.to_path_buf(),
-            line: 1,
-            severity: Severity::Warning,
-            rule: "long-file",
-            message: format!("File is {count} lines (max {MAX_FILE_LINES})"),
-            package: package.to_string(),
-            reason: None,
-        }]
+        vec![Issue::new(
+            filepath,
+            1,
+            Severity::Warning,
+            "long-file",
+            package,
+            format!("File is {count} lines (max {MAX_FILE_LINES})"),
+        )]
     } else {
         Vec::new()
     }
@@ -33,15 +32,14 @@ pub fn check_todo_markers(source: &str, filepath: &Path, package: &str) -> Vec<I
             } else {
                 trimmed.to_string()
             };
-            issues.push(Issue {
-                file: filepath.to_path_buf(),
-                line: i + 1,
-                severity: Severity::Info,
-                rule: "todo-marker",
-                message: format!("{marker} marker: {snippet}"),
-                package: package.to_string(),
-                reason: None,
-            });
+            issues.push(Issue::new(
+                filepath,
+                i + 1,
+                Severity::Info,
+                "todo-marker",
+                package,
+                format!("{marker} marker: {snippet}"),
+            ));
         }
     }
     issues

@@ -223,29 +223,110 @@ pub fn discover_cwd_packages(cwd: &Path) -> (BTreeMap<String, PathBuf>, Option<S
     (packages, loose_root_name)
 }
 
+/// Bumped only on a breaking change to the `--json` shape; additive fields
+/// keep it. The matching schema is committed in the Python repo at
+/// `schema/report.v1.json` — mirrors `cli.py::JSON_SCHEMA_VERSION`.
+pub const JSON_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Serialize)]
 struct JsonIssue {
     file: String,
     line: usize,
+    column: Option<usize>,
+    end_line: Option<usize>,
+    end_column: Option<usize>,
     severity: &'static str,
     rule: &'static str,
     message: String,
     package: String,
+    fingerprint: String,
+}
+
+impl JsonIssue {
+    fn from_issue(i: &Issue, workspace_root: Option<&Path>) -> Self {
+        JsonIssue {
+            file: display_path(&i.file, workspace_root),
+            line: i.line,
+            column: i.column,
+            end_line: i.end_line,
+            end_column: i.end_column,
+            severity: i.severity.as_str(),
+            rule: i.rule,
+            message: i.message.clone(),
+            package: i.package.clone(),
+            fingerprint: i.fingerprint.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
 struct JsonIgnoredIssue {
-    file: String,
-    line: usize,
-    severity: &'static str,
-    rule: &'static str,
-    message: String,
-    package: String,
+    #[serde(flatten)]
+    issue: JsonIssue,
     reason: Option<String>,
 }
 
+/// Per-package (and whole-run) stats — mirrors `cli.py::_package_json`.
+#[derive(Serialize)]
+struct JsonPackageStats {
+    grade: &'static str,
+    score: f64,
+    files: usize,
+    lines: usize,
+    functions: usize,
+    issues: usize,
+    errors: usize,
+    warnings: usize,
+    infos: usize,
+}
+
+impl JsonPackageStats {
+    fn from_result(result: &ScanResult) -> Self {
+        let (score, grade) = crate::scoring::compute_score(result);
+        JsonPackageStats {
+            grade,
+            score: round_half_even_1dp(score),
+            files: result.files_scanned,
+            lines: result.total_lines,
+            functions: result.functions_scanned,
+            issues: result.issues.len(),
+            errors: result.error_count(),
+            warnings: result.warning_count(),
+            infos: result.info_count(),
+        }
+    }
+}
+
+/// Python's `round(x, 1)`: the double nearest the correctly-rounded
+/// (half-to-even) one-decimal value. Rust's `{:.1}` formatting is the same
+/// correctly-rounded conversion, so parsing it back yields the identical
+/// double — and `serde_json` then prints the same shortest repr Python does
+/// (`100.0`, `89.8`).
+fn round_half_even_1dp(x: f64) -> f64 {
+    format!("{x:.1}").parse().unwrap_or(x)
+}
+
+/// `{name: stats}` in scan order — serialized as a JSON object whose key
+/// order is the package order, like Python's insertion-ordered dict.
+struct JsonPackages(Vec<(String, JsonPackageStats)>);
+
+impl Serialize for JsonPackages {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, stats) in &self.0 {
+            map.serialize_entry(name, stats)?;
+        }
+        map.end()
+    }
+}
+
+/// Schema v1 — mirrors `cli.py::_json_report` key for key, in order.
 #[derive(Serialize)]
 struct JsonOutput {
+    schema_version: u32,
+    summary: JsonPackageStats,
+    packages: JsonPackages,
     issues: Vec<JsonIssue>,
     suppressed: usize,
     suppression_help: &'static str,
@@ -254,6 +335,29 @@ struct JsonOutput {
 
 const SUPPRESSION_HELP: &str = "Silence a confirmed non-issue by adding \
 '# spaghetti-ignore[rule-name]: reason' on the flagged line (or the line above).";
+
+/// `json.dumps(..., indent=2)` byte for byte: serde_json's pretty printer
+/// already matches the indentation and separators; what it doesn't do is
+/// `ensure_ascii`, so every non-ASCII character (and DEL, which Python's
+/// `[^\ -~]` escape class also catches) is rewritten to `\uXXXX` — as a
+/// UTF-16 surrogate pair above the BMP, lowercase hex, exactly like Python.
+/// Safe to do over the whole document: outside string literals serde_json
+/// only ever emits ASCII.
+fn to_json_ensure_ascii<T: Serialize>(value: &T) -> String {
+    let pretty = serde_json::to_string_pretty(value).expect("report is serializable");
+    let mut out = String::with_capacity(pretty.len());
+    for c in pretty.chars() {
+        if (c as u32) < 0x7f {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
+}
 
 pub fn run(args: Args) -> i32 {
     let cwd = std::env::current_dir().expect("cwd");
@@ -351,11 +455,11 @@ pub fn run(args: Args) -> i32 {
             (name.clone(), result)
         })
         .collect();
-    let mut per_package: BTreeMap<String, ScanResult> = scanned.into_iter().collect();
+    let per_package: BTreeMap<String, ScanResult> = scanned.into_iter().collect();
 
     let mut total = ScanResult::default();
     for name in &selected {
-        total.extend(std::mem::take(per_package.get_mut(name).unwrap()));
+        total.extend(&per_package[name]);
     }
 
     let min_severity = severity_rank(&args.severity);
@@ -372,16 +476,22 @@ pub fn run(args: Args) -> i32 {
         );
     } else if args.json {
         let output = JsonOutput {
+            schema_version: JSON_SCHEMA_VERSION,
+            summary: JsonPackageStats::from_result(&total),
+            packages: JsonPackages(
+                selected
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            JsonPackageStats::from_result(&per_package[name]),
+                        )
+                    })
+                    .collect(),
+            ),
             issues: filtered
                 .iter()
-                .map(|i| JsonIssue {
-                    file: display_path(&i.file, workspace_root.as_deref()),
-                    line: i.line,
-                    severity: i.severity.as_str(),
-                    rule: i.rule,
-                    message: i.message.clone(),
-                    package: i.package.clone(),
-                })
+                .map(|i| JsonIssue::from_issue(i, workspace_root.as_deref()))
                 .collect(),
             suppressed: total.suppressed,
             suppression_help: SUPPRESSION_HELP,
@@ -389,17 +499,12 @@ pub fn run(args: Args) -> i32 {
                 .ignored
                 .iter()
                 .map(|i| JsonIgnoredIssue {
-                    file: display_path(&i.file, workspace_root.as_deref()),
-                    line: i.line,
-                    severity: i.severity.as_str(),
-                    rule: i.rule,
-                    message: i.message.clone(),
-                    package: i.package.clone(),
+                    issue: JsonIssue::from_issue(i, workspace_root.as_deref()),
                     reason: i.reason.clone(),
                 })
                 .collect(),
         };
-        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        println!("{}", to_json_ensure_ascii(&output));
     } else {
         render_text_report(&filtered, &total, workspace_root.as_deref(), args.quiet);
     }

@@ -25,6 +25,7 @@ use crate::config::{
     MIN_BOOLEAN_FLAGS, MIN_CLASS_METHODS, is_dunder, layer_rules,
 };
 use crate::models::{Issue, Severity};
+use rustpython_ast::text_size::TextRange;
 use rustpython_ast::{Arguments, Constant, Expr, Mod, Ranged, Stmt, Visitor};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -36,6 +37,8 @@ fn module_body(module: &Mod) -> &[Stmt] {
     }
 }
 
+/// An issue that knows only its line — for the rules whose Python original
+/// passes just `line=...` (unused-import, dead-code, god-module, magic-string).
 fn issue(
     filepath: &Path,
     line: usize,
@@ -44,15 +47,27 @@ fn issue(
     package: &str,
     message: String,
 ) -> Issue {
-    Issue {
-        file: filepath.to_path_buf(),
-        line,
-        severity,
-        rule,
-        message,
-        package: package.to_string(),
-        reason: None,
-    }
+    Issue::new(filepath, line, severity, rule, package, message)
+}
+
+/// An issue located at `range` — line plus start/end columns, mirroring the
+/// Python original's `line=node.lineno, **_loc(node)`. Columns are byte
+/// columns here; `scan_package` converts them to character columns.
+fn issue_at(
+    filepath: &Path,
+    line_index: &LineIndex,
+    range: TextRange,
+    severity: Severity,
+    rule: &'static str,
+    package: &str,
+    message: String,
+) -> Issue {
+    let loc = line_index.node_loc(range);
+    let mut issue = Issue::new(filepath, loc.line, severity, rule, package, message);
+    issue.column = Some(loc.column);
+    issue.end_line = Some(loc.end_line);
+    issue.end_column = Some(loc.end_column);
+    issue
 }
 
 // ── Rule: Long Functions (Phase 1) ───────────────────────────────────────────
@@ -68,9 +83,10 @@ pub fn check_long_functions(
     for func in collect_functions(module_body(module)) {
         let lines = line_count(&line_index, func.start, func.end());
         if lines > MAX_FUNCTION_LINES && nesting_depth(&func) > LONG_FUNCTION_FLAT_NESTING_MAX {
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line_index.line_number(func.start),
+                &line_index,
+                func.range(),
                 Severity::Warning,
                 "long-function",
                 package,
@@ -146,9 +162,10 @@ pub fn check_complexity(module: &Mod, source: &str, filepath: &Path, package: &s
             } else {
                 Severity::Warning
             };
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line_index.line_number(func.start),
+                &line_index,
+                func.range(),
                 severity,
                 "high-complexity",
                 package,
@@ -181,11 +198,11 @@ pub fn check_missing_types(
         if is_private(&func.name) || is_test_function(&func.name) || is_test_file(filepath) {
             continue;
         }
-        let line = line_index.line_number(func.start);
         if func.returns().is_none() && func.name != "__init__" {
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line,
+                &line_index,
+                func.range(),
                 Severity::Warning,
                 "missing-return-type",
                 package,
@@ -198,9 +215,10 @@ pub fn check_missing_types(
                 continue;
             }
             if arg.def.annotation.is_none() {
-                issues.push(issue(
+                issues.push(issue_at(
                     filepath,
-                    line,
+                    &line_index,
+                    func.range(),
                     Severity::Info,
                     "missing-param-type",
                     package,
@@ -236,9 +254,10 @@ pub fn check_excessive_params(
             total += 1;
         }
         if total > MAX_FUNC_PARAMS {
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line_index.line_number(func.start),
+                &line_index,
+                func.range(),
                 Severity::Warning,
                 "too-many-params",
                 package,
@@ -266,9 +285,10 @@ pub fn check_excessive_returns(
     for func in collect_functions(module_body(module)) {
         let n = count_nested_returns(&func);
         if n > MAX_RETURNS as i64 {
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line_index.line_number(func.start),
+                &line_index,
+                func.range(),
                 Severity::Info,
                 "excessive-returns",
                 package,
@@ -354,9 +374,10 @@ pub fn check_boolean_flag_params(
             }
         }
         if flags.len() >= MIN_BOOLEAN_FLAGS {
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line_index.line_number(func.start),
+                &line_index,
+                func.range(),
                 Severity::Info,
                 "boolean-flag-params",
                 package,
@@ -387,9 +408,10 @@ pub fn check_deep_nesting(
     for func in collect_functions(module_body(module)) {
         let depth = nesting_depth(&func);
         if depth > MAX_NESTING_DEPTH {
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line_index.line_number(func.start),
+                &line_index,
+                func.range(),
                 Severity::Warning,
                 "deep-nesting",
                 package,
@@ -436,9 +458,10 @@ pub fn check_mutable_defaults(
             .filter_map(|a| a.default.as_deref())
             .any(is_mutable_literal);
         if has_mutable_default {
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line_index.line_number(func.start),
+                &line_index,
+                func.range(),
                 Severity::Warning,
                 "mutable-default",
                 package,
@@ -467,9 +490,10 @@ impl<'a> Visitor for BareExceptVisitor<'a> {
         node: rustpython_ast::ExceptHandlerExceptHandler,
     ) {
         if node.type_.is_none() {
-            self.issues.push(issue(
+            self.issues.push(issue_at(
                 self.filepath,
-                self.line_index.line_number(node.range().start()),
+                self.line_index,
+                node.range(),
                 Severity::Warning,
                 "bare-except",
                 self.package,
@@ -568,9 +592,10 @@ impl<'a> Visitor for MissingElseVisitor<'a> {
             && !is_guard_delegation
             && !is_state_mutation
         {
-            self.issues.push(issue(
+            self.issues.push(issue_at(
                 self.filepath,
-                self.line_index.line_number(node.range().start()),
+                self.line_index,
+                node.range(),
                 Severity::Info,
                 "missing-else",
                 self.package,
@@ -786,9 +811,10 @@ impl<'a> Visitor for SwallowedExceptionVisitor<'a> {
                 },
                 None => "Exception".to_string(),
             };
-            self.issues.push(issue(
+            self.issues.push(issue_at(
                 self.filepath,
-                self.line_index.line_number(node.range().start()),
+                self.line_index,
+                node.range(),
                 Severity::Warning,
                 "swallowed-exception",
                 self.package,
@@ -851,9 +877,10 @@ fn collect_star_imports(
         fn visit_stmt_import_from(&mut self, node: rustpython_ast::StmtImportFrom) {
             for alias in &node.names {
                 if alias.name.as_str() == "*" {
-                    self.issues.push(issue(
+                    self.issues.push(issue_at(
                         self.filepath,
-                        self.line_index.line_number(node.range().start()),
+                        self.line_index,
+                        node.range(),
                         Severity::Warning,
                         "star-import",
                         self.package,
@@ -903,9 +930,10 @@ pub fn check_global_mutations(
                 if let Expr::Name(name) = target
                     && !name.id.as_str().starts_with('_')
                 {
-                    issues.push(issue(
+                    issues.push(issue_at(
                         filepath,
-                        line_index.line_number(assign.range().start()),
+                        &line_index,
+                        assign.range(),
                         Severity::Info,
                         "global-mutable",
                         package,
@@ -933,13 +961,9 @@ pub fn check_global_mutations(
 struct OwnScopeCollector {
     global_names: HashSet<String>,
     nonlocal_names: HashSet<String>,
-    // (name, position, is_lazy_singleton_init)
-    assignments: Vec<(String, TextSizeShim, bool)>,
+    // (name, statement span, is_lazy_singleton_init)
+    assignments: Vec<(String, TextRange, bool)>,
 }
-
-// Local newtype so this file doesn't need to import rustpython's TextSize
-// directly just for this one field's type name in a doc-adjacent struct.
-type TextSizeShim = rustpython_ast::text_size::TextSize;
 
 /// `<name> is None` — the target of a lazy-singleton-init guard, if `test`
 /// has that exact shape.
@@ -978,7 +1002,7 @@ impl Visitor for OwnScopeCollector {
         for t in &node.targets {
             if let Expr::Name(n) = t {
                 self.assignments
-                    .push((n.id.to_string(), node.range().start(), false));
+                    .push((n.id.to_string(), node.range(), false));
             }
         }
         self.generic_visit_stmt_assign(node);
@@ -986,7 +1010,7 @@ impl Visitor for OwnScopeCollector {
     fn visit_stmt_aug_assign(&mut self, node: rustpython_ast::StmtAugAssign) {
         if let Expr::Name(n) = node.target.as_ref() {
             self.assignments
-                .push((n.id.to_string(), node.range().start(), false));
+                .push((n.id.to_string(), node.range(), false));
         }
         self.generic_visit_stmt_aug_assign(node);
     }
@@ -1006,11 +1030,8 @@ impl Visitor for OwnScopeCollector {
                     for t in &a.targets {
                         if let Expr::Name(n) = t {
                             let is_guarded = n.id.as_str() == guarded_name;
-                            self.assignments.push((
-                                n.id.to_string(),
-                                a.range().start(),
-                                is_guarded,
-                            ));
+                            self.assignments
+                                .push((n.id.to_string(), a.range(), is_guarded));
                         }
                     }
                 }
@@ -1018,7 +1039,7 @@ impl Visitor for OwnScopeCollector {
                     if let Expr::Name(n) = a.target.as_ref() {
                         let is_guarded = n.id.as_str() == guarded_name;
                         self.assignments
-                            .push((n.id.to_string(), a.range().start(), is_guarded));
+                            .push((n.id.to_string(), a.range(), is_guarded));
                     }
                 }
                 other => self.visit_stmt(other.clone()),
@@ -1051,7 +1072,7 @@ pub fn check_scope_mutations(
         if outer_names.is_empty() {
             continue;
         }
-        if let Some((target_name, pos, _)) =
+        if let Some((target_name, range, _)) =
             collector
                 .assignments
                 .iter()
@@ -1066,9 +1087,10 @@ pub fn check_scope_mutations(
             if collector.nonlocal_names.contains(target_name) {
                 declared_by.push("nonlocal");
             }
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line_index.line_number(*pos),
+                &line_index,
+                *range,
                 Severity::Info,
                 "scope-mutation",
                 package,
@@ -1248,17 +1270,12 @@ pub fn check_excessive_decorators(
         issues: Vec<Issue>,
     }
     impl<'a> DecoratorVisitor<'a> {
-        fn check(
-            &mut self,
-            kind: &str,
-            name: &str,
-            decorators: usize,
-            start: rustpython_ast::text_size::TextSize,
-        ) {
+        fn check(&mut self, kind: &str, name: &str, decorators: usize, range: TextRange) {
             if decorators > MAX_DECORATORS {
-                self.issues.push(issue(
+                self.issues.push(issue_at(
                     self.filepath,
-                    self.line_index.line_number(start),
+                    self.line_index,
+                    range,
                     Severity::Info,
                     "excessive-decorators",
                     self.package,
@@ -1275,7 +1292,7 @@ pub fn check_excessive_decorators(
                 "function",
                 node.name.as_str(),
                 node.decorator_list.len(),
-                node.range().start(),
+                node.range(),
             );
             self.generic_visit_stmt_function_def(node);
         }
@@ -1284,7 +1301,7 @@ pub fn check_excessive_decorators(
                 "function",
                 node.name.as_str(),
                 node.decorator_list.len(),
-                node.range().start(),
+                node.range(),
             );
             self.generic_visit_stmt_async_function_def(node);
         }
@@ -1293,7 +1310,7 @@ pub fn check_excessive_decorators(
                 "class",
                 node.name.as_str(),
                 node.decorator_list.len(),
-                node.range().start(),
+                node.range(),
             );
             self.generic_visit_stmt_class_def(node);
         }
@@ -1443,9 +1460,10 @@ pub fn check_lazy_class(module: &Mod, source: &str, filepath: &Path, package: &s
                     .filter(|s| matches!(s, Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_)))
                     .count();
                 if methods < MIN_CLASS_METHODS {
-                    self.issues.push(issue(
+                    self.issues.push(issue_at(
                         self.filepath,
-                        self.line_index.line_number(node.range().start()),
+                        self.line_index,
+                        node.range(),
                         Severity::Info,
                         "lazy-class",
                         self.package,
@@ -1537,23 +1555,95 @@ fn source_segment(source: &str, range: rustpython_ast::text_size::TextRange) -> 
     source.get(start as usize..end as usize)
 }
 
+/// Mirrors Python's `for stmt in func.body: for child in ast.walk(stmt)`.
+///
+/// `ast.walk` is breadth-first, so the order two literals in one statement
+/// are reported in depends on their depth in the tree (`foo(5, bar(6), 7)`
+/// reports 5, 7, then 6). This visitor is depth-first, but tags every
+/// candidate with its `ast.walk` depth — every Python AST node on the way
+/// down counts one level, including the `keyword`/`arguments`/`arg`/
+/// `comprehension`/`withitem`/`ExceptHandler`/`match_case`/pattern wrapper
+/// nodes — and `check_magic_numbers` stable-sorts each statement's
+/// candidates by that depth, which turns pre-order into level order exactly
+/// (same-depth nodes are already in parent-then-sibling order).
 struct MagicNumberVisitor<'a> {
     line_index: &'a LineIndex,
     source: &'a str,
     filepath: &'a Path,
     package: &'a str,
-    issues: Vec<Issue>,
+    depth: usize,
+    /// `(ast.walk depth, issue)` in pre-order.
+    found: Vec<(usize, Issue)>,
     distinct: HashSet<String>,
 }
-impl<'a> Visitor for MagicNumberVisitor<'a> {
-    fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-        walk_comprehension_children(self, node);
+
+/// `ast.iter_child_nodes(arguments)` order: `posonlyargs`, `args`, `vararg`,
+/// `kwonlyargs`, `kw_defaults`, `kwarg`, `defaults` — every `arg` first
+/// (whose annotation is one level deeper), then the default values.
+fn walk_arguments_in_ast_order(visitor: &mut MagicNumberVisitor<'_>, node: Arguments) {
+    let Arguments {
+        posonlyargs,
+        args,
+        vararg,
+        kwonlyargs,
+        kwarg,
+        ..
+    } = node;
+    let mut positional_defaults = Vec::new();
+    for arg in posonlyargs.into_iter().chain(args) {
+        visitor.visit_arg(arg.def);
+        if let Some(default) = arg.default {
+            positional_defaults.push(*default);
+        }
     }
-    // Skip the signature entirely: a default parameter value (e.g.
-    // `base_delay: float = 0.5`) is already named by the parameter itself,
-    // so it isn't "magic" the way a bare literal in the body is. Mirrors the
-    // Python check, which only walks `func.body`.
-    fn visit_arguments(&mut self, _node: Arguments) {}
+    if let Some(vararg) = vararg {
+        visitor.visit_arg(*vararg);
+    }
+    let mut kw_defaults = Vec::new();
+    for arg in kwonlyargs {
+        visitor.visit_arg(arg.def);
+        if let Some(default) = arg.default {
+            kw_defaults.push(*default);
+        }
+    }
+    for default in kw_defaults {
+        visitor.visit_expr(default);
+    }
+    if let Some(kwarg) = kwarg {
+        visitor.visit_arg(*kwarg);
+    }
+    for default in positional_defaults {
+        visitor.visit_expr(default);
+    }
+}
+
+impl<'a> Visitor for MagicNumberVisitor<'a> {
+    fn visit_stmt(&mut self, node: Stmt) {
+        self.depth += 1;
+        self.generic_visit_stmt(node);
+        self.depth -= 1;
+    }
+    fn visit_expr(&mut self, node: Expr) {
+        self.depth += 1;
+        self.generic_visit_expr(node);
+        self.depth -= 1;
+    }
+    // A nested def's/lambda's signature *is* walked — Python's `ast.walk`
+    // over an enclosing body statement descends into it (the enclosing
+    // function's own signature isn't: `check_magic_numbers` only feeds this
+    // visitor `func.body`, like the original).
+    fn visit_arguments(&mut self, node: Arguments) {
+        self.depth += 1;
+        walk_arguments_in_ast_order(self, node);
+        self.depth -= 1;
+    }
+    fn visit_arg(&mut self, node: rustpython_ast::Arg) {
+        self.depth += 1;
+        if let Some(annotation) = node.annotation {
+            self.visit_expr(*annotation);
+        }
+        self.depth -= 1;
+    }
     // A literal passed directly as `name=<literal>` (e.g. `stacklevel=2`) is
     // already documented by the keyword name the same way a named constant
     // would document it — skip only that direct value, but still walk into
@@ -1561,11 +1651,46 @@ impl<'a> Visitor for MagicNumberVisitor<'a> {
     // `timeout=compute(30)`) is still caught.
     fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
         if !matches!(node.value, Expr::Constant(_)) {
+            self.depth += 1;
             self.visit_expr(node.value);
+            self.depth -= 1;
         }
     }
+    fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
+        self.depth += 1;
+        walk_comprehension_children(self, node);
+        self.depth -= 1;
+    }
     fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
+        self.depth += 1;
         walk_withitem_children(self, node);
+        self.depth -= 1;
+    }
+    fn visit_excepthandler(&mut self, node: rustpython_ast::ExceptHandler) {
+        self.depth += 1;
+        self.generic_visit_excepthandler(node);
+        self.depth -= 1;
+    }
+    fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
+        self.depth += 1;
+        self.visit_pattern(node.pattern);
+        if let Some(guard) = node.guard {
+            self.visit_expr(*guard);
+        }
+        for stmt in node.body {
+            self.visit_stmt(stmt);
+        }
+        self.depth -= 1;
+    }
+    fn visit_pattern(&mut self, node: rustpython_ast::Pattern) {
+        self.depth += 1;
+        self.generic_visit_pattern(node);
+        self.depth -= 1;
+    }
+    fn visit_type_param(&mut self, node: rustpython_ast::TypeParam) {
+        self.depth += 1;
+        self.generic_visit_type_param(node);
+        self.depth -= 1;
     }
     fn visit_expr_constant(&mut self, node: rustpython_ast::ExprConstant) {
         if let Some((allowed, repr)) = format_number_for_magic_check(&node.value)
@@ -1573,15 +1698,19 @@ impl<'a> Visitor for MagicNumberVisitor<'a> {
         {
             let display = source_segment(self.source, node.range()).unwrap_or(&repr);
             self.distinct.insert(display.to_string());
-            self.issues.push(issue(
-                self.filepath,
-                self.line_index.line_number(node.range().start()),
-                Severity::Info,
-                "magic-number",
-                self.package,
-                format!(
-                    "magic number {display} — extract to a named constant, or an \
-                     enum.IntEnum if it's one of a fixed set of status/category codes"
+            self.found.push((
+                self.depth,
+                issue_at(
+                    self.filepath,
+                    self.line_index,
+                    node.range(),
+                    Severity::Info,
+                    "magic-number",
+                    self.package,
+                    format!(
+                        "magic number {display} — extract to a named constant, or an \
+                         enum.IntEnum if it's one of a fixed set of status/category codes"
+                    ),
                 ),
             ));
         }
@@ -1601,17 +1730,25 @@ pub fn check_magic_numbers(
         if func.name == "__init__" {
             continue;
         }
-        let mut visitor = MagicNumberVisitor {
-            line_index: &line_index,
-            source,
-            filepath,
-            package,
-            issues: Vec::new(),
-            distinct: HashSet::new(),
-        };
-        visitor.visit_stmt(func.stmt.clone());
-        issues.append(&mut visitor.issues);
-        distinct.extend(visitor.distinct);
+        // Only the body — never the function's own signature, decorators or
+        // return annotation (a default like `base_delay: float = 0.5` is
+        // already named by its parameter). Each top-level statement is its
+        // own `ast.walk`, so candidates are ordered per statement.
+        for stmt in func.body() {
+            let mut visitor = MagicNumberVisitor {
+                line_index: &line_index,
+                source,
+                filepath,
+                package,
+                depth: 0,
+                found: Vec::new(),
+                distinct: HashSet::new(),
+            };
+            visitor.visit_stmt(stmt.clone());
+            visitor.found.sort_by_key(|(depth, _)| *depth);
+            issues.extend(visitor.found.into_iter().map(|(_, issue)| issue));
+            distinct.extend(visitor.distinct);
+        }
     }
     if distinct.len() >= MAGIC_NUMBER_DENSE_FILE_MIN_DISTINCT {
         return Vec::new();
@@ -1837,11 +1974,11 @@ impl Visitor for AnnotationCollector {
     }
 }
 
-struct BareDictScanner<'a> {
-    line_index: &'a LineIndex,
-    lines: Vec<usize>,
+#[derive(Default)]
+struct BareDictScanner {
+    names: Vec<TextRange>,
 }
-impl<'a> Visitor for BareDictScanner<'a> {
+impl Visitor for BareDictScanner {
     fn visit_expr_subscript(&mut self, node: rustpython_ast::ExprSubscript) {
         if let Expr::Name(n) = node.value.as_ref()
             && n.id.as_str() == "dict"
@@ -1853,8 +1990,7 @@ impl<'a> Visitor for BareDictScanner<'a> {
     }
     fn visit_expr_name(&mut self, node: rustpython_ast::ExprName) {
         if node.id.as_str() == "dict" {
-            self.lines
-                .push(self.line_index.line_number(node.range().start()));
+            self.names.push(node.range());
         }
     }
     fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
@@ -1877,24 +2013,30 @@ pub fn check_untyped_dicts(
         collector.visit_stmt(stmt.clone());
     }
 
-    let mut lines: Vec<usize> = Vec::new();
+    let mut scanner = BareDictScanner::default();
     for annotation in collector.annotations {
-        let mut scanner = BareDictScanner {
-            line_index: &line_index,
-            lines: Vec::new(),
-        };
         scanner.visit_expr(annotation);
-        lines.extend(scanner.lines);
     }
-    lines.sort_unstable();
-    lines.dedup();
 
-    lines
+    // Python dedups with `{(i.line, i.rule): i for i in issues}` — one issue
+    // per line, and the *last* bare `dict` on that line wins (so its
+    // location is that name's), in first-seen line order.
+    let mut by_line: Vec<(usize, TextRange)> = Vec::new();
+    for range in scanner.names {
+        let line = line_index.line_number(range.start());
+        match by_line.iter_mut().find(|(l, _)| *l == line) {
+            Some(slot) => slot.1 = range,
+            None => by_line.push((line, range)),
+        }
+    }
+
+    by_line
         .into_iter()
-        .map(|line| {
-            issue(
+        .map(|(_, range)| {
+            issue_at(
                 filepath,
-                line,
+                &line_index,
+                range,
                 Severity::Info,
                 "untyped-dict",
                 package,
@@ -1921,9 +2063,10 @@ impl<'a> Visitor for DuplicateBranchVisitor<'a> {
             || (node.orelse.len() == 1 && matches!(node.orelse[0], Stmt::If(_)))
             || node.body.is_empty();
         if !skip && dump_stmts(&node.body) == dump_stmts(&node.orelse) {
-            self.issues.push(issue(
+            self.issues.push(issue_at(
                 self.filepath,
-                self.line_index.line_number(node.range().start()),
+                self.line_index,
+                node.range(),
                 Severity::Warning,
                 "duplicate-branch",
                 self.package,
@@ -2084,9 +2227,10 @@ impl<'a> Visitor for EncapsulationVisitor<'a> {
         if let Some(attr) =
             direct_private_access(&node, self.current_class(), self.current_first_param())
         {
-            self.issues.push(issue(
+            self.issues.push(issue_at(
                 self.filepath,
-                self.line_index.line_number(node.range().start()),
+                self.line_index,
+                node.range(),
                 Severity::Info,
                 "encapsulation-violation",
                 self.package,
@@ -2099,9 +2243,10 @@ impl<'a> Visitor for EncapsulationVisitor<'a> {
         if let Some((fname, attr_name)) =
             reflective_private_access(&node, self.current_class(), self.current_first_param())
         {
-            self.issues.push(issue(
+            self.issues.push(issue_at(
                 self.filepath,
-                self.line_index.line_number(node.range().start()),
+                self.line_index,
+                node.range(),
                 Severity::Info,
                 "encapsulation-violation",
                 self.package,
@@ -2218,9 +2363,10 @@ impl<'a> Visitor for GodClassVisitor<'a> {
             } else {
                 Severity::Warning
             };
-            self.issues.push(issue(
+            self.issues.push(issue_at(
                 self.filepath,
-                self.line_index.line_number(node.range().start()),
+                self.line_index,
+                node.range(),
                 severity,
                 "god-class",
                 self.package,
@@ -2275,19 +2421,17 @@ pub fn check_layer_violations(
     let line_index = LineIndex::new(source);
 
     struct ImportedModuleVisitor {
-        imports: Vec<(String, rustpython_ast::text_size::TextSize)>,
+        imports: Vec<(String, TextRange)>,
     }
     impl Visitor for ImportedModuleVisitor {
         fn visit_stmt_import(&mut self, node: rustpython_ast::StmtImport) {
             if let Some(alias) = node.names.first() {
-                self.imports
-                    .push((alias.name.to_string(), node.range().start()));
+                self.imports.push((alias.name.to_string(), node.range()));
             }
         }
         fn visit_stmt_import_from(&mut self, node: rustpython_ast::StmtImportFrom) {
             if let Some(module) = &node.module {
-                self.imports
-                    .push((module.to_string(), node.range().start()));
+                self.imports.push((module.to_string(), node.range()));
             }
         }
     }
@@ -2303,14 +2447,15 @@ pub fn check_layer_violations(
         if !rel_path_str.starts_with(pattern) {
             continue;
         }
-        for (imported, pos) in &collector.imports {
+        for (imported, range) in &collector.imports {
             if forbidden_prefixes
                 .iter()
                 .any(|prefix| imported.starts_with(prefix))
             {
-                issues.push(issue(
+                issues.push(issue_at(
                     filepath,
-                    line_index.line_number(*pos),
+                    &line_index,
+                    *range,
                     Severity::Error,
                     "layer-violation",
                     package,
@@ -2336,6 +2481,10 @@ pub fn check_transport_in_library(
     filepath: &Path,
     package: &str,
 ) -> Vec<Issue> {
+    // The Python original still gates this rule on its own hardcoded set of
+    // "library" package names (`check_transport_in_library` in
+    // checks/ast_per_file.py); kept identical here for conformance until
+    // the set moves to user configuration (ROADMAP Phase 1).
     if !matches!(package, "etl-core" | "boti" | "boti-data" | "boti-dask") {
         return Vec::new();
     }
@@ -2353,9 +2502,10 @@ pub fn check_transport_in_library(
             if let Some(module) = &node.module {
                 let top = module.split('.').next().unwrap_or("");
                 if TRANSPORT_MODULES.contains(&top) {
-                    self.issues.push(issue(
+                    self.issues.push(issue_at(
                         self.filepath,
-                        self.line_index.line_number(node.range().start()),
+                        self.line_index,
+                        node.range(),
                         Severity::Error,
                         "transport-in-library",
                         self.package,
@@ -2419,9 +2569,10 @@ pub fn check_circular_imports(
                     .collect::<Vec<_>>()
                     .iter())
             {
-                issues.push(issue(
+                issues.push(issue_at(
                     filepath,
-                    line_index.line_number(node.range().start()),
+                    &line_index,
+                    node.range(),
                     Severity::Warning,
                     "potential-circular-import",
                     package,
@@ -2575,14 +2726,11 @@ pub fn check_deep_inheritance(
     // not just module-level ones — mirror that with an explicit recursive
     // collection rather than relying on `collect_functions`-style tooling,
     // since this needs ClassDefs specifically, not FunctionDefs.
-    fn collect_all_classes<'a>(
-        stmts: &'a [Stmt],
-        out: &mut Vec<(&'a str, &'a [Expr], rustpython_ast::text_size::TextSize)>,
-    ) {
+    fn collect_all_classes<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a str, &'a [Expr], TextRange)>) {
         for stmt in stmts {
             match stmt {
                 Stmt::ClassDef(c) => {
-                    out.push((c.name.as_str(), c.bases.as_slice(), c.range().start()));
+                    out.push((c.name.as_str(), c.bases.as_slice(), c.range()));
                     collect_all_classes(&c.body, out);
                 }
                 Stmt::FunctionDef(f) => collect_all_classes(&f.body, out),
@@ -2602,7 +2750,7 @@ pub fn check_deep_inheritance(
     }
 
     let mut issues = Vec::new();
-    for (class_name, bases, start) in &all_classes_full {
+    for (class_name, bases, range) in &all_classes_full {
         if bases.is_empty() {
             continue;
         }
@@ -2619,9 +2767,10 @@ pub fn check_deep_inheritance(
         }
         let total_depth = seen.len();
         if total_depth >= MAX_INHERITANCE_DEPTH {
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line_index.line_number(*start),
+                &line_index,
+                *range,
                 Severity::Warning,
                 "deep-inheritance",
                 package,
@@ -2662,12 +2811,7 @@ pub fn check_deep_inheritance(
 // gives the same answer `ast.walk` + `break` would.
 struct MessageChainVisitor {
     current_depth: usize,
-    candidates: Vec<(
-        usize,
-        i64,
-        rustpython_ast::text_size::TextSize,
-        Option<String>,
-    )>,
+    candidates: Vec<(usize, i64, TextRange, Option<String>)>,
 }
 
 fn chain_depth(expr: &Expr) -> i64 {
@@ -2696,7 +2840,7 @@ impl MessageChainVisitor {
             self.candidates.push((
                 self.current_depth,
                 chain_depth(node),
-                node.range().start(),
+                node.range(),
                 chain_root_name(node),
             ));
         }
@@ -2756,15 +2900,16 @@ pub fn check_message_chains(
 
         // Stable sort by depth == BFS order (see block comment above).
         visitor.candidates.sort_by_key(|(depth, _, _, _)| *depth);
-        if let Some((_, depth, pos, _)) =
+        if let Some((_, depth, range, _)) =
             visitor.candidates.iter().find(|(_, chain_depth, _, root)| {
                 *chain_depth > crate::config::MAX_MESSAGE_CHAIN_DEPTH
                     && !root.as_deref().is_some_and(|r| imported.contains_key(r))
             })
         {
-            issues.push(issue(
+            issues.push(issue_at(
                 filepath,
-                line_index.line_number(*pos),
+                &line_index,
+                *range,
                 Severity::Info,
                 "message-chain",
                 package,
@@ -2894,16 +3039,16 @@ struct PassThroughVisitor<'a> {
 }
 impl<'a> Visitor for PassThroughVisitor<'a> {
     fn visit_stmt_function_def(&mut self, node: rustpython_ast::StmtFunctionDef) {
-        self.check(node.name.as_str(), &node.body, node.range().start());
+        self.check(node.name.as_str(), &node.body, node.range());
         self.generic_visit_stmt_function_def(node);
     }
     fn visit_stmt_async_function_def(&mut self, node: rustpython_ast::StmtAsyncFunctionDef) {
-        self.check(node.name.as_str(), &node.body, node.range().start());
+        self.check(node.name.as_str(), &node.body, node.range());
         self.generic_visit_stmt_async_function_def(node);
     }
 }
 impl<'a> PassThroughVisitor<'a> {
-    fn check(&mut self, name: &str, body: &[Stmt], start: rustpython_ast::text_size::TextSize) {
+    fn check(&mut self, name: &str, body: &[Stmt], range: TextRange) {
         // Python's own check here is a plain `startswith("__") and
         // endswith("__")` — not the `DUNDER_RE`-based `is_dunder` used by
         // encapsulation-violation above. Two different dunder checks in the
@@ -2925,9 +3070,10 @@ impl<'a> PassThroughVisitor<'a> {
 
         if is_pure_delegation_call(call_node) {
             let target = render_call_target(&call_node.func);
-            self.issues.push(issue(
+            self.issues.push(issue_at(
                 self.filepath,
-                self.line_index.line_number(start),
+                self.line_index,
+                range,
                 Severity::Info,
                 "pass-through-method",
                 self.package,
@@ -2962,43 +3108,51 @@ pub fn check_pass_through_methods(
 
 pub type FileCheck = fn(&Mod, &str, &Path, &str) -> Vec<Issue>;
 
-pub const ALL_CHECKS: &[FileCheck] = &[
-    check_long_functions,
-    check_complexity,
-    check_missing_types,
-    check_excessive_params,
-    check_excessive_returns,
-    check_boolean_flag_params,
-    check_deep_nesting,
-    check_mutable_defaults,
-    check_bare_except,
-    check_missing_else,
-    check_unused_imports,
-    check_swallowed_exceptions,
-    check_star_imports,
-    check_global_mutations,
-    check_scope_mutations,
-    check_dead_code,
-    check_excessive_decorators,
-    check_lazy_class,
-    check_magic_numbers,
-    check_magic_strings,
-    check_untyped_dicts,
-    check_duplicate_branches,
-    check_encapsulation_violations,
-    check_god_class,
-    check_transport_in_library,
-    check_god_module,
-    check_deep_inheritance,
-    check_pass_through_methods,
-    check_message_chains,
-];
+/// A per-file check, in the one of two shapes the scanner knows how to call.
+pub enum Check {
+    PerFile(FileCheck),
+    /// Needs the package root too (`layer-violation`, `potential-circular-import`).
+    WithPkgRoot(PkgRootCheck),
+}
 
-/// Checks needing the package root — not part of `ALL_CHECKS`, called
-/// directly by `scanner.rs` alongside it.
 pub type PkgRootCheck = fn(&Mod, &str, &Path, &str, &Path) -> Vec<Issue>;
 
-pub const PKG_ROOT_CHECKS: &[PkgRootCheck] = &[check_layer_violations, check_circular_imports];
+/// Every per-file AST check, in the Python original's order (its
+/// `ALL_CHECKS` list, then `check_magic_numbers`, which `detector.py` calls
+/// right after it) — the order findings are reported in, so it must match.
+pub const ALL_CHECKS: &[Check] = &[
+    Check::PerFile(check_long_functions),
+    Check::PerFile(check_complexity),
+    Check::PerFile(check_missing_types),
+    Check::PerFile(check_excessive_params),
+    Check::PerFile(check_excessive_returns),
+    Check::PerFile(check_boolean_flag_params),
+    Check::PerFile(check_deep_nesting),
+    Check::PerFile(check_untyped_dicts),
+    Check::PerFile(check_unused_imports),
+    Check::PerFile(check_swallowed_exceptions),
+    Check::PerFile(check_duplicate_branches),
+    Check::PerFile(check_encapsulation_violations),
+    Check::PerFile(check_god_class),
+    Check::WithPkgRoot(check_layer_violations),
+    Check::PerFile(check_transport_in_library),
+    Check::WithPkgRoot(check_circular_imports),
+    Check::PerFile(check_god_module),
+    Check::PerFile(check_mutable_defaults),
+    Check::PerFile(check_bare_except),
+    Check::PerFile(check_star_imports),
+    Check::PerFile(check_global_mutations),
+    Check::PerFile(check_scope_mutations),
+    Check::PerFile(check_dead_code),
+    Check::PerFile(check_message_chains),
+    Check::PerFile(check_excessive_decorators),
+    Check::PerFile(check_magic_strings),
+    Check::PerFile(check_missing_else),
+    Check::PerFile(check_lazy_class),
+    Check::PerFile(check_deep_inheritance),
+    Check::PerFile(check_pass_through_methods),
+    Check::PerFile(check_magic_numbers),
+];
 
 #[cfg(test)]
 mod missing_types_tests {

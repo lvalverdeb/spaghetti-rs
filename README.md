@@ -79,18 +79,27 @@ The marker applies to the line it appears on and the line directly above it (so 
 
 ## JSON Output
 
-With `--json`, the report is a single JSON object to stdout — the same shape as the Python original's:
+With `--json`, the report is a single JSON object to stdout — **schema version 1**, byte-for-byte the same document the Python original emits for the same input. The schema is committed in the Python repo at [`schema/report.v1.json`](https://github.com/lvalverdeb/spaghetti/blob/main/schema/report.v1.json); `schema_version` is bumped only on a breaking change to the shape (additive fields keep it).
 
 ```json
 {
+  "schema_version": 1,
+  "summary": { "grade": "B", "score": 89.8, "files": 13, "lines": 4137, "functions": 168, "issues": 33, "errors": 0, "warnings": 27, "infos": 6 },
+  "packages": {
+    "my-lib": { "grade": "B", "score": 89.8, "files": 13, "lines": 4137, "functions": 168, "issues": 33, "errors": 0, "warnings": 27, "infos": 6 }
+  },
   "issues": [
     {
       "file": "src/my_module.py",
       "line": 42,
+      "column": 1,
+      "end_line": 107,
+      "end_column": 18,
       "severity": "warning",
       "rule": "long-function",
       "message": "my_func() is 65 lines (max 50)",
-      "package": "my-lib"
+      "package": "my-lib",
+      "fingerprint": "3f2a9c1b7e4d5a60"
     }
   ],
   "suppressed": 3,
@@ -99,17 +108,25 @@ With `--json`, the report is a single JSON object to stdout — the same shape a
     {
       "file": "src/legacy.py",
       "line": 10,
+      "column": 5,
+      "end_line": 11,
+      "end_column": 13,
       "severity": "warning",
       "rule": "bare-except",
-      "message": "Bare except: clause",
+      "message": "Bare except clause — catch specific exceptions instead",
       "package": "my-lib",
+      "fingerprint": "9b0d4e2f6a1c3857",
       "reason": "reviewed, no issue"
     }
   ]
 }
 ```
 
-`ignored` lists the findings a `# spaghetti-ignore` marker actually silenced (each with its `reason`, if one was given), so a suppression is visible rather than invisible in the JSON report too.
+- `summary` and each entry of `packages` carry the same grade/score/count block; `score` is rounded to one decimal.
+- `column`/`end_column` are 1-based *character* columns (so a non-ASCII character earlier on the line doesn't shift them); `end_column` is exclusive. Rules that flag a whole file or a line without a node (`long-file`, `todo-marker`, `unused-import`, `dead-code`, `god-module`, `magic-string`, the cross-file rules and the infrastructure rules) report `null` for all three.
+- `fingerprint` is a stable 16-hex-digit identity for a finding (rule + package-relative path + message with digits stripped, disambiguated per occurrence), so it survives line shifts and re-runs — the hook for baselines and SARIF `partialFingerprints`.
+- `ignored` lists the findings a `# spaghetti-ignore` marker actually silenced (each with its `reason`, if one was given), so a suppression is visible rather than invisible in the JSON report too.
+- Non-ASCII characters are escaped as `\uXXXX`, as Python's `json.dumps` does by default.
 
 ## Rules
 

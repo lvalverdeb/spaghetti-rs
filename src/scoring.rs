@@ -292,15 +292,14 @@ mod priority_score_tests {
     use std::path::PathBuf;
 
     fn issue(severity: Severity, rule: &'static str) -> Issue {
-        Issue {
-            file: PathBuf::from("f.py"),
-            line: 1,
+        Issue::new(
+            &PathBuf::from("f.py"),
+            1,
             severity,
             rule,
-            message: String::new(),
-            package: "pkg".to_string(),
-            reason: None,
-        }
+            "pkg",
+            String::new(),
+        )
     }
 
     #[test]

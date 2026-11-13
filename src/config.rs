@@ -31,20 +31,6 @@ pub fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The first allowed import prefix for `pkg` — mirrors
-/// `config.py::ALLOWED_IMPORT_PREFIXES`, used by `import-cycle` to restrict
-/// the intra-package import graph to the package's own dotted-module stem.
-pub fn allowed_import_prefix(pkg: &str) -> Option<&'static str> {
-    match pkg {
-        "etl-core" => Some("etl_core."),
-        "etl-demo" => Some("etl_demo."),
-        "boti-data" => Some("boti_data."),
-        "boti-dask" => Some("boti_dask."),
-        "boti" => Some("boti."),
-        _ => None,
-    }
-}
-
 // ── Thresholds — must stay numerically identical to config.py ───────────────
 
 pub const MAX_FUNCTION_LINES: usize = 50;
@@ -95,16 +81,14 @@ pub const BANNER_WIDTH: usize = 72;
 
 // ── Layer rules (pkg -> {path-prefix: [forbidden import prefixes]}) ─────────
 //
-// Only exercised for `etl-demo`/`etl-core`, which aren't part of this port's
-// default package set — ported faithfully anyway since `layer-violation`'s
-// logic doesn't depend on which packages happen to be scanned by default.
+// Empty for every package: there are no built-in architectural opinions
+// about any particular codebase (mirrors `config.py::LAYER_RULES = {}`).
+// `layer-violation` is therefore inert until this is fed from user
+// configuration (ROADMAP Phase 1); the check itself stays wired up so the
+// rule, its message and its scoring weight don't have to be re-ported then.
 
-pub fn layer_rules(pkg: &str) -> &'static [(&'static str, &'static [&'static str])] {
-    match pkg {
-        "etl-demo" => &[("routes/", &["boti_data.", "boti.", "boti_dask."])],
-        "etl-core" => &[("", &["fastapi", "starlette", "httpx"])],
-        _ => &[],
-    }
+pub fn layer_rules(_pkg: &str) -> &'static [(&'static str, &'static [&'static str])] {
+    &[]
 }
 
 // ── Compiled regexes ──────────────────────────────────────────────────────────

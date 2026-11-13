@@ -4,11 +4,12 @@
 //! Python's native (lineno, end_lineno), so a `LineIndex` bridges the two:
 //! it's the equivalent of what Python's `ast` module gives you for free.
 
-use rustpython_ast::text_size::TextSize;
+use rustpython_ast::text_size::{TextRange, TextSize};
 use rustpython_ast::{
     Arguments, ExceptHandlerExceptHandler, Expr, Ranged, Stmt, StmtAssert, StmtAsyncFor,
     StmtAsyncFunctionDef, StmtFor, StmtFunctionDef, StmtIf, StmtTry, StmtWhile, StmtWith, Visitor,
 };
+use std::collections::VecDeque;
 use std::sync::LazyLock;
 
 pub struct LineIndex {
@@ -33,6 +34,36 @@ impl LineIndex {
         match self.line_starts.binary_search(&offset) {
             Ok(i) => i + 1,
             Err(i) => i, // i-1 in 0-indexed terms == i in 1-indexed terms
+        }
+    }
+}
+
+/// A node's span in Python `ast` terms — mirrors `ast_helpers.py::_loc`
+/// (plus `lineno`). Columns are 1-based *byte* columns at this point, exactly
+/// like `col_offset + 1`/`end_col_offset + 1`; `scanner::scan_package`
+/// rewrites them to character columns once the source lines are at hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeLoc {
+    pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+impl LineIndex {
+    /// 1-based byte column of `offset` within its line (`col_offset + 1`).
+    pub fn column(&self, offset: TextSize) -> usize {
+        let offset: u32 = offset.into();
+        let line_start = self.line_starts[self.line_number(offset.into()) - 1];
+        (offset - line_start) as usize + 1
+    }
+
+    pub fn node_loc(&self, range: TextRange) -> NodeLoc {
+        NodeLoc {
+            line: self.line_number(range.start()),
+            column: self.column(range.start()),
+            end_line: self.line_number(range.end()),
+            end_column: self.column(range.end()),
         }
     }
 }
@@ -120,43 +151,105 @@ impl FuncNode {
             _ => unreachable!("FuncNode only ever wraps FunctionDef/AsyncFunctionDef"),
         }
     }
-}
 
-struct FunctionCollector {
-    functions: Vec<FuncNode>,
-}
-
-impl Visitor for FunctionCollector {
-    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
-        self.functions.push(FuncNode {
-            name: node.name.as_str().to_string(),
-            start: node.range().start(),
-            stmt: Stmt::FunctionDef(node.clone()),
-        });
-        self.generic_visit_stmt_function_def(node);
-    }
-
-    fn visit_stmt_async_function_def(&mut self, node: StmtAsyncFunctionDef) {
-        self.functions.push(FuncNode {
-            name: node.name.as_str().to_string(),
-            start: node.range().start(),
-            stmt: Stmt::AsyncFunctionDef(node.clone()),
-        });
-        self.generic_visit_stmt_async_function_def(node);
+    pub fn range(&self) -> TextRange {
+        TextRange::new(self.start, self.end())
     }
 }
 
-/// Every FunctionDef/AsyncFunctionDef in `module_body`, at any nesting level —
-/// mirrors `for node in ast.walk(tree): if isinstance(node, (FunctionDef,
-/// AsyncFunctionDef))`.
+/// The nodes that can sit between a module and a `def` on the way down:
+/// statements, plus the `ExceptHandler`/`match_case` wrappers that
+/// `ast.walk` treats as nodes of their own (and so as an extra level).
+enum StmtContainer<'a> {
+    Stmt(&'a Stmt),
+    Handler(&'a rustpython_ast::ExceptHandler),
+    Case(&'a rustpython_ast::MatchCase),
+}
+
+impl<'a> StmtContainer<'a> {
+    /// This node's statement-bearing children, in `ast.iter_child_nodes`
+    /// field order. Expression children are skipped: no `def` can hide in
+    /// one (a `lambda` is not a `FunctionDef`), so leaving them out doesn't
+    /// change the relative order of the functions a BFS discovers.
+    fn children(&self, out: &mut VecDeque<StmtContainer<'a>>) {
+        fn stmts<'a>(out: &mut VecDeque<StmtContainer<'a>>, body: &'a [Stmt]) {
+            out.extend(body.iter().map(StmtContainer::Stmt));
+        }
+        match self {
+            StmtContainer::Stmt(stmt) => match stmt {
+                Stmt::FunctionDef(n) => stmts(out, &n.body),
+                Stmt::AsyncFunctionDef(n) => stmts(out, &n.body),
+                Stmt::ClassDef(n) => stmts(out, &n.body),
+                Stmt::For(n) => {
+                    stmts(out, &n.body);
+                    stmts(out, &n.orelse);
+                }
+                Stmt::AsyncFor(n) => {
+                    stmts(out, &n.body);
+                    stmts(out, &n.orelse);
+                }
+                Stmt::While(n) => {
+                    stmts(out, &n.body);
+                    stmts(out, &n.orelse);
+                }
+                Stmt::If(n) => {
+                    stmts(out, &n.body);
+                    stmts(out, &n.orelse);
+                }
+                Stmt::With(n) => stmts(out, &n.body),
+                Stmt::AsyncWith(n) => stmts(out, &n.body),
+                Stmt::Match(n) => out.extend(n.cases.iter().map(StmtContainer::Case)),
+                Stmt::Try(n) => {
+                    stmts(out, &n.body);
+                    out.extend(n.handlers.iter().map(StmtContainer::Handler));
+                    stmts(out, &n.orelse);
+                    stmts(out, &n.finalbody);
+                }
+                Stmt::TryStar(n) => {
+                    stmts(out, &n.body);
+                    out.extend(n.handlers.iter().map(StmtContainer::Handler));
+                    stmts(out, &n.orelse);
+                    stmts(out, &n.finalbody);
+                }
+                _ => {}
+            },
+            StmtContainer::Handler(rustpython_ast::ExceptHandler::ExceptHandler(h)) => {
+                stmts(out, &h.body)
+            }
+            StmtContainer::Case(c) => stmts(out, &c.body),
+        }
+    }
+}
+
+/// Every FunctionDef/AsyncFunctionDef in `module_body`, at any nesting level,
+/// in the order `for node in ast.walk(tree): if isinstance(node, (FunctionDef,
+/// AsyncFunctionDef))` yields them. `ast.walk` is breadth-first, so every
+/// module-level function comes before any method or nested function, and
+/// those in turn before anything nested one level deeper — this is the
+/// order the per-function rules report their findings in, so it has to
+/// match rather than being a depth-first visitor's.
 pub fn collect_functions(module_body: &[Stmt]) -> Vec<FuncNode> {
-    let mut visitor = FunctionCollector {
-        functions: Vec::new(),
-    };
-    for stmt in module_body {
-        visitor.visit_stmt(stmt.clone());
+    let mut functions = Vec::new();
+    let mut queue: VecDeque<StmtContainer> = module_body.iter().map(StmtContainer::Stmt).collect();
+    while let Some(node) = queue.pop_front() {
+        if let StmtContainer::Stmt(stmt) = node {
+            match stmt {
+                Stmt::FunctionDef(n) => functions.push(FuncNode {
+                    name: n.name.as_str().to_string(),
+                    start: n.range().start(),
+                    stmt: stmt.clone(),
+                }),
+                Stmt::AsyncFunctionDef(n) => functions.push(FuncNode {
+                    name: n.name.as_str().to_string(),
+                    start: n.range().start(),
+                    stmt: stmt.clone(),
+                }),
+                _ => {}
+            }
+        }
+        node.children(&mut queue);
     }
-    visitor.functions
+    functions
 }
 
 struct FunctionWithClassContextCollector {
