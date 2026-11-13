@@ -35,15 +35,43 @@ pub mod unparse;
 /// reserved, not memory committed.
 pub const SCAN_STACK_BYTES: usize = 1 << 30;
 
-/// Run `f` on a thread with a `SCAN_STACK_BYTES` stack and return its result.
+/// Give rayon's global pool (which scans packages and their files)
+/// `SCAN_STACK_BYTES` stacks. Idempotent; a pool that cannot be built with
+/// that stack keeps rayon's default.
+pub fn init_scan_pool() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .stack_size(SCAN_STACK_BYTES)
+            .build_global();
+    });
+}
+
+/// Run `f` on a thread with a `SCAN_STACK_BYTES` stack and return its
+/// result; on a system that refuses that reservation, run it here instead.
 pub fn with_scan_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
+    let f = std::sync::Mutex::new(Some(f));
+    let spawned = std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
             .name("spaghetti-scan".to_string())
             .stack_size(SCAN_STACK_BYTES)
-            .spawn_scoped(scope, f)
-            .expect("spawning the scan thread")
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-    })
+            .spawn_scoped(scope, || {
+                let f = f.lock().unwrap_or_else(|e| e.into_inner()).take();
+                f.map(|f| f())
+            });
+        handle.ok().map(|h| {
+            h.join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    });
+    match spawned.flatten() {
+        Some(result) => result,
+        None => {
+            let f = f
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("the scan closure runs exactly once");
+            f()
+        }
+    }
 }

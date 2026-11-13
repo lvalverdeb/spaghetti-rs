@@ -16,7 +16,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 use spaghetti::models::{ScanConfig, ScanResult};
 use spaghetti::scanner::{scan_package, scan_workspace};
-use spaghetti::with_scan_stack;
+use spaghetti::{init_scan_pool, with_scan_stack};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -44,6 +44,8 @@ fn scan_bytes(bytes: &[u8]) -> Vec<&'static str> {
     std::fs::remove_dir_all(&root).ok();
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("m.py"), bytes).unwrap();
+    // The same stacks the CLI scans with (see `main.rs`).
+    init_scan_pool();
     let result = with_scan_stack(|| {
         let config = config();
         let mut per: IndexMap<String, ScanResult> = IndexMap::new();

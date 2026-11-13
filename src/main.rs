@@ -1,13 +1,11 @@
 use clap::Parser;
-use spaghetti::{SCAN_STACK_BYTES, cli, mcp, with_scan_stack};
+use spaghetti::{cli, init_scan_pool, mcp, with_scan_stack};
 
 fn main() {
     // Packages are scanned on rayon's pool and the rest of the run on one
     // big-stack thread: rustpython drops and clones its AST recursively, so
     // a pathologically nested file needs more stack than a default thread.
-    let _ = rayon::ThreadPoolBuilder::new()
-        .stack_size(SCAN_STACK_BYTES)
-        .build_global();
+    init_scan_pool();
     let code = with_scan_stack(|| {
         // `spaghetti mcp` is intercepted before argument parsing, like Python's
         // `main()` does with `sys.argv[1:2] == ["mcp"]`.
