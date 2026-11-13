@@ -1,19 +1,20 @@
 //! Text-based (non-AST) per-file checks — mirrors `checks/text_per_file.py`.
 
-use crate::config::{MAX_FILE_LINES, TODO_RE};
+use crate::config::{TODO_RE, thresholds};
 use crate::models::{Issue, Severity};
 use std::path::Path;
 
 pub fn check_long_file(source: &str, filepath: &Path, package: &str) -> Vec<Issue> {
+    let max_file_lines = thresholds().max_file_lines;
     let count = source.lines().count();
-    if count > MAX_FILE_LINES {
+    if count > max_file_lines {
         vec![Issue::new(
             filepath,
             1,
             Severity::Warning,
             "long-file",
             package,
-            format!("File is {count} lines (max {MAX_FILE_LINES})"),
+            format!("File is {count} lines (max {max_file_lines})"),
         )]
     } else {
         Vec::new()

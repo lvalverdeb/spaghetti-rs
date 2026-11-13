@@ -1,17 +1,18 @@
 //! Cross-file, whole-package checks — Phase 3 of the port proposal's §10
-//! plan: `import-cycle`, `duplicate-function-body`, `sync-async-duplication`.
+//! plan: `import-cycle`, `high-coupling`, `orphan-interface`,
+//! `duplicate-function-body`, `sync-async-duplication`.
 //! Mirrors `spaghetti/checks/package_level.py`.
 
 use crate::ast_helpers::{
     FuncNode, LineIndex, NodeLoc, collect_functions, collect_functions_with_class_context,
     dump_stmts, is_trivial_body, line_count,
 };
-use crate::config::{MAX_MODULE_FAN_IN, MAX_MODULE_FAN_OUT, MIN_TWIN_FUNCTION_LINES};
+use crate::config::{Thresholds, thresholds};
 use crate::models::{Issue, Severity, display_path};
 use crate::similarity::sequence_matcher_ratio;
 use crate::unparse::unparse_function;
 use indexmap::IndexMap;
-use rustpython_ast::{Mod, Stmt, Visitor};
+use rustpython_ast::{Mod, Ranged, Stmt, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -342,6 +343,11 @@ pub fn check_module_coupling_pkg(
     files: &[ParsedFile],
     pkg_root: &Path,
 ) -> Vec<Issue> {
+    let Thresholds {
+        max_module_fan_in,
+        max_module_fan_out,
+        ..
+    } = thresholds();
     let (graph, file_for_module) = build_import_graph(files, pkg_root);
     if file_for_module.is_empty() {
         return Vec::new();
@@ -362,7 +368,7 @@ pub fn check_module_coupling_pkg(
         let filepath = file_for_module[module];
         let fan_out = graph.get(module).map(|s| s.len()).unwrap_or(0);
         let module_fan_in = fan_in.get(module).copied().unwrap_or(0);
-        if module_fan_in > MAX_MODULE_FAN_IN && fan_out > MAX_MODULE_FAN_OUT {
+        if module_fan_in > max_module_fan_in && fan_out > max_module_fan_out {
             issues.push(issue(
                 filepath,
                 1,
@@ -371,10 +377,165 @@ pub fn check_module_coupling_pkg(
                 pkg_name,
                 format!(
                     "module {module} has fan-in={module_fan_in} and fan-out={fan_out} \
-                     (max {MAX_MODULE_FAN_IN}/{MAX_MODULE_FAN_OUT}) — other modules depend \
+                     (max {max_module_fan_in}/{max_module_fan_out}) — other modules depend \
                      on it heavily and it depends on other modules heavily; consider \
                      splitting it or inverting some dependencies (Dependency Inversion \
                      Principle)"
+                ),
+            ));
+        }
+    }
+    issues
+}
+
+// ── Orphan Interfaces (whole-package) ────────────────────────────────────────
+
+/// A node on the breadth-first frontier of `ast.walk`. Only statements can
+/// contain a `ClassDef`, but `ExceptHandler` and `match_case` are AST nodes of
+/// their own in Python, so they add a level of depth and must be queued as
+/// such for the class order to match `ast.walk(tree)` exactly.
+enum WalkNode<'a> {
+    Stmt(&'a Stmt),
+    Handler(&'a rustpython_ast::ExceptHandler),
+    Case(&'a rustpython_ast::MatchCase),
+}
+
+/// Every `ClassDef` in the module in `ast.walk` (breadth-first) order.
+fn collect_classes_bfs(module_body: &[Stmt]) -> Vec<&rustpython_ast::StmtClassDef> {
+    use std::collections::VecDeque;
+    let mut queue: VecDeque<WalkNode<'_>> = module_body.iter().map(WalkNode::Stmt).collect();
+    let mut classes = Vec::new();
+    while let Some(node) = queue.pop_front() {
+        let stmt = match node {
+            WalkNode::Stmt(stmt) => stmt,
+            WalkNode::Handler(rustpython_ast::ExceptHandler::ExceptHandler(h)) => {
+                queue.extend(h.body.iter().map(WalkNode::Stmt));
+                continue;
+            }
+            WalkNode::Case(case) => {
+                queue.extend(case.body.iter().map(WalkNode::Stmt));
+                continue;
+            }
+        };
+        // Children in `_fields` order, as `ast.iter_child_nodes` yields them.
+        match stmt {
+            Stmt::ClassDef(c) => {
+                classes.push(c);
+                queue.extend(c.body.iter().map(WalkNode::Stmt));
+            }
+            Stmt::FunctionDef(f) => queue.extend(f.body.iter().map(WalkNode::Stmt)),
+            Stmt::AsyncFunctionDef(f) => queue.extend(f.body.iter().map(WalkNode::Stmt)),
+            Stmt::For(f) => {
+                queue.extend(f.body.iter().map(WalkNode::Stmt));
+                queue.extend(f.orelse.iter().map(WalkNode::Stmt));
+            }
+            Stmt::AsyncFor(f) => {
+                queue.extend(f.body.iter().map(WalkNode::Stmt));
+                queue.extend(f.orelse.iter().map(WalkNode::Stmt));
+            }
+            Stmt::While(w) => {
+                queue.extend(w.body.iter().map(WalkNode::Stmt));
+                queue.extend(w.orelse.iter().map(WalkNode::Stmt));
+            }
+            Stmt::If(i) => {
+                queue.extend(i.body.iter().map(WalkNode::Stmt));
+                queue.extend(i.orelse.iter().map(WalkNode::Stmt));
+            }
+            Stmt::With(w) => queue.extend(w.body.iter().map(WalkNode::Stmt)),
+            Stmt::AsyncWith(w) => queue.extend(w.body.iter().map(WalkNode::Stmt)),
+            Stmt::Match(m) => queue.extend(m.cases.iter().map(WalkNode::Case)),
+            Stmt::Try(t) => {
+                queue.extend(t.body.iter().map(WalkNode::Stmt));
+                queue.extend(t.handlers.iter().map(WalkNode::Handler));
+                queue.extend(t.orelse.iter().map(WalkNode::Stmt));
+                queue.extend(t.finalbody.iter().map(WalkNode::Stmt));
+            }
+            Stmt::TryStar(t) => {
+                queue.extend(t.body.iter().map(WalkNode::Stmt));
+                queue.extend(t.handlers.iter().map(WalkNode::Handler));
+                queue.extend(t.orelse.iter().map(WalkNode::Stmt));
+                queue.extend(t.finalbody.iter().map(WalkNode::Stmt));
+            }
+            _ => {}
+        }
+    }
+    classes
+}
+
+/// `base.id` for a `Name`, `base.attr` for an `Attribute`, else `None` —
+/// the two spellings the Python check recognises.
+fn simple_name(expr: &rustpython_ast::Expr) -> Option<&str> {
+    match expr {
+        rustpython_ast::Expr::Name(n) => Some(n.id.as_str()),
+        rustpython_ast::Expr::Attribute(a) => Some(a.attr.as_str()),
+        _ => None,
+    }
+}
+
+/// Detect abstract classes with exactly one concrete implementation —
+/// mirrors `package_level.py::check_orphan_interfaces_pkg`.
+///
+/// This is a classic 'Speculative Generality' code smell. If an interface
+/// only exists to be implemented by a single class, it is likely adding
+/// mental overhead without providing any polymorphic value.
+pub fn check_orphan_interfaces_pkg(pkg_name: &str, files: &[ParsedFile]) -> Vec<Issue> {
+    // Insertion-ordered like Python's dict: a same-named interface in a
+    // later file keeps the first file's position but takes its location.
+    let mut interfaces: IndexMap<&str, (&Path, &rustpython_ast::StmtClassDef, &str)> =
+        IndexMap::new();
+    let mut implementations: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for file in files {
+        for class in collect_classes_bfs(module_body(&file.module)) {
+            let mut is_abstract = false;
+            for base in &class.bases {
+                match simple_name(base) {
+                    Some("ABC") | Some("Protocol") => is_abstract = true,
+                    Some(base_name) if !base_name.is_empty() => {
+                        implementations
+                            .entry(base_name)
+                            .or_default()
+                            .push(class.name.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            for keyword in &class.keywords {
+                if keyword
+                    .arg
+                    .as_ref()
+                    .is_some_and(|a| a.as_str() == "metaclass")
+                    && simple_name(&keyword.value) == Some("ABCMeta")
+                {
+                    is_abstract = true;
+                }
+            }
+            if is_abstract {
+                interfaces.insert(
+                    class.name.as_str(),
+                    (file.path.as_path(), class, file.source.as_str()),
+                );
+            }
+        }
+    }
+
+    let mut issues = Vec::new();
+    for (iface_name, (filepath, class, source)) in &interfaces {
+        let impls = implementations
+            .get(iface_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if let [impl_name] = impls {
+            let line_index = LineIndex::new(source);
+            issues.push(issue_at(
+                filepath,
+                line_index.node_loc(class.range()),
+                Severity::Info,
+                "orphan-interface",
+                pkg_name,
+                format!(
+                    "Interface '{iface_name}' has exactly one implementation ('{impl_name}'). \
+                     Consider removing the abstraction."
                 ),
             ));
         }
@@ -484,6 +645,7 @@ pub fn check_sync_async_twins_pkg(
     files: &[ParsedFile],
     min_ratio: f64,
 ) -> Vec<Issue> {
+    let min_twin_function_lines = thresholds().min_twin_function_lines;
     // Insertion-ordered, matching Python's dict (insertion order = file-walk
     // order, itself sorted by `scanner.rs`) — deliberately not a plain
     // `HashMap`. `reported`'s dedup key doesn't include the file path (same
@@ -527,7 +689,7 @@ pub fn check_sync_async_twins_pkg(
         let line_index = &line_indices[filepath];
         for (name, func) in by_name {
             let lines = line_count(line_index, func.start, func.end());
-            if lines < MIN_TWIN_FUNCTION_LINES {
+            if lines < min_twin_function_lines {
                 continue;
             }
             for candidate in twin_candidates(name) {

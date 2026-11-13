@@ -1,10 +1,16 @@
 pub mod ast_helpers;
+pub mod baseline;
 pub mod checks;
 pub mod cli;
 pub mod config;
+pub mod diff_filter;
+pub mod json;
 pub mod models;
+pub mod rules;
+pub mod sarif;
 pub mod scanner;
 pub mod scoring;
+pub mod settings;
 pub mod similarity;
 pub mod suppression;
 pub mod unparse;

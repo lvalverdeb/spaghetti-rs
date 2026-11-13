@@ -19,10 +19,7 @@ use crate::ast_helpers::{
     walk_withitem_children,
 };
 use crate::config::{
-    COMPLEXITY_THRESHOLD, ERROR_ESCALATION_MULTIPLIER, LONG_FUNCTION_FLAT_NESTING_MAX,
-    MAX_CLASS_ATTRS, MAX_CLASS_METHODS, MAX_CLASS_WMC, MAX_DECORATORS, MAX_FUNC_PARAMS,
-    MAX_FUNCTION_LINES, MAX_INHERITANCE_DEPTH, MAX_NESTING_DEPTH, MAX_PUBLIC_SYMBOLS, MAX_RETURNS,
-    MIN_BOOLEAN_FLAGS, MIN_CLASS_METHODS, is_dunder, layer_rules,
+    TRANSPORT_MODULES, Thresholds, is_dunder, is_library_package, layer_rules, thresholds,
 };
 use crate::models::{Issue, Severity};
 use rustpython_ast::text_size::TextRange;
@@ -79,10 +76,15 @@ pub fn check_long_functions(
     package: &str,
 ) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
+    let Thresholds {
+        max_function_lines,
+        long_function_flat_nesting_max,
+        ..
+    } = thresholds();
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
         let lines = line_count(&line_index, func.start, func.end());
-        if lines > MAX_FUNCTION_LINES && nesting_depth(&func) > LONG_FUNCTION_FLAT_NESTING_MAX {
+        if lines > max_function_lines && nesting_depth(&func) > long_function_flat_nesting_max {
             issues.push(issue_at(
                 filepath,
                 &line_index,
@@ -91,7 +93,7 @@ pub fn check_long_functions(
                 "long-function",
                 package,
                 format!(
-                    "{}() is {lines} lines (max {MAX_FUNCTION_LINES}) — extract logical \
+                    "{}() is {lines} lines (max {max_function_lines}) — extract logical \
                      chunks into named helper functions (Extract Method)",
                     func.name
                 ),
@@ -151,12 +153,17 @@ pub fn count_functions(module: &Mod) -> usize {
 // ── Rule: High Cyclomatic Complexity ─────────────────────────────────────────
 
 pub fn check_complexity(module: &Mod, source: &str, filepath: &Path, package: &str) -> Vec<Issue> {
+    let Thresholds {
+        complexity_threshold,
+        error_escalation_multiplier,
+        ..
+    } = thresholds();
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
         let cc = cyclomatic_complexity(&func);
-        if cc > COMPLEXITY_THRESHOLD as i64 {
-            let severity = if cc as f64 > COMPLEXITY_THRESHOLD as f64 * ERROR_ESCALATION_MULTIPLIER
+        if cc > complexity_threshold as i64 {
+            let severity = if cc as f64 > complexity_threshold as f64 * error_escalation_multiplier
             {
                 Severity::Error
             } else {
@@ -170,7 +177,7 @@ pub fn check_complexity(module: &Mod, source: &str, filepath: &Path, package: &s
                 "high-complexity",
                 package,
                 format!(
-                    "{}() has complexity {cc} (max {COMPLEXITY_THRESHOLD})",
+                    "{}() has complexity {cc} (max {complexity_threshold})",
                     func.name
                 ),
             ));
@@ -242,6 +249,7 @@ pub fn check_excessive_params(
     filepath: &Path,
     package: &str,
 ) -> Vec<Issue> {
+    let max_func_params = thresholds().max_func_params;
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
@@ -253,7 +261,7 @@ pub fn check_excessive_params(
         if args.kwarg.is_some() {
             total += 1;
         }
-        if total > MAX_FUNC_PARAMS {
+        if total > max_func_params {
             issues.push(issue_at(
                 filepath,
                 &line_index,
@@ -262,7 +270,7 @@ pub fn check_excessive_params(
                 "too-many-params",
                 package,
                 format!(
-                    "{}() has {total} params (max {MAX_FUNC_PARAMS}) — consider a Parameter \
+                    "{}() has {total} params (max {max_func_params}) — consider a Parameter \
                      Object (a dataclass or Pydantic model bundling the related fields) instead",
                     func.name
                 ),
@@ -280,11 +288,12 @@ pub fn check_excessive_returns(
     filepath: &Path,
     package: &str,
 ) -> Vec<Issue> {
+    let max_returns = thresholds().max_returns;
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
         let n = count_nested_returns(&func);
-        if n > MAX_RETURNS as i64 {
+        if n > max_returns as i64 {
             issues.push(issue_at(
                 filepath,
                 &line_index,
@@ -293,7 +302,7 @@ pub fn check_excessive_returns(
                 "excessive-returns",
                 package,
                 format!(
-                    "{}() has {n} nested return statements (max {MAX_RETURNS}) — consider a \
+                    "{}() has {n} nested return statements (max {max_returns}) — consider a \
                      Return Object bundling the result and building it up to a single return",
                     func.name
                 ),
@@ -354,6 +363,7 @@ pub fn check_boolean_flag_params(
     filepath: &Path,
     package: &str,
 ) -> Vec<Issue> {
+    let min_boolean_flags = thresholds().min_boolean_flags;
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
@@ -373,7 +383,7 @@ pub fn check_boolean_flag_params(
                 flags.push(arg.def.arg.as_str());
             }
         }
-        if flags.len() >= MIN_BOOLEAN_FLAGS {
+        if flags.len() >= min_boolean_flags {
             issues.push(issue_at(
                 filepath,
                 &line_index,
@@ -403,11 +413,12 @@ pub fn check_deep_nesting(
     filepath: &Path,
     package: &str,
 ) -> Vec<Issue> {
+    let max_nesting_depth = thresholds().max_nesting_depth;
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
         let depth = nesting_depth(&func);
-        if depth > MAX_NESTING_DEPTH {
+        if depth > max_nesting_depth {
             issues.push(issue_at(
                 filepath,
                 &line_index,
@@ -416,7 +427,7 @@ pub fn check_deep_nesting(
                 "deep-nesting",
                 package,
                 format!(
-                    "{}() has nesting depth {depth} (max {MAX_NESTING_DEPTH}) — use guard \
+                    "{}() has nesting depth {depth} (max {max_nesting_depth}) — use guard \
                      clauses (invert the condition, exit early) to keep the happy path \
                      unindented",
                     func.name
@@ -1271,7 +1282,8 @@ pub fn check_excessive_decorators(
     }
     impl<'a> DecoratorVisitor<'a> {
         fn check(&mut self, kind: &str, name: &str, decorators: usize, range: TextRange) {
-            if decorators > MAX_DECORATORS {
+            let max_decorators = thresholds().max_decorators;
+            if decorators > max_decorators {
                 self.issues.push(issue_at(
                     self.filepath,
                     self.line_index,
@@ -1280,7 +1292,7 @@ pub fn check_excessive_decorators(
                     "excessive-decorators",
                     self.package,
                     format!(
-                        "{kind} '{name}' has {decorators} decorators (max {MAX_DECORATORS}) — consider a wrapper or composition"
+                        "{kind} '{name}' has {decorators} decorators (max {max_decorators}) — consider a wrapper or composition"
                     ),
                 ));
             }
@@ -1453,13 +1465,14 @@ pub fn check_lazy_class(module: &Mod, source: &str, filepath: &Path, package: &s
     }
     impl<'a> Visitor for LazyClassVisitor<'a> {
         fn visit_stmt_class_def(&mut self, node: rustpython_ast::StmtClassDef) {
+            let min_class_methods = thresholds().min_class_methods;
             if !is_lazy_class_exempt(&node) {
                 let methods = node
                     .body
                     .iter()
                     .filter(|s| matches!(s, Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_)))
                     .count();
-                if methods < MIN_CLASS_METHODS {
+                if methods < min_class_methods {
                     self.issues.push(issue_at(
                         self.filepath,
                         self.line_index,
@@ -2300,6 +2313,13 @@ struct GodClassVisitor<'a> {
 }
 impl<'a> Visitor for GodClassVisitor<'a> {
     fn visit_stmt_class_def(&mut self, node: rustpython_ast::StmtClassDef) {
+        let Thresholds {
+            max_class_methods,
+            max_class_attrs,
+            max_class_wmc,
+            error_escalation_multiplier,
+            ..
+        } = thresholds();
         let methods: Vec<&Stmt> = node
             .body
             .iter()
@@ -2349,15 +2369,15 @@ impl<'a> Visitor for GodClassVisitor<'a> {
             })
             .sum();
 
-        if methods.len() > MAX_CLASS_METHODS
-            || attr_visitor.attrs.len() > MAX_CLASS_ATTRS
-            || wmc > MAX_CLASS_WMC
+        if methods.len() > max_class_methods
+            || attr_visitor.attrs.len() > max_class_attrs
+            || wmc > max_class_wmc
         {
             let severity = if methods.len() as f64
-                > MAX_CLASS_METHODS as f64 * ERROR_ESCALATION_MULTIPLIER
+                > max_class_methods as f64 * error_escalation_multiplier
                 || attr_visitor.attrs.len() as f64
-                    > MAX_CLASS_ATTRS as f64 * ERROR_ESCALATION_MULTIPLIER
-                || wmc as f64 > MAX_CLASS_WMC as f64 * ERROR_ESCALATION_MULTIPLIER
+                    > max_class_attrs as f64 * error_escalation_multiplier
+                || wmc as f64 > max_class_wmc as f64 * error_escalation_multiplier
             {
                 Severity::Error
             } else {
@@ -2371,7 +2391,7 @@ impl<'a> Visitor for GodClassVisitor<'a> {
                 "god-class",
                 self.package,
                 format!(
-                    "class {} has {} methods, {} attributes, and total complexity (WMC) {} (max {MAX_CLASS_METHODS}/{MAX_CLASS_ATTRS}/{MAX_CLASS_WMC}) — consider splitting responsibilities",
+                    "class {} has {} methods, {} attributes, and total complexity (WMC) {} (max {max_class_methods}/{max_class_attrs}/{max_class_wmc}) — consider splitting responsibilities",
                     node.name,
                     methods.len(),
                     attr_visitor.attrs.len(),
@@ -2430,9 +2450,11 @@ pub fn check_layer_violations(
             }
         }
         fn visit_stmt_import_from(&mut self, node: rustpython_ast::StmtImportFrom) {
-            if let Some(module) = &node.module {
-                self.imports.push((module.to_string(), node.range()));
-            }
+            // A bare relative import (`from . import x`) has no module: Python
+            // records it as the empty string, which only a `""` prefix matches.
+            let module = node.module.as_ref().map(|m| m.to_string());
+            self.imports
+                .push((module.unwrap_or_default(), node.range()));
         }
     }
     let mut collector = ImportedModuleVisitor {
@@ -2443,14 +2465,15 @@ pub fn check_layer_violations(
     }
 
     let mut issues = Vec::new();
-    for (pattern, forbidden_prefixes) in rules {
-        if !rel_path_str.starts_with(pattern) {
+    for (pattern, forbidden_prefixes) in &rules {
+        if !rel_path_str.starts_with(pattern.as_str()) {
             continue;
         }
         for (imported, range) in &collector.imports {
-            if forbidden_prefixes
+            // One issue per matching prefix, like the Python loop.
+            for _prefix in forbidden_prefixes
                 .iter()
-                .any(|prefix| imported.starts_with(prefix))
+                .filter(|prefix| imported.starts_with(prefix.as_str()))
             {
                 issues.push(issue_at(
                     filepath,
@@ -2481,14 +2504,12 @@ pub fn check_transport_in_library(
     filepath: &Path,
     package: &str,
 ) -> Vec<Issue> {
-    // The Python original still gates this rule on its own hardcoded set of
-    // "library" package names (`check_transport_in_library` in
-    // checks/ast_per_file.py); kept identical here for conformance until
-    // the set moves to user configuration (ROADMAP Phase 1).
-    if !matches!(package, "etl-core" | "boti" | "boti-data" | "boti-dask") {
+    // Applies only to the packages named in the `library-packages` setting
+    // (`config.py::LIBRARY_PACKAGES`); empty by default, so the rule is inert
+    // until a project says which of its packages are libraries.
+    if !is_library_package(package) {
         return Vec::new();
     }
-    const TRANSPORT_MODULES: &[&str] = &["fastapi", "starlette", "httpx", "flask", "django"];
     let line_index = LineIndex::new(source);
 
     struct TransportVisitor<'a> {
@@ -2596,6 +2617,7 @@ pub fn check_circular_imports(
 // children only, deliberately shallow (same as global-mutable).
 
 pub fn check_god_module(module: &Mod, _source: &str, filepath: &Path, package: &str) -> Vec<Issue> {
+    let max_public_symbols = thresholds().max_public_symbols;
     let mut public_classes = 0;
     let mut public_funcs = 0;
     for stmt in module_body(module) {
@@ -2609,7 +2631,7 @@ pub fn check_god_module(module: &Mod, _source: &str, filepath: &Path, package: &
         }
     }
     let total = public_classes + public_funcs;
-    if total > MAX_PUBLIC_SYMBOLS {
+    if total > max_public_symbols {
         vec![issue(
             filepath,
             1,
@@ -2719,6 +2741,7 @@ pub fn check_deep_inheritance(
     filepath: &Path,
     package: &str,
 ) -> Vec<Issue> {
+    let max_inheritance_depth = thresholds().max_inheritance_depth;
     let line_index = LineIndex::new(source);
 
     // Python's version uses ast.walk(tree), which finds ClassDefs at any
@@ -2766,7 +2789,7 @@ pub fn check_deep_inheritance(
             }
         }
         let total_depth = seen.len();
-        if total_depth >= MAX_INHERITANCE_DEPTH {
+        if total_depth >= max_inheritance_depth {
             issues.push(issue_at(
                 filepath,
                 &line_index,
@@ -2776,7 +2799,7 @@ pub fn check_deep_inheritance(
                 package,
                 format!(
                     "class '{class_name}' has effective inheritance depth {total_depth} (max \
-                     {MAX_INHERITANCE_DEPTH}) — use composition, e.g. the Strategy pattern, \
+                     {max_inheritance_depth}) — use composition, e.g. the Strategy pattern, \
                      instead of another inheritance level"
                 ),
             ));
@@ -2887,6 +2910,7 @@ pub fn check_message_chains(
     filepath: &Path,
     package: &str,
 ) -> Vec<Issue> {
+    let max_message_chain_depth = thresholds().max_message_chain_depth;
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     let imported = collect_imported_names(module);
@@ -2902,7 +2926,7 @@ pub fn check_message_chains(
         visitor.candidates.sort_by_key(|(depth, _, _, _)| *depth);
         if let Some((_, depth, range, _)) =
             visitor.candidates.iter().find(|(_, chain_depth, _, root)| {
-                *chain_depth > crate::config::MAX_MESSAGE_CHAIN_DEPTH
+                *chain_depth > max_message_chain_depth
                     && !root.as_deref().is_some_and(|r| imported.contains_key(r))
             })
         {
@@ -2915,7 +2939,7 @@ pub fn check_message_chains(
                 package,
                 format!(
                     "method/attribute chain depth {depth} exceeds {} — split into intermediate variables",
-                    crate::config::MAX_MESSAGE_CHAIN_DEPTH
+                    max_message_chain_depth
                 ),
             ));
         }

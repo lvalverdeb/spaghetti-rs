@@ -3,18 +3,19 @@
 //! Sequential for Phase 1-3 (proving the pipeline works); Phase 4 replaces
 //! the per-package loop with `rayon` per the port proposal's §4.3/§6.
 //!
-//! Column normalization, fingerprinting and suppression are each applied
-//! once, at the very end, over the combined per-file *and* package-level
-//! issue list — matching Python's own structure exactly (`scan_package`
-//! extends `result.issues` with every check's output first, then runs
-//! `_normalize_columns`, `_assign_fingerprints` and `_apply_suppressions`
-//! in that order), since a package-level issue (e.g. `import-cycle`) is
+//! Rule overrides, column normalization, fingerprinting and suppression are
+//! each applied once, at the very end, over the combined per-file *and*
+//! package-level issue list — matching Python's own structure exactly
+//! (`scan_package` extends `result.issues` with every check's output first,
+//! then runs `_apply_rule_overrides`, `_normalize_columns`,
+//! `_assign_fingerprints` and `_apply_suppressions` in that order), since a package-level issue (e.g. `import-cycle`) is
 //! attributed to a file that isn't "the current file" in any per-file loop,
 //! so it needs the same final passes everything else gets.
 
 use crate::checks::ast_per_file::Check;
 use crate::checks::package_level::{self, ParsedFile};
 use crate::checks::{ast_per_file, text_per_file};
+use crate::config::{RuleSetting, rule_overrides};
 use crate::models::{Issue, ScanConfig, ScanResult, Severity};
 use crate::suppression::is_suppressed;
 use regex::Regex;
@@ -107,14 +108,16 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
                     module,
                 });
             }
-            Err(e) => {
+            // The parser's own message is dropped: Python reports the bare
+            // "syntax error" too, so the fingerprint and message match.
+            Err(_) => {
                 all_issues.push(Issue::new(
                     path,
                     1,
                     Severity::Error,
                     "syntax-error",
                     package,
-                    format!("Failed to parse file — syntax error: {e}"),
+                    "Failed to parse file — syntax error".to_string(),
                 ));
             }
         }
@@ -132,6 +135,10 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
         &parsed_files,
         root,
     ));
+    all_issues.extend(package_level::check_orphan_interfaces_pkg(
+        package,
+        &parsed_files,
+    ));
     all_issues.extend(package_level::check_duplicate_functions_pkg(
         package,
         &parsed_files,
@@ -148,6 +155,7 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
         .map(|(p, s)| (p.as_path(), s.lines().collect()))
         .collect();
 
+    let mut all_issues = apply_rule_overrides(all_issues);
     for issue in &mut all_issues {
         normalize_columns(issue, lines_by_file.get(issue.file.as_path()));
     }
@@ -168,6 +176,28 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
     }
 
     result
+}
+
+/// Honour `[tool.spaghetti.rules]`: drop rules set to `off`, rewrite the
+/// severity of the rest — mirrors `detector._apply_rule_overrides`. Runs
+/// before fingerprinting so a severity change doesn't alter a finding's
+/// identity (the fingerprint ignores severity).
+fn apply_rule_overrides(issues: Vec<Issue>) -> Vec<Issue> {
+    let overrides = rule_overrides();
+    if overrides.is_empty() {
+        return issues;
+    }
+    issues
+        .into_iter()
+        .filter_map(|mut issue| match overrides.get(issue.rule) {
+            Some(RuleSetting::Off) => None,
+            Some(RuleSetting::Severity(severity)) => {
+                issue.severity = *severity;
+                Some(issue)
+            }
+            None => Some(issue),
+        })
+        .collect()
 }
 
 /// Convert a 0-based UTF-8 byte offset (what the parser reports) into a

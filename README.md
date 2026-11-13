@@ -6,7 +6,7 @@ This is a from-scratch reimplementation of [`spaghetti-detector`](https://github
 
 The [Python original](https://github.com/lvalverdeb/spaghetti) remains the actively maintained **spec of record**: when the two disagree, the Python behaviour is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/spaghetti/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioural quirk (some quite subtle — e.g. `difflib.SequenceMatcher.ratio()`'s asymmetry under `autojunk`) uncovered and matched along the way.
 
-**Status**: all 40 rules ported and verified — 674/674 issues identical to Python's own output across a real multi-package codebase, output is reproducible run-to-run, and `--plan` output is byte-for-byte identical to Python's.
+**Status**: all 41 default-on rules ported and verified — `--json`, `--format sarif`, `--plan` and the baseline file are byte-for-byte identical to Python's output on the same input (Phase 1 of the Python [ROADMAP](https://github.com/lvalverdeb/spaghetti/blob/main/ROADMAP.md): settings, baseline, changed-lines mode, SARIF, `--fail-on`), and output is reproducible run-to-run.
 
 ## Why It Exists
 
@@ -43,19 +43,28 @@ spaghetti --plan --top 10
 spaghetti --config spaghetti.yaml
 spaghetti --package my-lib=my-lib/src/my_lib
 spaghetti -q
+spaghetti --baseline .spaghetti-baseline.json --update-baseline
+spaghetti --diff-base origin/main --fail-on error
+spaghetti --format sarif > spaghetti.sarif
 ```
 
-Exit codes: `0` (clean), `1` (warnings present), `2` (errors present) — safe to wire into CI as a gate.
+Exit codes: `0` (clean), `1` (warnings present), `2` (errors present) — safe to wire into CI as a gate. `--fail-on error|warning|info|never` picks the lowest severity that makes the exit code non-zero (default `warning`); the code is computed on the findings that survive the baseline and `--diff-base` filters, not on the `--severity` display floor. Usage and settings errors exit `2` with a message on stderr.
 
 ### Options
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--config` | none | YAML file with a `packages: {name: path}` mapping; replaces the built-in defaults |
+| `--config` | none | YAML settings file (same keys as `[tool.spaghetti]`); its `packages: {name: path}` mapping replaces the pyproject one |
 | `--package` | none | Add or override one package as `NAME=PATH` (repeatable); applied on top of `--config` or the defaults |
 | `--packages` | all resolved packages | Names to scan from the resolved registry |
 | `--severity` | `info` | Minimum severity to display (`info` / `warning` / `error`) |
-| `--json` | off | Output as JSON instead of the console report |
+| `--format` | `text` | `text`, `json`, or `sarif` (SARIF 2.1.0 for code-scanning tools) |
+| `--json` | off | Shorthand for `--format json` |
+| `--fail-on` | `warning` | Lowest severity that makes the exit code non-zero; `never` always exits 0 |
+| `--baseline` | from settings | Baseline file of accepted findings; see [Baseline](#baseline) |
+| `--update-baseline` | off | Write every current finding to the baseline file and exit 0 |
+| `--diff-base` | none | Git ref; report only findings on lines added or changed since it |
+| `--no-pyproject` | off | Ignore any `[tool.spaghetti]` table found above the working directory |
 | `--quiet` / `-q` | off | Suppress the report banner (text-report mode only; `--json` is unaffected) |
 | `--top` | `5` | Number of worst files/rules to list |
 | `--exclude` | none | Path substrings to exclude from scanning |
@@ -127,10 +136,60 @@ With `--json`, the report is a single JSON object to stdout — **schema version
 - `fingerprint` is a stable 16-hex-digit identity for a finding (rule + package-relative path + message with digits stripped, disambiguated per occurrence), so it survives line shifts and re-runs — the hook for baselines and SARIF `partialFingerprints`.
 - `ignored` lists the findings a `# spaghetti-ignore` marker actually silenced (each with its `reason`, if one was given), so a suppression is visible rather than invisible in the JSON report too.
 - Non-ASCII characters are escaped as `\uXXXX`, as Python's `json.dumps` does by default.
+- `diff_base` (`{"ref", "hidden"}`) and `baseline` (`{"path", "known", "fixed": [...]}`) follow `ignored`; each is `null` when the corresponding filter was not used. `summary`/`packages` always count the full picture; `issues` is what survived the filters.
+
+## Configuration
+
+Settings live in `pyproject.toml` under `[tool.spaghetti]` (found by walking up from the working directory) and/or in the YAML file passed to `--config` — the same files, keys and precedence as the Python original (defaults < `pyproject.toml` < `--config` < CLI flags). A malformed file, an unknown key, rule or threshold is an error listing the valid names, never a silent fallback to defaults; `--no-pyproject` ignores the table.
+
+```toml
+[tool.spaghetti]
+exclude = ["tests/", "migrations/"]
+fail-on = "error"                        # error | warning | info | never
+baseline = ".spaghetti-baseline.json"    # relative to this file
+library-packages = ["my-lib"]            # packages `transport-in-library` applies to
+
+[tool.spaghetti.packages]                # same mapping as --config's `packages:`
+my-lib = "src/my_lib"
+
+[tool.spaghetti.thresholds]              # any numeric constant in config.rs / config.py, kebab-case
+max-function-lines = 60
+complexity-threshold = 12
+
+[tool.spaghetti.rules]                   # "off", or a severity override
+magic-number = "off"
+missing-return-type = "error"
+
+[tool.spaghetti.layers.my-lib]           # path prefix inside the package -> forbidden import prefixes
+"routes/" = ["my_lib.db."]
+```
+
+See the Python README's [Configuration](https://github.com/lvalverdeb/spaghetti#configuration) section for the full key reference. (In YAML, quote `"off"` — bare `off` is a boolean in YAML 1.1, and both implementations reject it.)
+
+## Baseline
+
+```bash
+spaghetti --baseline .spaghetti-baseline.json --update-baseline   # accept everything, once
+spaghetti --baseline .spaghetti-baseline.json                      # from now on: new findings only
+```
+
+Set `baseline` in `[tool.spaghetti]` and the flag becomes unnecessary. Findings are matched by `fingerprint`, so they survive line shifts. Known findings are hidden from the report and the exit code; entries no longer matched are listed as fixed (in the JSON `baseline.fixed` and the text summary). The file format is identical to the Python original's (`schema_version` 1), so either binary can write or read it.
+
+## Changed Lines Only
+
+```bash
+spaghetti --diff-base origin/main
+```
+
+Reports only findings whose span touches a line added or modified since the ref (working tree included), via `git diff -U0 REF`. The summary states how many findings the filter hid. Not a git repository or an unknown ref is a usage error (exit 2).
+
+## SARIF
+
+`--format sarif` emits SARIF 2.1.0 — rule metadata for every default-on rule, character columns, the fingerprint under `partialFingerprints["spaghetti/v1"]`, `baselineState` when a baseline is in use, and inline `# spaghetti-ignore` suppressions as suppressed results with their justification. Upload it with `github/codeql-action/upload-sarif`; see the Python README's [SARIF section](https://github.com/lvalverdeb/spaghetti#sarif-and-github-code-scanning) for the Action and pre-commit wiring.
 
 ## Rules
 
-All 40 rules from the Python original: 31 per-file AST checks (including `pass-through-method`), 2 source-text checks, 2 infrastructure checks (`syntax-error`, `unreadable-file`), and 5 cross-file package checks (`import-cycle`, `high-coupling`, `orphan-interface`, `duplicate-function-body`, `sync-async-duplication`). A `low-cohesion` (LCOM4) check also exists in the codebase but is intentionally not enabled by default — see the rule's own doc comment for why. See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
+All 41 default-on rules from the Python original: 32 per-file AST checks (including `pass-through-method`, `layer-violation` driven by the `layers` setting and `transport-in-library` driven by `library-packages`), 2 source-text checks, 2 infrastructure checks (`syntax-error`, `unreadable-file`), and 5 cross-file package checks (`import-cycle`, `high-coupling`, `orphan-interface`, `duplicate-function-body`, `sync-async-duplication`). The rule catalog (`src/rules.rs`) mirrors Python's `rules.py` entry for entry, including `low-cohesion` (LCOM4), which is catalogued but off by default in both. See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
 
 ## Development
 

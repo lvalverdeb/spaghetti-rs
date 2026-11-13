@@ -1,15 +1,22 @@
-//! CLI entry point — mirrors `spaghetti/cli.py`. Phase 4: full flag parity
-//! (`--plan`, `rayon`-based concurrency across packages, matching Python's
-//! `review_packages_concurrently` — no process-pool/agent machinery needed
-//! here since Rust has no GIL to work around, per the port proposal's §4.3).
+//! CLI entry point — mirrors `spaghetti/cli.py`: flag parity, settings from
+//! `pyproject.toml`/`--config`, baseline and changed-lines gating, the
+//! `--fail-on` exit-code policy, and text/JSON/SARIF output. Packages scan
+//! concurrently on `rayon` (Python needs a process pool to get past the GIL;
+//! Rust doesn't, per the port proposal's §4.3).
 
+use crate::baseline::{self, BaselineEntry};
 use crate::config;
+use crate::diff_filter;
+use crate::json::dumps_pretty;
 use crate::models::{Issue, ScanConfig, ScanResult, Severity, display_path};
+use crate::sarif;
 use crate::scanner::scan_package;
+use crate::settings::{self, Settings, SettingsError, resolve_lenient};
 use clap::Parser;
+use indexmap::IndexMap;
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
@@ -23,33 +30,72 @@ pub struct Args {
     #[arg(long, short = 'q')]
     pub quiet: bool,
 
+    /// YAML settings file; its 'packages: {name: path}' mapping replaces the
+    /// pyproject one. Paths resolve relative to the config file.
     #[arg(long)]
     pub config: Option<PathBuf>,
 
+    /// Add or override one package as NAME=PATH (repeatable). Applied on top
+    /// of --config/pyproject; PATH resolves relative to the current directory.
     #[arg(long = "package", value_name = "NAME=PATH")]
     pub package_args: Vec<String>,
 
+    /// Names to scan from the resolved registry (default: all)
     #[arg(long, num_args = 0..)]
     pub packages: Option<Vec<String>>,
 
+    /// Minimum severity to display (default: info)
     #[arg(long, default_value = "info", value_parser = ["info", "warning", "error"])]
     pub severity: String,
 
+    /// Report format (default: text). 'sarif' emits SARIF 2.1.0 for code-scanning tools.
+    #[arg(long, value_parser = ["text", "json", "sarif"])]
+    pub format: Option<String>,
+
+    /// Shorthand for --format json
     #[arg(long)]
     pub json: bool,
 
+    /// Lowest severity that makes the exit code non-zero (default: warning,
+    /// i.e. exit 2 on errors, 1 on warnings). 'never' always exits 0.
+    #[arg(long, value_parser = ["error", "warning", "info", "never"])]
+    pub fail_on: Option<String>,
+
+    /// Baseline file of accepted findings (by fingerprint). Findings in it are
+    /// hidden and don't affect the exit code. Can also be set in [tool.spaghetti].
+    #[arg(long, value_name = "PATH")]
+    pub baseline: Option<PathBuf>,
+
+    /// Write every current finding to the baseline file and exit 0
+    #[arg(long)]
+    pub update_baseline: bool,
+
+    /// Report only findings on lines added or modified since git REF (e.g.
+    /// origin/main). Requires the scanned paths to be inside a git repo.
+    #[arg(long, value_name = "REF")]
+    pub diff_base: Option<String>,
+
+    /// Ignore any [tool.spaghetti] table found in a pyproject.toml above the cwd
+    #[arg(long)]
+    pub no_pyproject: bool,
+
+    /// Number of worst files to list
     #[arg(long, default_value_t = config::DEFAULT_TOP_FILES)]
     pub top: usize,
 
+    /// Path substrings to exclude from scanning (default: none)
     #[arg(long, num_args = 0..)]
     pub exclude: Vec<String>,
 
+    /// Minimum function length to consider for duplicate-body detection
     #[arg(long, default_value_t = config::DEFAULT_MIN_DUPLICATE_LINES)]
     pub min_duplicate_lines: usize,
 
+    /// Minimum text-similarity ratio (0-1) to flag a sync/async twin pair
     #[arg(long, default_value_t = config::DEFAULT_TWIN_SIMILARITY)]
     pub twin_similarity: f64,
 
+    /// Output a prioritized remediation plan instead of the standard report
     #[arg(long)]
     pub plan: bool,
 }
@@ -62,15 +108,20 @@ fn severity_rank(s: &str) -> u8 {
     }
 }
 
-/// Shape of a `--config` YAML file: a top-level `packages` mapping of
-/// `{name: path}`. Mirrors the Python original's `yaml.safe_load` + shape
-/// check in `spaghetti/src/spaghetti/cli.py`; other top-level keys are ignored.
+/// `{name: path}` in insertion order — a Python dict, so the scan order and
+/// every per-package listing follow the order packages were registered.
+pub type Registry = IndexMap<String, PathBuf>;
+
+/// Shape of a `--config` YAML file's `packages:` mapping, as the pre-settings
+/// `resolve_packages` API still reads it; `run()` goes through `settings`
+/// instead, which validates the whole file.
 #[derive(serde::Deserialize)]
 struct ConfigFile {
-    packages: Option<BTreeMap<String, String>>,
+    /// Order-preserving (serde_json's `preserve_order`), like the Python dict.
+    packages: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-fn load_packages_from_config(config_path: &Path) -> BTreeMap<String, PathBuf> {
+fn load_packages_from_config(config_path: &Path) -> Registry {
     let text = std::fs::read_to_string(config_path).unwrap_or_else(|e| {
         panic!(
             "error: could not read --config {}: {e}",
@@ -100,36 +151,47 @@ fn load_packages_from_config(config_path: &Path) -> BTreeMap<String, PathBuf> {
 
     packages
         .into_iter()
-        .map(|(name, rel)| (name, base_dir.join(rel)))
-        .collect()
-}
-
-fn parse_package_args(entries: &[String], cwd: &Path) -> BTreeMap<String, PathBuf> {
-    entries
-        .iter()
-        .map(|entry| {
-            let (name, raw_path) = entry
-                .split_once('=')
-                .unwrap_or_else(|| panic!("error: --package expects NAME=PATH, got {entry:?}"));
-            (name.trim().to_string(), cwd.join(raw_path.trim()))
+        .map(|(name, rel)| {
+            let rel = rel.as_str().unwrap_or_else(|| {
+                panic!(
+                    "error: {} must define a top-level 'packages' mapping of {{name: path}}",
+                    config_path.display()
+                )
+            });
+            (name, base_dir.join(rel))
         })
         .collect()
 }
 
+fn parse_package_args(entries: &[String], cwd: &Path) -> Result<Registry, String> {
+    let mut resolved = Registry::new();
+    for entry in entries {
+        let (name, raw_path) = entry
+            .split_once('=')
+            .map(|(n, p)| (n.trim(), p.trim()))
+            .filter(|(n, p)| !n.is_empty() && !p.is_empty())
+            .ok_or_else(|| format!("--package expects NAME=PATH, got {entry:?}"))?;
+        resolved.insert(name.to_string(), resolve_lenient(&cwd.join(raw_path)));
+    }
+    Ok(resolved)
+}
+
+/// Build the effective `{name: path}` package registry for one run —
+/// mirrors `cli.py::resolve_packages`.
 pub fn resolve_packages(
     config_path: Option<&Path>,
     package_args: &[String],
-    defaults: &BTreeMap<String, PathBuf>,
+    defaults: &Registry,
     cwd: &Path,
-) -> BTreeMap<String, PathBuf> {
+) -> Result<Registry, String> {
     if config_path.is_none() && package_args.is_empty() {
-        return defaults.clone();
+        return Ok(defaults.clone());
     }
     let mut packages = config_path
         .map(load_packages_from_config)
         .unwrap_or_default();
-    packages.extend(parse_package_args(package_args, cwd));
-    packages
+    packages.extend(parse_package_args(package_args, cwd)?);
+    Ok(packages)
 }
 
 const NOISE_DIR_NAMES: &[&str] = &[
@@ -163,8 +225,8 @@ fn is_noise_dir(name: &str) -> bool {
 /// Auto-discover a `{name: path}` registry from `cwd` for a bare `spaghetti`
 /// invocation (no --config/--package given) — mirrors
 /// `cli.py::discover_cwd_packages`. This is what keeps a no-args run from
-/// silently defaulting to the workspace's boti/boti-data/boti-dask registry:
-/// it scans whatever's actually under the current directory instead.
+/// silently defaulting to a hardcoded registry: it scans whatever's actually
+/// under the current directory instead.
 ///
 /// Each immediate, non-noise subdirectory of `cwd` containing at least one
 /// `.py` file anywhere in its subtree becomes its own named package. `.py`
@@ -173,7 +235,7 @@ fn is_noise_dir(name: &str) -> bool {
 /// value is that package's name (`None` if there were no such loose files),
 /// so callers can scan it non-recursively and avoid double-scanning the
 /// subdirectories already registered on their own.
-pub fn discover_cwd_packages(cwd: &Path) -> (BTreeMap<String, PathBuf>, Option<String>) {
+pub fn discover_cwd_packages(cwd: &Path) -> (Registry, Option<String>) {
     let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(cwd)
         .into_iter()
         .flatten()
@@ -181,7 +243,7 @@ pub fn discover_cwd_packages(cwd: &Path) -> (BTreeMap<String, PathBuf>, Option<S
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
-    let mut packages: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut packages = Registry::new();
     let mut has_loose_py = false;
     for entry in entries {
         let path = entry.path();
@@ -321,9 +383,35 @@ impl Serialize for JsonPackages {
     }
 }
 
-/// Schema v1 — mirrors `cli.py::_json_report` key for key, in order.
+/// `_Gating.json()["diff_base"]`.
 #[derive(Serialize)]
-struct JsonOutput {
+struct JsonDiffBase {
+    #[serde(rename = "ref")]
+    base_ref: String,
+    hidden: usize,
+}
+
+/// One entry of `_Gating.json()["baseline"]["fixed"]`.
+#[derive(Serialize)]
+struct JsonFixed<'a> {
+    fingerprint: &'a str,
+    rule: &'a str,
+    file: &'a str,
+    message: &'a str,
+}
+
+/// `_Gating.json()["baseline"]`.
+#[derive(Serialize)]
+struct JsonBaseline<'a> {
+    path: String,
+    known: usize,
+    fixed: Vec<JsonFixed<'a>>,
+}
+
+/// Schema v1 — mirrors `cli.py::_json_report` key for key, in order, plus the
+/// additive `diff_base`/`baseline` objects `_Gating.json()` appends.
+#[derive(Serialize)]
+struct JsonOutput<'a> {
     schema_version: u32,
     summary: JsonPackageStats,
     packages: JsonPackages,
@@ -331,120 +419,227 @@ struct JsonOutput {
     suppressed: usize,
     suppression_help: &'static str,
     ignored: Vec<JsonIgnoredIssue>,
+    diff_base: Option<JsonDiffBase>,
+    baseline: Option<JsonBaseline<'a>>,
 }
 
 const SUPPRESSION_HELP: &str = "Silence a confirmed non-issue by adding \
 '# spaghetti-ignore[rule-name]: reason' on the flagged line (or the line above).";
 
-/// `json.dumps(..., indent=2)` byte for byte: serde_json's pretty printer
-/// already matches the indentation and separators; what it doesn't do is
-/// `ensure_ascii`, so every non-ASCII character (and DEL, which Python's
-/// `[^\ -~]` escape class also catches) is rewritten to `\uXXXX` — as a
-/// UTF-16 surrogate pair above the BMP, lowercase hex, exactly like Python.
-/// Safe to do over the whole document: outside string literals serde_json
-/// only ever emits ASCII.
-fn to_json_ensure_ascii<T: Serialize>(value: &T) -> String {
-    let pretty = serde_json::to_string_pretty(value).expect("report is serializable");
-    let mut out = String::with_capacity(pretty.len());
-    for c in pretty.chars() {
-        if (c as u32) < 0x7f {
-            out.push(c);
-        } else {
-            let mut units = [0u16; 2];
-            for unit in c.encode_utf16(&mut units) {
-                out.push_str(&format!("\\u{unit:04x}"));
-            }
+/// What the run hid from the report and why — surfaced in every format.
+/// Mirrors `cli.py::_Gating`.
+#[derive(Default)]
+struct Gating {
+    diff_base: Option<String>,
+    diff_hidden: usize,
+    baseline_path: Option<PathBuf>,
+    baseline_used: bool,
+    known: Vec<Issue>,
+    fixed: Vec<BaselineEntry>,
+}
+
+impl Gating {
+    fn notes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(base) = &self.diff_base {
+            out.push(format!(
+                "Changed lines only (vs {base}): {} finding(s) outside the diff hidden",
+                self.diff_hidden
+            ));
         }
+        if self.baseline_used {
+            out.push(format!(
+                "Baseline {}: {} known finding(s) hidden, {} fixed since the baseline was written",
+                self.baseline_path
+                    .as_deref()
+                    .unwrap_or(Path::new(""))
+                    .display(),
+                self.known.len(),
+                self.fixed.len()
+            ));
+        }
+        out
     }
-    out
+
+    fn json_diff_base(&self) -> Option<JsonDiffBase> {
+        self.diff_base.as_ref().map(|base| JsonDiffBase {
+            base_ref: base.clone(),
+            hidden: self.diff_hidden,
+        })
+    }
+
+    fn json_baseline(&self) -> Option<JsonBaseline<'_>> {
+        self.baseline_used.then(|| JsonBaseline {
+            path: self
+                .baseline_path
+                .as_deref()
+                .unwrap_or(Path::new(""))
+                .display()
+                .to_string(),
+            known: self.known.len(),
+            fixed: self
+                .fixed
+                .iter()
+                .map(|e| JsonFixed {
+                    fingerprint: &e.fingerprint,
+                    rule: &e.rule,
+                    file: &e.file,
+                    message: &e.message,
+                })
+                .collect(),
+        })
+    }
+}
+
+const DEFAULT_FAIL_ON: &str = "warning";
+
+// Process exit codes: the worst issue severity that trips the --fail-on
+// policy, or 0 if the run was clean.
+const EXIT_CLEAN: i32 = 0;
+const EXIT_WARNING: i32 = 1;
+const EXIT_ERROR: i32 = 2;
+/// Usage/configuration errors — what argparse's `parser.error` exits with.
+const EXIT_USAGE: i32 = 2;
+
+/// Worst severity among `issues` at or above `fail_on` decides the code:
+/// errors → 2, anything else that trips the policy → 1, clean → 0 —
+/// mirrors `cli.py::_exit_code`.
+fn exit_code(issues: &[Issue], fail_on: &str) -> i32 {
+    if fail_on == "never" {
+        return EXIT_CLEAN;
+    }
+    let threshold = severity_rank(fail_on);
+    let tripping: Vec<&Issue> = issues
+        .iter()
+        .filter(|i| severity_rank(i.severity.as_str()) >= threshold)
+        .collect();
+    if tripping.is_empty() {
+        EXIT_CLEAN
+    } else if tripping.iter().any(|i| i.severity == Severity::Error) {
+        EXIT_ERROR
+    } else {
+        EXIT_WARNING
+    }
+}
+
+/// `parser.error(...)`: message on stderr, exit 2, nothing on stdout.
+fn usage_error(message: &str) -> i32 {
+    eprintln!("error: {message}");
+    EXIT_USAGE
+}
+
+fn load_run_settings(args: &Args, cwd: &Path) -> Result<Settings, SettingsError> {
+    let pyproject = if args.no_pyproject {
+        None
+    } else {
+        settings::find_pyproject(cwd)?
+    };
+    settings::load_settings(pyproject.as_deref(), args.config.as_deref())
+}
+
+/// The output format: `--format` wins, then `--json`, then text.
+fn output_format(args: &Args) -> &str {
+    match &args.format {
+        Some(fmt) => fmt.as_str(),
+        None if args.json => "json",
+        None => "text",
+    }
+}
+
+/// Populate the registry from the CLI flags, settings or cwd discovery, and
+/// return it with the effective exclude list plus the names to scan
+/// non-recursively — mirrors `cli.py::_resolve_registry`.
+fn resolve_registry(
+    args: &Args,
+    settings: &Settings,
+    cwd: &Path,
+) -> Result<(Registry, Vec<String>, BTreeSet<String>), String> {
+    // A bare invocation (no --config, no --package, no configured packages)
+    // must never silently fall back to a hardcoded registry — instead it
+    // auto-discovers whatever's actually under the current directory.
+    let mut run_exclude: Vec<String> = settings.exclude.clone();
+    run_exclude.extend(args.exclude.iter().cloned());
+    let mut non_recursive = BTreeSet::new();
+    let registry =
+        if args.config.is_none() && args.package_args.is_empty() && settings.packages.is_empty() {
+            let (discovered, loose_root_name) = discover_cwd_packages(cwd);
+            run_exclude.extend(DEFAULT_CWD_EXCLUDES.iter().map(|s| s.to_string()));
+            if let Some(name) = loose_root_name {
+                non_recursive.insert(name);
+            }
+            discovered
+        } else {
+            // `settings.packages` already reflects --config's `packages:` (which
+            // replaces any pyproject mapping), so only --package overlays remain.
+            resolve_packages(None, &args.package_args, &settings.packages, cwd)?
+        };
+    if registry.is_empty() {
+        return Err("no packages to scan — the resolved package registry is empty".to_string());
+    }
+    Ok((registry, run_exclude, non_recursive))
 }
 
 pub fn run(args: Args) -> i32 {
     let cwd = std::env::current_dir().expect("cwd");
     let workspace_root = config::find_workspace_root(&cwd);
 
-    // A bare invocation (no --config, no --package) must never silently
-    // fall back to a hardcoded workspace-specific registry — instead it
-    // auto-discovers whatever's actually under the current directory.
-    // --config/--package (in any combination) opt back into the explicit
-    // registry-resolution path below, unchanged. There's no built-in
-    // default registry to fall back to in that path either (empty
-    // defaults) — a generic tool shouldn't assume it's running inside this
-    // particular monorepo. Mirrors `cli.py::main`'s equivalent branch.
-    let mut run_exclude = args.exclude.clone();
-    let mut non_recursive: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let registry = if args.config.is_none() && args.package_args.is_empty() {
-        let (discovered, loose_root_name) = discover_cwd_packages(&cwd);
-        run_exclude.extend(DEFAULT_CWD_EXCLUDES.iter().map(|s| s.to_string()));
-        if let Some(name) = loose_root_name {
-            non_recursive.insert(name);
-        }
-        discovered
-    } else {
-        resolve_packages(
-            args.config.as_deref(),
-            &args.package_args,
-            &BTreeMap::new(),
-            &cwd,
-        )
+    let settings = match load_run_settings(&args, &cwd) {
+        Ok(settings) => settings,
+        Err(e) => return usage_error(&e.to_string()),
     };
-    if registry.is_empty() {
-        eprintln!("error: no packages to scan — the resolved package registry is empty");
-        return 2;
-    }
+    settings::apply_settings(&settings);
+
+    let (registry, run_exclude, non_recursive) = match resolve_registry(&args, &settings, &cwd) {
+        Ok(resolved) => resolved,
+        Err(message) => return usage_error(&message),
+    };
 
     let selected: Vec<String> = args
         .packages
         .clone()
         .unwrap_or_else(|| registry.keys().cloned().collect());
-    let unknown: Vec<&String> = selected
+    let unknown: Vec<&str> = selected
         .iter()
+        .map(String::as_str)
         .filter(|p| !registry.contains_key(*p))
         .collect();
     if !unknown.is_empty() {
-        eprintln!(
-            "error: unknown package(s): {}. Available: {}",
-            unknown
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-            registry.keys().cloned().collect::<Vec<_>>().join(", ")
-        );
-        return 2;
+        let mut available: Vec<&str> = registry.keys().map(String::as_str).collect();
+        available.sort_unstable();
+        return usage_error(&format!(
+            "unknown package(s): {}. Available: {}",
+            unknown.join(", "),
+            available.join(", ")
+        ));
     }
 
     // A resolved-but-nonexistent path (e.g. a --package NAME=PATH typo, or a
-    // relative PATH resolved against the wrong cwd — the real case that
-    // surfaced this, in the Python original: `--package
-    // boti-dask=src/boti_dask` run from the workspace root instead of from
-    // inside boti-dask/) must not be confused with "scanned and found
-    // nothing wrong": scan_package() silently returns an empty ScanResult
-    // for a missing path (`!root.exists()`), which without this check
-    // reports a perfect A/100.0 grade — indistinguishable from a genuinely
-    // clean package that actually got scanned. Same fix as the Python port.
+    // relative PATH resolved against the wrong cwd) must not be confused
+    // with "scanned and found nothing wrong": scan_package() silently
+    // returns an empty ScanResult for a missing path, which without this
+    // check reports a perfect A/100.0 grade — indistinguishable from a
+    // genuinely clean package that actually got scanned.
     let missing: Vec<String> = selected
         .iter()
-        .filter(|name| !registry[*name].exists())
-        .map(|name| format!("{name}={}", registry[name].display()))
+        .filter(|name| !registry[name.as_str()].exists())
+        .map(|name| format!("{name}={}", registry[name.as_str()].display()))
         .collect();
     if !missing.is_empty() {
-        eprintln!(
-            "error: package path(s) do not exist: {}",
+        return usage_error(&format!(
+            "package path(s) do not exist: {}",
             missing.join(", ")
-        );
-        return 2;
+        ));
     }
 
     // Every package scanned concurrently — mirrors Python's
-    // `review_packages_concurrently`, minus the `ProcessPoolExecutor`/
-    // `boti.core.Agent` machinery that exists there only to get real
-    // parallelism past the GIL. Rust has no GIL, so `rayon`'s thread pool is
-    // the whole story.
+    // `review_packages_concurrently`, minus the `ProcessPoolExecutor`
+    // machinery that exists there only to get real parallelism past the GIL.
+    // Rust has no GIL, so `rayon`'s thread pool is the whole story; the
+    // settings installed above are process-global, so every worker sees them.
     let scanned: Vec<(String, ScanResult)> = selected
         .par_iter()
         .map(|name| {
-            let root = &registry[name];
+            let root = &registry[name.as_str()];
             let config = ScanConfig {
                 exclude: run_exclude.clone(),
                 min_duplicate_lines: args.min_duplicate_lines,
@@ -455,16 +650,69 @@ pub fn run(args: Args) -> i32 {
             (name.clone(), result)
         })
         .collect();
-    let per_package: BTreeMap<String, ScanResult> = scanned.into_iter().collect();
+    let per_package: IndexMap<String, ScanResult> = scanned.into_iter().collect();
 
     let mut total = ScanResult::default();
     for name in &selected {
-        total.extend(&per_package[name]);
+        total.extend(&per_package[name.as_str()]);
+    }
+
+    // ── Gating: baseline, then changed lines ────────────────────────────────
+    let mut gating = Gating::default();
+    let mut gated: Vec<Issue> = total.issues.clone();
+    let baseline_path = args.baseline.clone().or_else(|| settings.baseline.clone());
+    match baseline_path {
+        None if args.update_baseline => {
+            return usage_error("--update-baseline needs --baseline PATH or a 'baseline' setting");
+        }
+        None => {}
+        Some(path) => {
+            gating.baseline_path = Some(path.clone());
+            if args.update_baseline {
+                if let Err(e) = baseline::save_baseline(
+                    &path,
+                    &total.issues,
+                    &format!("spaghetti {}", env!("CARGO_PKG_VERSION")),
+                    workspace_root.as_deref(),
+                ) {
+                    return usage_error(&format!(
+                        "{}: cannot write baseline — {e}",
+                        path.display()
+                    ));
+                }
+                eprintln!(
+                    "Wrote {} finding(s) to {}",
+                    total.issues.len(),
+                    path.display()
+                );
+                return EXIT_CLEAN;
+            }
+            let known = match baseline::load_baseline(&path) {
+                Ok(known) => known,
+                Err(e) => return usage_error(&e.to_string()),
+            };
+            if path.exists() {
+                let split = baseline::split_against_baseline(gated, &known);
+                gating.baseline_used = true;
+                gating.known = split.known;
+                gating.fixed = split.fixed;
+                gated = split.new;
+            }
+        }
+    }
+    if let Some(base_ref) = &args.diff_base {
+        let changed = match diff_filter::changed_lines(base_ref, &cwd) {
+            Ok(changed) => changed,
+            Err(e) => return usage_error(&format!("--diff-base: {e}")),
+        };
+        let split = diff_filter::restrict_to_changed(gated, &changed);
+        gating.diff_base = Some(base_ref.clone());
+        gating.diff_hidden = split.hidden;
+        gated = split.kept;
     }
 
     let min_severity = severity_rank(&args.severity);
-    let filtered: Vec<&Issue> = total
-        .issues
+    let filtered: Vec<&Issue> = gated
         .iter()
         .filter(|i| severity_rank(i.severity.as_str()) >= min_severity)
         .collect();
@@ -474,48 +722,69 @@ pub fn run(args: Args) -> i32 {
             "{}",
             crate::scoring::plan_report(&filtered, args.top, workspace_root.as_deref())
         );
-    } else if args.json {
-        let output = JsonOutput {
-            schema_version: JSON_SCHEMA_VERSION,
-            summary: JsonPackageStats::from_result(&total),
-            packages: JsonPackages(
-                selected
-                    .iter()
-                    .map(|name| {
-                        (
-                            name.clone(),
-                            JsonPackageStats::from_result(&per_package[name]),
-                        )
-                    })
-                    .collect(),
-            ),
-            issues: filtered
-                .iter()
-                .map(|i| JsonIssue::from_issue(i, workspace_root.as_deref()))
-                .collect(),
-            suppressed: total.suppressed,
-            suppression_help: SUPPRESSION_HELP,
-            ignored: total
-                .ignored
-                .iter()
-                .map(|i| JsonIgnoredIssue {
-                    issue: JsonIssue::from_issue(i, workspace_root.as_deref()),
-                    reason: i.reason.clone(),
-                })
-                .collect(),
-        };
-        println!("{}", to_json_ensure_ascii(&output));
     } else {
-        render_text_report(&filtered, &total, workspace_root.as_deref(), args.quiet);
+        match output_format(&args) {
+            "json" => {
+                let output = JsonOutput {
+                    schema_version: JSON_SCHEMA_VERSION,
+                    summary: JsonPackageStats::from_result(&total),
+                    packages: JsonPackages(
+                        selected
+                            .iter()
+                            .map(|name| {
+                                (
+                                    name.clone(),
+                                    JsonPackageStats::from_result(&per_package[name.as_str()]),
+                                )
+                            })
+                            .collect(),
+                    ),
+                    issues: filtered
+                        .iter()
+                        .map(|i| JsonIssue::from_issue(i, workspace_root.as_deref()))
+                        .collect(),
+                    suppressed: total.suppressed,
+                    suppression_help: SUPPRESSION_HELP,
+                    ignored: total
+                        .ignored
+                        .iter()
+                        .map(|i| JsonIgnoredIssue {
+                            issue: JsonIssue::from_issue(i, workspace_root.as_deref()),
+                            reason: i.reason.clone(),
+                        })
+                        .collect(),
+                    diff_base: gating.json_diff_base(),
+                    baseline: gating.json_baseline(),
+                };
+                println!("{}", dumps_pretty(&output));
+            }
+            "sarif" => {
+                let document = sarif::build_sarif(
+                    &filtered,
+                    &gating.known,
+                    &total.ignored,
+                    env!("CARGO_PKG_VERSION"),
+                    &cwd,
+                    gating.baseline_used,
+                );
+                println!("{}", dumps_pretty(&document));
+            }
+            _ => render_text_report(
+                &filtered,
+                &total,
+                workspace_root.as_deref(),
+                args.quiet,
+                &gating.notes(),
+            ),
+        }
     }
 
-    if total.issues.iter().any(|i| i.severity == Severity::Error) {
-        2
-    } else if total.issues.iter().any(|i| i.severity == Severity::Warning) {
-        1
-    } else {
-        0
-    }
+    let fail_on = args
+        .fail_on
+        .as_deref()
+        .or(settings.fail_on.as_deref())
+        .unwrap_or(DEFAULT_FAIL_ON);
+    exit_code(&gated, fail_on)
 }
 
 /// (errors, warnings, infos) — the report renders this same tally for
@@ -541,6 +810,7 @@ fn render_text_report(
     total: &ScanResult,
     workspace_root: Option<&Path>,
     quiet: bool,
+    notes: &[String],
 ) {
     if !quiet {
         println!("{}", "=".repeat(config::BANNER_WIDTH));
@@ -564,6 +834,9 @@ fn render_text_report(
             "  Suppressed:        {} (inline spaghetti-ignore markers)",
             total.suppressed
         );
+    }
+    for note in notes {
+        println!("  {note}");
     }
     if !filtered.is_empty() {
         println!(
@@ -620,6 +893,24 @@ fn render_text_report(
 mod discover_cwd_packages_tests {
     use super::discover_cwd_packages;
     use std::path::PathBuf;
+
+    #[test]
+    fn registry_keeps_insertion_order_like_a_python_dict() {
+        let cwd = temp_dir("order");
+        for name in ["zeta", "alpha"] {
+            std::fs::create_dir(cwd.join(name)).unwrap();
+            std::fs::write(cwd.join(name).join("mod.py"), "x = 1\n").unwrap();
+        }
+        std::fs::write(cwd.join("main.py"), "x = 1\n").unwrap();
+        let (packages, loose) = discover_cwd_packages(&cwd);
+        std::fs::remove_dir_all(&cwd).ok();
+        // Sorted subdirectories first, the loose-root package appended last
+        // (a BTreeMap would have slotted it alphabetically between them).
+        let names: Vec<&String> = packages.keys().collect();
+        assert_eq!(names[0], "alpha");
+        assert_eq!(names[1], "zeta");
+        assert_eq!(Some(names[2]), loose.as_ref());
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
