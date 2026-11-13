@@ -12,14 +12,23 @@
 //! attributed to a file that isn't "the current file" in any per-file loop,
 //! so it needs the same final passes everything else gets.
 
+use crate::ast_helpers::LineIndex;
 use crate::checks::ast_per_file::Check;
 use crate::checks::package_level::{self, ParsedFile};
+use crate::checks::workspace_level::{
+    PackageImports, build_import_graph, check_duplicate_code_ws, check_import_cycles_ws,
+    check_module_coupling_ws, collect_raw_imports,
+};
 use crate::checks::{ast_per_file, text_per_file};
+use crate::clones::{TokenStream, token_stream};
 use crate::config::{RuleSetting, rule_overrides};
+use crate::metrics::maintainability_index;
 use crate::models::{Issue, ScanConfig, ScanResult, Severity};
 use crate::rules::{is_enabled_by_default, is_known_rule};
 use crate::suppression::is_suppressed;
+use indexmap::IndexMap;
 use regex::Regex;
+use rustpython_ast::{Mod, Stmt};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -104,6 +113,20 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
                         Check::WithPkgRoot(f) => f(&module, &source, path, package, root),
                     });
                 }
+                let body: &[Stmt] = match &module {
+                    Mod::Module(m) => &m.body,
+                    _ => &[],
+                };
+                let mi = maintainability_index(body, &source);
+                result.file_mi.insert(path.to_path_buf(), mi);
+                all_issues.extend(ast_per_file::low_maintainability_issue(mi, path, package));
+                result
+                    .raw_imports
+                    .insert(path.to_path_buf(), collect_raw_imports(body));
+                result.token_streams.insert(
+                    path.to_path_buf(),
+                    token_stream(body, &LineIndex::new(&source)),
+                );
                 parsed_files.push(ParsedFile {
                     path: path.to_path_buf(),
                     source: source.clone(),
@@ -127,16 +150,6 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
         source_by_file.insert(path.to_path_buf(), source);
     }
 
-    all_issues.extend(package_level::check_import_cycles_pkg(
-        package,
-        &parsed_files,
-        root,
-    ));
-    all_issues.extend(package_level::check_module_coupling_pkg(
-        package,
-        &parsed_files,
-        root,
-    ));
     all_issues.extend(package_level::check_orphan_interfaces_pkg(
         package,
         &parsed_files,
@@ -156,14 +169,32 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
         .iter()
         .map(|(p, s)| (p.as_path(), s.lines().collect()))
         .collect();
+    finalize(
+        all_issues,
+        root,
+        &lines_by_file,
+        &rule_overrides(),
+        &mut result,
+    );
+    result
+}
 
-    let mut all_issues = apply_rule_overrides(all_issues, &rule_overrides());
-    for issue in &mut all_issues {
+/// Rule overrides, character columns, fingerprints, inline suppressions —
+/// in that order, for every issue — then into `result` (mirrors
+/// `detector._finalize`).
+fn finalize(
+    issues: Vec<Issue>,
+    root: &Path,
+    lines_by_file: &HashMap<&Path, Vec<&str>>,
+    overrides: &BTreeMap<String, RuleSetting>,
+    result: &mut ScanResult,
+) {
+    let mut issues = apply_rule_overrides(issues, overrides);
+    for issue in &mut issues {
         normalize_columns(issue, lines_by_file.get(issue.file.as_path()));
     }
-    assign_fingerprints(&mut all_issues, root);
-
-    for mut issue in all_issues {
+    assign_fingerprints(&mut issues, root);
+    for mut issue in issues {
         let suppression = lines_by_file
             .get(issue.file.as_path())
             .and_then(|lines| is_suppressed(&issue, lines));
@@ -176,8 +207,91 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
             None => result.issues.push(issue),
         }
     }
+}
 
-    result
+/// Run the checks that need every package at once — import cycles and
+/// coupling over the union graph, token-based clones — and fold their
+/// findings into each owning package's result, after that package's own
+/// findings. Consumes the per-file transport data the workers collected.
+/// Mirrors `detector.scan_workspace`.
+pub fn scan_workspace(
+    per_package: &mut IndexMap<String, ScanResult>,
+    registry: &IndexMap<String, PathBuf>,
+    config: &ScanConfig,
+    workspace_root: Option<&Path>,
+) {
+    scan_workspace_with(
+        per_package,
+        registry,
+        config,
+        workspace_root,
+        &rule_overrides(),
+    );
+}
+
+fn scan_workspace_with(
+    per_package: &mut IndexMap<String, ScanResult>,
+    registry: &IndexMap<String, PathBuf>,
+    config: &ScanConfig,
+    workspace_root: Option<&Path>,
+    overrides: &BTreeMap<String, RuleSetting>,
+) {
+    let found: Vec<Issue> = {
+        let packages: Vec<PackageImports<'_>> = per_package
+            .iter()
+            .map(|(name, result)| PackageImports {
+                name,
+                root: &registry[name.as_str()],
+                files: &result.raw_imports,
+            })
+            .collect();
+        let streams: Vec<(&str, &IndexMap<PathBuf, TokenStream>)> = per_package
+            .iter()
+            .map(|(name, result)| (name.as_str(), &result.token_streams))
+            .collect();
+        let (graph, index) = build_import_graph(&packages);
+        let mut found = check_import_cycles_ws(&graph, &index);
+        found.extend(check_module_coupling_ws(&graph, &index));
+        found.extend(check_duplicate_code_ws(
+            &streams,
+            config.min_clone_tokens,
+            workspace_root,
+        ));
+        found
+    };
+
+    let mut sources: HashMap<PathBuf, String> = HashMap::new();
+    for (name, result) in per_package.iter_mut() {
+        let own: Vec<Issue> = found
+            .iter()
+            .filter(|i| i.package == *name)
+            .cloned()
+            .collect();
+        result.raw_imports = IndexMap::new();
+        result.token_streams = IndexMap::new();
+        if own.is_empty() {
+            continue;
+        }
+        for issue in &own {
+            if !sources.contains_key(&issue.file) {
+                let text = std::fs::read(&issue.file)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_default();
+                sources.insert(issue.file.clone(), text);
+            }
+        }
+        let lines_by_file: HashMap<&Path, Vec<&str>> = sources
+            .iter()
+            .map(|(p, s)| (p.as_path(), s.lines().collect()))
+            .collect();
+        finalize(
+            own,
+            &registry[name.as_str()],
+            &lines_by_file,
+            overrides,
+            result,
+        );
+    }
 }
 
 /// Honour the catalog's `enabled_by_default` and `[tool.spaghetti.rules]`:
@@ -304,6 +418,7 @@ mod recursive_flag_tests {
             min_duplicate_lines: 5,
             twin_similarity: 0.6,
             recursive: false,
+            min_clone_tokens: 50,
         };
         let result = scan_package("root", &root, &config);
 
@@ -330,6 +445,7 @@ mod unreadable_file_tests {
             min_duplicate_lines: 5,
             twin_similarity: 0.6,
             recursive: true,
+            min_clone_tokens: 50,
         }
     }
 
@@ -397,6 +513,7 @@ mod location_and_fingerprint_tests {
             min_duplicate_lines: 5,
             twin_similarity: 0.6,
             recursive: true,
+            min_clone_tokens: 50,
         }
     }
 
@@ -562,5 +679,192 @@ mod rule_override_tests {
         let kept = apply_rule_overrides(vec![issue("future-rule")], &BTreeMap::new());
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].rule, "future-rule");
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    //! Mirrors tests/test_workspace.py: cross-package cycles, coupling and
+    //! clones folded into each owning package's result.
+    use super::{scan_package, scan_workspace_with};
+    use crate::config::RuleSetting;
+    use crate::models::{ScanConfig, ScanResult};
+    use indexmap::IndexMap;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    const CLONE: &str = "\ndef {name}(items, limit):\n    total = 0\n    seen = set()\n    for item in items:\n        if item in seen:\n            continue\n        seen.add(item)\n        if item.value > limit:\n            total += item.value * 2\n        else:\n            total -= 1\n    return total, len(seen)\n";
+
+    fn clone_body(name: &str) -> String {
+        CLONE.replace("{name}", name)
+    }
+
+    fn config() -> ScanConfig {
+        ScanConfig {
+            exclude: vec![],
+            min_duplicate_lines: 5,
+            twin_similarity: 0.6,
+            recursive: true,
+            min_clone_tokens: 30,
+        }
+    }
+
+    struct Workspace {
+        root: PathBuf,
+        registry: IndexMap<String, PathBuf>,
+        per_package: IndexMap<String, ScanResult>,
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    fn workspace(
+        tag: &str,
+        packages: &[(&str, &[(&str, &str)])],
+        overrides: &BTreeMap<String, RuleSetting>,
+    ) -> Workspace {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("spaghetti_rs_ws_{tag}_{}_{n}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let mut registry = IndexMap::new();
+        for (pkg, files) in packages {
+            let dir = root.join(pkg);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, src) in *files {
+                std::fs::write(dir.join(name), src).unwrap();
+            }
+            registry.insert(pkg.to_string(), dir);
+        }
+        let config = config();
+        let mut per_package: IndexMap<String, ScanResult> = registry
+            .iter()
+            .map(|(pkg, dir)| (pkg.clone(), scan_package(pkg, dir, &config)))
+            .collect();
+        scan_workspace_with(&mut per_package, &registry, &config, None, overrides);
+        Workspace {
+            root,
+            registry,
+            per_package,
+        }
+    }
+
+    #[test]
+    fn cycle_spanning_two_packages_is_reported_once() {
+        let ws = workspace(
+            "cycle",
+            &[
+                (
+                    "alpha",
+                    &[("__init__.py", ""), ("a.py", "from beta.b import B\n")],
+                ),
+                (
+                    "beta",
+                    &[("__init__.py", ""), ("b.py", "from alpha.a import A\n")],
+                ),
+            ],
+            &BTreeMap::new(),
+        );
+        let cycles: Vec<_> = ws
+            .per_package
+            .values()
+            .flat_map(|r| r.issues.iter())
+            .filter(|i| i.rule == "import-cycle")
+            .collect();
+        assert_eq!(cycles.len(), 1);
+        assert!(cycles[0].message.contains("alpha.a → beta.b → alpha.a"));
+        assert_eq!(cycles[0].package, "alpha");
+        assert!(!cycles[0].fingerprint.is_empty());
+        assert_eq!(cycles[0].file, ws.registry["alpha"].join("a.py"));
+    }
+
+    #[test]
+    fn clone_across_packages_reported_on_both_sides() {
+        let f = clone_body("f");
+        let g = clone_body("g").replace("item", "row");
+        let ws = workspace(
+            "clone",
+            &[
+                ("alpha", &[("__init__.py", ""), ("a.py", f.as_str())]),
+                ("beta", &[("__init__.py", ""), ("b.py", g.as_str())]),
+            ],
+            &BTreeMap::new(),
+        );
+        let clones: Vec<_> = ws
+            .per_package
+            .values()
+            .flat_map(|r| r.issues.iter())
+            .filter(|i| i.rule == "duplicate-code")
+            .collect();
+        let packages: Vec<&str> = clones.iter().map(|i| i.package.as_str()).collect();
+        assert_eq!(packages, ["alpha", "beta"]); // both sides are told
+        assert!(
+            clones[0]
+                .message
+                .contains("Lines 2-13 are duplicated in 1 other place(s)")
+        );
+        assert!(clones[0].message.contains("b.py:2-13"));
+        assert!(clones[1].message.contains("a.py:2-13"));
+        assert_eq!(clones[0].line, 2);
+        assert_eq!(clones[0].end_line, Some(13));
+    }
+
+    #[test]
+    fn workspace_findings_honour_suppressions_and_overrides() {
+        let overrides = BTreeMap::from([("duplicate-code".to_string(), RuleSetting::Off)]);
+        let b = format!("from alpha.a import A\n{}", clone_body("f"));
+        let c = clone_body("g");
+        let ws = workspace(
+            "overrides",
+            &[(
+                "alpha",
+                &[
+                    ("__init__.py", ""),
+                    (
+                        "a.py",
+                        "# spaghetti-ignore[import-cycle]: legacy\nfrom alpha.b import B\n",
+                    ),
+                    ("b.py", b.as_str()),
+                    ("c.py", c.as_str()),
+                ],
+            )],
+            &overrides,
+        );
+        let result = &ws.per_package["alpha"];
+        assert!(
+            result
+                .issues
+                .iter()
+                .all(|i| i.rule != "import-cycle" && i.rule != "duplicate-code")
+        );
+        let ignored: Vec<&str> = result.ignored.iter().map(|i| i.rule).collect();
+        assert_eq!(ignored, ["import-cycle"]);
+        assert_eq!(result.suppressed, 1);
+        assert!(result.raw_imports.is_empty() && result.token_streams.is_empty());
+    }
+
+    #[test]
+    fn maintainability_index_is_recorded_per_file() {
+        let ws = workspace(
+            "mi",
+            &[("alpha", &[("__init__.py", ""), ("a.py", "x = 1\n")])],
+            &BTreeMap::new(),
+        );
+        let result = &ws.per_package["alpha"];
+        let files: Vec<&PathBuf> = result.file_mi.keys().collect();
+        assert_eq!(
+            files,
+            [
+                &ws.registry["alpha"].join("__init__.py"),
+                &ws.registry["alpha"].join("a.py")
+            ]
+        );
+        assert_eq!(result.maintainability_index(), Some(100.0));
     }
 }

@@ -14,6 +14,7 @@ pub enum Tier {
     Text,
     Infra,
     Package,
+    Workspace,
 }
 
 impl Tier {
@@ -23,6 +24,7 @@ impl Tier {
             Tier::Text => "text",
             Tier::Infra => "infra",
             Tier::Package => "package",
+            Tier::Workspace => "workspace",
         }
     }
 }
@@ -61,7 +63,7 @@ const fn off(id: &'static str, summary: &'static str, sev: Severity, tier: Tier)
 }
 
 use Severity::{Error, Info, Warning};
-use Tier::{Ast, Infra, Package, Text};
+use Tier::{Ast, Infra, Package, Text, Workspace};
 
 /// Every rule, in `rules.py::_RULES` order (which is the order SARIF lists
 /// them in).
@@ -75,9 +77,21 @@ pub const RULE_CATALOG: &[RuleMeta] = &[
     ),
     r(
         "high-complexity",
-        "Cyclomatic complexity above threshold",
+        "Cyclomatic complexity (McCabe, Radon-exact) above threshold",
         Warning,
         Ast,
+    ),
+    r(
+        "high-cognitive-complexity",
+        "Cognitive complexity (Sonar) above threshold",
+        Warning,
+        Ast,
+    ),
+    r(
+        "low-maintainability",
+        "Maintainability Index below threshold",
+        Warning,
+        Text,
     ),
     r(
         "missing-return-type",
@@ -246,13 +260,19 @@ pub const RULE_CATALOG: &[RuleMeta] = &[
         "import-cycle",
         "Circular import between modules",
         Error,
-        Package,
+        Workspace,
     ),
     r(
         "high-coupling",
         "Module with both high fan-in and high fan-out",
         Warning,
-        Package,
+        Workspace,
+    ),
+    r(
+        "duplicate-code",
+        "Duplicated token sequence (type-2 clone) across files",
+        Info,
+        Workspace,
     ),
     r(
         "orphan-interface",
@@ -295,10 +315,10 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn catalog_has_42_unique_rules_with_the_audited_ones_off() {
-        assert_eq!(RULE_CATALOG.len(), 42);
+    fn catalog_has_45_unique_rules_with_the_audited_ones_off() {
+        assert_eq!(RULE_CATALOG.len(), 45);
         let ids: HashSet<&str> = RULE_CATALOG.iter().map(|m| m.id).collect();
-        assert_eq!(ids.len(), 42);
+        assert_eq!(ids.len(), 45);
         let off: HashSet<&str> = RULE_CATALOG
             .iter()
             .filter(|m| !m.enabled_by_default)

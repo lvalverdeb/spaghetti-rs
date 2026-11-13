@@ -10,7 +10,7 @@ use crate::diff_filter;
 use crate::json::dumps_pretty;
 use crate::models::{Issue, ScanConfig, ScanResult, Severity, display_path};
 use crate::sarif;
-use crate::scanner::scan_package;
+use crate::scanner::{scan_package, scan_workspace};
 use crate::settings::{self, Settings, SettingsError, resolve_lenient};
 use clap::Parser;
 use indexmap::IndexMap;
@@ -340,6 +340,9 @@ struct JsonPackageStats {
     errors: usize,
     warnings: usize,
     infos: usize,
+    /// Mean SEI/Radon Maintainability Index over parsed files (2.0); `null`
+    /// when no file parsed.
+    maintainability_index: Option<f64>,
 }
 
 impl JsonPackageStats {
@@ -355,6 +358,7 @@ impl JsonPackageStats {
             errors: result.error_count(),
             warnings: result.warning_count(),
             infos: result.info_count(),
+            maintainability_index: result.maintainability_index().map(round_half_even_1dp),
         }
     }
 }
@@ -636,21 +640,34 @@ pub fn run(args: Args) -> i32 {
     // machinery that exists there only to get real parallelism past the GIL.
     // Rust has no GIL, so `rayon`'s thread pool is the whole story; the
     // settings installed above are process-global, so every worker sees them.
+    let base_config = ScanConfig {
+        exclude: run_exclude.clone(),
+        min_duplicate_lines: args.min_duplicate_lines,
+        twin_similarity: args.twin_similarity,
+        recursive: true,
+        min_clone_tokens: config::thresholds().min_clone_tokens,
+    };
     let scanned: Vec<(String, ScanResult)> = selected
         .par_iter()
         .map(|name| {
             let root = &registry[name.as_str()];
             let config = ScanConfig {
-                exclude: run_exclude.clone(),
-                min_duplicate_lines: args.min_duplicate_lines,
-                twin_similarity: args.twin_similarity,
                 recursive: !non_recursive.contains(name),
+                ..base_config.clone()
             };
             let result = scan_package(name, root, &config);
             (name.clone(), result)
         })
         .collect();
-    let per_package: IndexMap<String, ScanResult> = scanned.into_iter().collect();
+    let mut per_package: IndexMap<String, ScanResult> = scanned.into_iter().collect();
+    // Import cycles, coupling and clones run once over every package, so a
+    // cycle or clone that spans two packages is found.
+    scan_workspace(
+        &mut per_package,
+        &registry,
+        &base_config,
+        workspace_root.as_deref(),
+    );
 
     let mut total = ScanResult::default();
     for name in &selected {

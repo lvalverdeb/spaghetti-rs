@@ -1,5 +1,8 @@
 //! Core data models — mirrors `spaghetti/models.py`.
 
+use crate::checks::workspace_level::RawImport;
+use crate::clones::TokenStream;
+use indexmap::IndexMap;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -94,6 +97,7 @@ pub struct ScanConfig {
     pub min_duplicate_lines: usize,
     pub twin_similarity: f64,
     pub recursive: bool,
+    pub min_clone_tokens: usize,
 }
 
 /// A single prioritized remediation action — mirrors `models.py`'s
@@ -122,9 +126,23 @@ pub struct ScanResult {
     /// entry's `reason` is the text after the marker's `:`, or `None` if the
     /// marker didn't give one.
     pub ignored: Vec<Issue>,
+    /// Maintainability Index per parsed file (see `metrics::maintainability_index`).
+    pub file_mi: IndexMap<PathBuf, f64>,
+    /// Transport from worker to parent for the workspace-level import graph; cleared after use.
+    pub raw_imports: IndexMap<PathBuf, Vec<RawImport>>,
+    /// Transport from worker to parent for clone detection; cleared after use.
+    pub token_streams: IndexMap<PathBuf, TokenStream>,
 }
 
 impl ScanResult {
+    /// Mean MI over parsed files, or `None` when nothing parsed.
+    pub fn maintainability_index(&self) -> Option<f64> {
+        if self.file_mi.is_empty() {
+            return None;
+        }
+        Some(self.file_mi.values().sum::<f64>() / self.file_mi.len() as f64)
+    }
+
     pub fn error_count(&self) -> usize {
         self.issues
             .iter()
@@ -156,5 +174,7 @@ impl ScanResult {
         self.total_lines += other.total_lines;
         self.suppressed += other.suppressed;
         self.ignored.extend(other.ignored.iter().cloned());
+        self.file_mi
+            .extend(other.file_mi.iter().map(|(p, mi)| (p.clone(), *mi)));
     }
 }

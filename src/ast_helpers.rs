@@ -6,8 +6,8 @@
 
 use rustpython_ast::text_size::{TextRange, TextSize};
 use rustpython_ast::{
-    Arguments, ExceptHandlerExceptHandler, Expr, Ranged, Stmt, StmtAssert, StmtAsyncFor,
-    StmtAsyncFunctionDef, StmtFor, StmtFunctionDef, StmtIf, StmtTry, StmtWhile, StmtWith, Visitor,
+    Arguments, ExceptHandlerExceptHandler, Expr, Ranged, Stmt, StmtAsyncFor, StmtAsyncFunctionDef,
+    StmtFor, StmtFunctionDef, StmtIf, StmtTry, StmtWhile, StmtWith, Visitor,
 };
 use std::collections::VecDeque;
 use std::sync::LazyLock;
@@ -450,85 +450,11 @@ pub fn walk_withitem_children<V: Visitor + ?Sized>(
 }
 
 // ── Cyclomatic complexity ────────────────────────────────────────────────────
-//
-// Mirrors `ast_helpers.py::_cyclomatic_complexity`, which walks via
-// `ast.walk()` over the *whole* function node — deliberately not stopping at
-// nested function/lambda boundaries (a nested def's branches count toward
-// the enclosing function too), and including args/decorators/return
-// annotation, not just the body. Calling `visit_stmt` on the whole node
-// (rather than just iterating `body`) reproduces that exact traversal, since
-// this visitor doesn't override `visit_stmt_function_def`.
-struct ComplexityVisitor {
-    complexity: i64,
-}
 
-impl Visitor for ComplexityVisitor {
-    fn visit_arguments(&mut self, node: Arguments) {
-        walk_arguments_children(self, node);
-    }
-    fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-        walk_comprehension_children(self, node);
-    }
-    fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
-        walk_keyword_children(self, node);
-    }
-    fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
-        walk_withitem_children(self, node);
-    }
-    fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
-        walk_match_case_children(self, node);
-    }
-    fn visit_stmt_if(&mut self, node: StmtIf) {
-        self.complexity += 1;
-        self.generic_visit_stmt_if(node);
-    }
-    fn visit_stmt_while(&mut self, node: StmtWhile) {
-        self.complexity += 1;
-        self.generic_visit_stmt_while(node);
-    }
-    fn visit_stmt_for(&mut self, node: StmtFor) {
-        self.complexity += 1;
-        self.generic_visit_stmt_for(node);
-    }
-    fn visit_stmt_async_for(&mut self, node: StmtAsyncFor) {
-        self.complexity += 1;
-        self.generic_visit_stmt_async_for(node);
-    }
-    fn visit_excepthandler_except_handler(&mut self, node: ExceptHandlerExceptHandler) {
-        self.complexity += 1;
-        self.generic_visit_excepthandler_except_handler(node);
-    }
-    fn visit_stmt_assert(&mut self, node: StmtAssert) {
-        self.complexity += 1;
-        self.generic_visit_stmt_assert(node);
-    }
-    fn visit_expr_bool_op(&mut self, node: rustpython_ast::ExprBoolOp) {
-        self.complexity += node.values.len() as i64 - 1;
-        self.generic_visit_expr_bool_op(node);
-    }
-    fn visit_expr_list_comp(&mut self, node: rustpython_ast::ExprListComp) {
-        self.complexity += 1;
-        self.generic_visit_expr_list_comp(node);
-    }
-    fn visit_expr_set_comp(&mut self, node: rustpython_ast::ExprSetComp) {
-        self.complexity += 1;
-        self.generic_visit_expr_set_comp(node);
-    }
-    fn visit_expr_dict_comp(&mut self, node: rustpython_ast::ExprDictComp) {
-        self.complexity += 1;
-        self.generic_visit_expr_dict_comp(node);
-    }
-    fn visit_expr_generator_exp(&mut self, node: rustpython_ast::ExprGeneratorExp) {
-        self.complexity += 1;
-        self.generic_visit_expr_generator_exp(node);
-    }
-}
-
-/// Approximate McCabe cyclomatic complexity for a function.
+/// McCabe cyclomatic complexity of a function, as `radon cc` counts it —
+/// see `metrics::cyclomatic_complexity`.
 pub fn cyclomatic_complexity(func: &FuncNode) -> i64 {
-    let mut visitor = ComplexityVisitor { complexity: 1 };
-    visitor.visit_stmt(func.stmt.clone());
-    visitor.complexity
+    crate::metrics::cyclomatic_complexity(func.body())
 }
 
 // ── Nesting depth ────────────────────────────────────────────────────────────

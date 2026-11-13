@@ -584,7 +584,7 @@ mod tests {
             ),
             (
                 r#"{"thresholds": {"bogus": 1}}"#,
-                "unknown threshold 'bogus'. Known: complexity-threshold, default-min-duplicate-lines",
+                "unknown threshold 'bogus'. Known: cognitive-complexity-threshold, complexity-threshold, default-min-duplicate-lines",
             ),
             (
                 r#"{"thresholds": {"max-function-lines": "50"}}"#,
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn threshold_names_cover_every_python_tunable() {
         let names: Vec<&str> = THRESHOLD_NAMES.iter().map(|(n, _)| *n).collect();
-        assert_eq!(names.len(), 28);
+        assert_eq!(names.len(), 31);
         for required in [
             "MAX_FUNCTION_LINES",
             "COMPLEXITY_THRESHOLD",

@@ -6,7 +6,7 @@ This is a from-scratch reimplementation of [`spaghetti-detector`](https://github
 
 The [Python original](https://github.com/lvalverdeb/spaghetti) remains the actively maintained **spec of record**: when the two disagree, the Python behaviour is correct by definition and this is a bug here, not there. See [`RUST_PORT_PROPOSAL.md`](https://github.com/lvalverdeb/spaghetti/blob/main/RUST_PORT_PROPOSAL.md) in the Python repo for the full design rationale, phased build history, and every behavioural quirk (some quite subtle — e.g. `difflib.SequenceMatcher.ratio()`'s asymmetry under `autojunk`) uncovered and matched along the way.
 
-**Status**: all 42 catalogued rules ported and verified — `--json`, `--format sarif`, `--plan` and the baseline file are byte-for-byte identical to Python's output on the same input (Phase 1 of the Python [ROADMAP](https://github.com/lvalverdeb/spaghetti/blob/main/ROADMAP.md): settings, baseline, changed-lines mode, SARIF, `--fail-on`), and output is reproducible run-to-run.
+**Status**: all 45 catalogued rules ported and verified — `--json`, `--format sarif`, `--plan` and the baseline file are byte-for-byte identical to Python's output on the same input (Phases 1-2 of the Python [ROADMAP](https://github.com/lvalverdeb/spaghetti/blob/main/ROADMAP.md): settings, baseline, changed-lines mode, SARIF, `--fail-on`, Radon-exact complexity, cognitive complexity, clone detection, the workspace import graph and the Maintainability Index), and output is reproducible run-to-run.
 
 ## Why It Exists
 
@@ -93,9 +93,9 @@ With `--json`, the report is a single JSON object to stdout — **schema version
 ```json
 {
   "schema_version": 1,
-  "summary": { "grade": "B", "score": 89.8, "files": 13, "lines": 4137, "functions": 168, "issues": 33, "errors": 0, "warnings": 27, "infos": 6 },
+  "summary": { "grade": "B", "score": 89.8, "files": 13, "lines": 4137, "functions": 168, "issues": 33, "errors": 0, "warnings": 27, "infos": 6, "maintainability_index": 64.2 },
   "packages": {
-    "my-lib": { "grade": "B", "score": 89.8, "files": 13, "lines": 4137, "functions": 168, "issues": 33, "errors": 0, "warnings": 27, "infos": 6 }
+    "my-lib": { "grade": "B", "score": 89.8, "files": 13, "lines": 4137, "functions": 168, "issues": 33, "errors": 0, "warnings": 27, "infos": 6, "maintainability_index": 64.2 }
   },
   "issues": [
     {
@@ -189,11 +189,11 @@ Reports only findings whose span touches a line added or modified since the ref 
 
 ## Rules
 
-All 42 catalogued rules from the Python original: 33 per-file AST checks (including `pass-through-method`, `layer-violation` driven by the `layers` setting and `transport-in-library` driven by `library-packages`), 2 source-text checks, 2 infrastructure checks (`syntax-error`, `unreadable-file`), and 5 cross-file package checks (`import-cycle`, `high-coupling`, `orphan-interface`, `duplicate-function-body`, `sync-async-duplication`). The rule catalog (`src/rules.rs`) mirrors Python's `rules.py` entry for entry. See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
+All 45 catalogued rules from the Python original, across five tiers: 34 per-file AST checks (including `high-complexity` — McCabe cyclomatic complexity, identical to `radon cc` — and `high-cognitive-complexity` — SonarSource cognitive complexity, default 15 — plus `pass-through-method`, `layer-violation` driven by the `layers` setting and `transport-in-library` driven by `library-packages`), 3 source-text checks (`long-file`, `todo-marker`, `low-maintainability` — SEI/Radon Maintainability Index under 10; the per-package mean is also reported as `maintainability_index`), 2 infrastructure checks (`syntax-error`, `unreadable-file`), 3 cross-file package checks (`orphan-interface`, `duplicate-function-body`, `sync-async-duplication`) and 3 workspace checks run once over every registered package: `import-cycle` and `high-coupling` on the union import graph, so a cycle between two packages is found, and `duplicate-code`, a PMD-CPD-style type-2 clone detector over a normalised AST token stream that finds copies with renamed variables (default window 50 tokens, `min-clone-tokens`; `info` by default because duplication is a density signal and mature libraries carry deliberate copies). The rule catalog (`src/rules.rs`) mirrors Python's `rules.py` entry for entry. See the Python repo's [`SDD.md`](https://github.com/lvalverdeb/spaghetti/blob/main/SDD.md) for the full rule catalog, thresholds, and scoring formula — this port matches it exactly, not approximately.
 
 ### Rules off by default
 
-The Python project's 2026-11 precision audit over five public codebases (httpx, rich, FastAPI, pydantic, black — see its [`docs/precision.md`](https://github.com/lvalverdeb/spaghetti/blob/main/docs/precision.md)) switched eight catalogued rules off by default; this port follows it exactly, so 34 rules run out of the box and SARIF lists those 34. The others — `low-cohesion`, `missing-else`, `pass-through-method`, `magic-string`, `magic-number`, `star-import`, `unused-import` and `potential-circular-import` — are kept in the catalog and re-enabled per rule by naming them in `[tool.spaghetti.rules]` with a severity (an `"off"` entry keeps them off):
+The Python project's 2026-11 precision audit over five public codebases (httpx, rich, FastAPI, pydantic, black — see its [`docs/precision.md`](https://github.com/lvalverdeb/spaghetti/blob/main/docs/precision.md)) switched eight catalogued rules off by default; this port follows it exactly, so 37 rules run out of the box and SARIF lists those 37. The others — `low-cohesion`, `missing-else`, `pass-through-method`, `magic-string`, `magic-number`, `star-import`, `unused-import` and `potential-circular-import` — are kept in the catalog and re-enabled per rule by naming them in `[tool.spaghetti.rules]` with a severity (an `"off"` entry keeps them off):
 
 ```toml
 [tool.spaghetti.rules]
@@ -201,6 +201,8 @@ magic-number = "warning"   # opt back in, reported as a warning
 ```
 
 The same audit narrowed several default-on rules (all mirrored here): `too-many-params` counts only required positional parameters; `boolean-flag-params` counts only positional booleans; `lazy-class` exempts any class with a base, keyword or decorator; `global-mutable` skips `UPPER_CASE` constants; `deep-inheritance` skips exception hierarchies; `encapsulation-violation` allows a class to reach into another instance of itself; `swallowed-exception` skips handlers that carry a comment; `scope-mutation` reports `global` only; `duplicate-function-body` skips dunder methods; `star-import` skips `__init__.py`; and the import graph behind `import-cycle`/`high-coupling` ignores `if __name__ == "__main__":` blocks and resolves `from pkg import name` to the submodule `pkg.name` when one exists.
+
+**2.0 metric break.** Cyclomatic complexity is now McCabe-exact (Radon's rules: `match` arms, ternaries, comprehension clauses, `try/else`, no `with`). Scores and `high-complexity`/`god-class` findings shift accordingly; regenerate baselines when upgrading from 1.x.
 
 ## Development
 

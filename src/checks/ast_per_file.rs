@@ -187,6 +187,72 @@ pub fn check_complexity(module: &Mod, source: &str, filepath: &Path, package: &s
     issues
 }
 
+// ── Rule: Cognitive Complexity ───────────────────────────────────────────────
+
+/// Sonar cognitive complexity: how hard a function is to *read*, dominated
+/// by nesting. Cyclomatic is what CI gates on; this is what reviews argue
+/// about.
+pub fn check_cognitive_complexity(
+    module: &Mod,
+    source: &str,
+    filepath: &Path,
+    package: &str,
+) -> Vec<Issue> {
+    let Thresholds {
+        cognitive_complexity_threshold: limit,
+        error_escalation_multiplier,
+        ..
+    } = thresholds();
+    let line_index = LineIndex::new(source);
+    let mut issues = Vec::new();
+    for func in collect_functions(module_body(module)) {
+        let score = crate::metrics::cognitive_complexity(&func.name, func.body());
+        if score > limit as i64 {
+            let severity = if score as f64 > limit as f64 * error_escalation_multiplier {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
+            issues.push(issue_at(
+                filepath,
+                &line_index,
+                func.range(),
+                severity,
+                "high-cognitive-complexity",
+                package,
+                format!(
+                    "{}() has cognitive complexity {score} (max {limit}) — flatten nesting: \
+                     return early, extract the inner loop or branch into a named function",
+                    func.name
+                ),
+            ));
+        }
+    }
+    issues
+}
+
+// ── Rule: Low Maintainability ────────────────────────────────────────────────
+
+/// One finding when a file's Maintainability Index (computed once by the
+/// scanner, which also reports it per package) is under the threshold.
+pub fn low_maintainability_issue(mi: f64, filepath: &Path, package: &str) -> Option<Issue> {
+    let min = thresholds().min_maintainability_index;
+    if mi >= min as f64 {
+        return None;
+    }
+    Some(Issue::new(
+        filepath,
+        1,
+        Severity::Warning,
+        "low-maintainability",
+        package,
+        format!(
+            "Maintainability Index {mi:.1} (min {min}) — a large, dense, uncommented module; \
+             split it along its responsibilities"
+        ),
+    ))
+}
+
 // ── Rule: Missing Type Hints ─────────────────────────────────────────────────
 //
 // Python only ever inspects `node.args.args` here — deliberately excluding
@@ -3313,6 +3379,7 @@ pub type PkgRootCheck = fn(&Mod, &str, &Path, &str, &Path) -> Vec<Issue>;
 pub const ALL_CHECKS: &[Check] = &[
     Check::PerFile(check_long_functions),
     Check::PerFile(check_complexity),
+    Check::PerFile(check_cognitive_complexity),
     Check::PerFile(check_missing_types),
     Check::PerFile(check_excessive_params),
     Check::PerFile(check_excessive_returns),

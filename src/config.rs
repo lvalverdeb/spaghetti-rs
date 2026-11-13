@@ -47,6 +47,13 @@ pub const MAX_NESTING_DEPTH: usize = 5;
 // is deep-nesting's own, much higher threshold for a different rule.
 pub const LONG_FUNCTION_FLAT_NESTING_MAX: usize = 2;
 pub const COMPLEXITY_THRESHOLD: usize = 10;
+/// Sonar's default for its cognitive-complexity rule.
+pub const COGNITIVE_COMPLEXITY_THRESHOLD: usize = 15;
+/// Smallest normalised-token window reported as a clone (see `clones`).
+pub const MIN_CLONE_TOKENS: usize = 50;
+/// Files whose Maintainability Index is below this are flagged; 10 is the
+/// Radon rank-C boundary ("low maintainability").
+pub const MIN_MAINTAINABILITY_INDEX: usize = 10;
 pub const MIN_BOOLEAN_FLAGS: usize = 3;
 pub const MAX_DECORATORS: usize = 3;
 pub const MAX_CLASS_METHODS: usize = 25;
@@ -106,6 +113,9 @@ pub struct Thresholds {
     pub long_function_flat_nesting_max: usize,
     pub max_cross_layer_imports: usize,
     pub complexity_threshold: usize,
+    pub cognitive_complexity_threshold: usize,
+    pub min_clone_tokens: usize,
+    pub min_maintainability_index: usize,
     pub max_class_methods: usize,
     pub max_class_attrs: usize,
     pub min_boolean_flags: usize,
@@ -139,6 +149,9 @@ impl Default for Thresholds {
             long_function_flat_nesting_max: LONG_FUNCTION_FLAT_NESTING_MAX,
             max_cross_layer_imports: 0,
             complexity_threshold: COMPLEXITY_THRESHOLD,
+            cognitive_complexity_threshold: COGNITIVE_COMPLEXITY_THRESHOLD,
+            min_clone_tokens: MIN_CLONE_TOKENS,
+            min_maintainability_index: MIN_MAINTAINABILITY_INDEX,
             max_class_methods: MAX_CLASS_METHODS,
             max_class_attrs: MAX_CLASS_ATTRS,
             min_boolean_flags: MIN_BOOLEAN_FLAGS,
@@ -189,6 +202,9 @@ pub const THRESHOLD_NAMES: &[(&str, ThresholdKind)] = &[
     ("LONG_FUNCTION_FLAT_NESTING_MAX", ThresholdKind::Int),
     ("MAX_CROSS_LAYER_IMPORTS", ThresholdKind::Int),
     ("COMPLEXITY_THRESHOLD", ThresholdKind::Int),
+    ("COGNITIVE_COMPLEXITY_THRESHOLD", ThresholdKind::Int),
+    ("MIN_CLONE_TOKENS", ThresholdKind::Int),
+    ("MIN_MAINTAINABILITY_INDEX", ThresholdKind::Int),
     ("MAX_CLASS_METHODS", ThresholdKind::Int),
     ("MAX_CLASS_ATTRS", ThresholdKind::Int),
     ("MIN_BOOLEAN_FLAGS", ThresholdKind::Int),
@@ -249,6 +265,9 @@ impl Thresholds {
             "LONG_FUNCTION_FLAT_NESTING_MAX" => unsigned(&mut self.long_function_flat_nesting_max),
             "MAX_CROSS_LAYER_IMPORTS" => unsigned(&mut self.max_cross_layer_imports),
             "COMPLEXITY_THRESHOLD" => unsigned(&mut self.complexity_threshold),
+            "COGNITIVE_COMPLEXITY_THRESHOLD" => unsigned(&mut self.cognitive_complexity_threshold),
+            "MIN_CLONE_TOKENS" => unsigned(&mut self.min_clone_tokens),
+            "MIN_MAINTAINABILITY_INDEX" => unsigned(&mut self.min_maintainability_index),
             "MAX_CLASS_METHODS" => unsigned(&mut self.max_class_methods),
             "MAX_CLASS_ATTRS" => unsigned(&mut self.max_class_attrs),
             "MIN_BOOLEAN_FLAGS" => unsigned(&mut self.min_boolean_flags),

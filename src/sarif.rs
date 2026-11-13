@@ -353,7 +353,7 @@ mod tests {
         let driver = &run["tool"]["driver"];
         assert_eq!(driver["name"], "spaghetti");
         assert_eq!(driver["version"], "9.9.9");
-        assert_eq!(driver["rules"].as_array().unwrap().len(), 34);
+        assert_eq!(driver["rules"].as_array().unwrap().len(), 37);
         assert_eq!(
             run["originalUriBaseIds"]["%SRCROOT%"]["uri"],
             "file:///nonexistent/root/"

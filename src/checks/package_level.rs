@@ -1,13 +1,13 @@
-//! Cross-file, whole-package checks — Phase 3 of the port proposal's §10
-//! plan: `import-cycle`, `high-coupling`, `orphan-interface`,
-//! `duplicate-function-body`, `sync-async-duplication`.
-//! Mirrors `spaghetti/checks/package_level.py`.
+//! Cross-file, whole-package checks (`orphan-interface`,
+//! `duplicate-function-body`, `sync-async-duplication`) plus the
+//! import-resolution helpers the workspace-level graph reuses — mirrors
+//! `spaghetti/checks/package_level.py`.
 
 use crate::ast_helpers::{
     FuncNode, LineIndex, NodeLoc, collect_classes_bfs, collect_functions,
     collect_functions_with_class_context, dump_stmts, is_trivial_body, line_count,
 };
-use crate::config::{Thresholds, is_dunder, thresholds};
+use crate::config::{is_dunder, thresholds};
 use crate::models::{Issue, Severity, display_path};
 use crate::similarity::sequence_matcher_ratio;
 use crate::unparse::unparse_function;
@@ -64,7 +64,7 @@ fn issue_at(
 /// Derived from the registered package directory's name, which is also how
 /// `module_and_package_for` names modules — so an import is intra-package
 /// exactly when it starts with this.
-fn package_prefix(pkg_root: &Path) -> String {
+pub(crate) fn package_prefix(pkg_root: &Path) -> String {
     let name = pkg_root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -72,11 +72,11 @@ fn package_prefix(pkg_root: &Path) -> String {
     format!("{name}.")
 }
 
-// ── Import Cycles (real cycle detection via DFS) ─────────────────────────────
+// ── Import resolution (shared with `workspace_level`) ────────────────────────
 
 /// Returns `(dotted_module_name, dotted_containing_package_name)`, relative
 /// to `pkg_root`'s *parent* — mirrors `_module_and_package_for`.
-fn module_and_package_for(pkg_root: &Path, filepath: &Path) -> (String, String) {
+pub(crate) fn module_and_package_for(pkg_root: &Path, filepath: &Path) -> (String, String) {
     let anchor = pkg_root.parent().unwrap_or(pkg_root);
     let rel = filepath
         .strip_prefix(anchor)
@@ -107,17 +107,15 @@ fn module_and_package_for(pkg_root: &Path, filepath: &Path) -> (String, String) 
 /// so with `modules` (the package's known module names) the edge points at
 /// that submodule rather than at `pkg`'s `__init__` — the ubiquitous
 /// `__init__` re-export pattern is then not a cycle.
-fn import_targets(
+pub(crate) fn import_targets(
     package: &str,
-    node: &rustpython_ast::StmtImportFrom,
-    modules: &HashMap<String, &Path>,
+    level: usize,
+    module: Option<&str>,
+    names: &[String],
+    modules: &HashSet<String>,
 ) -> Vec<String> {
-    let level = node.level.as_ref().map(|l| l.to_usize()).unwrap_or(0);
     let base = if level == 0 {
-        node.module
-            .as_ref()
-            .map(|m| m.to_string())
-            .unwrap_or_default()
+        module.map(str::to_string).unwrap_or_default()
     } else {
         let mut pkg_parts: Vec<&str> = if package.is_empty() {
             Vec::new()
@@ -133,21 +131,20 @@ fn import_targets(
             }
         }
         let joined = pkg_parts.join(".");
-        match &node.module {
+        match module {
             Some(m) if joined.is_empty() => m.to_string(),
             Some(m) => format!("{joined}.{m}"),
             None => joined,
         }
     };
     if base.is_empty() {
-        return node.names.iter().map(|a| a.name.to_string()).collect();
+        return names.to_vec();
     }
-    let mut targets: Vec<String> = node
-        .names
+    let mut targets: Vec<String> = names
         .iter()
-        .map(|a| {
-            let candidate = format!("{base}.{}", a.name);
-            if modules.contains_key(&candidate) {
+        .map(|name| {
+            let candidate = format!("{base}.{name}");
+            if modules.contains(&candidate) {
                 candidate
             } else {
                 base.clone()
@@ -175,7 +172,7 @@ fn is_main_guard(test: &rustpython_ast::Expr) -> bool {
     matches!(test, Expr::Compare(c) if matches!(c.left.as_ref(), Expr::Name(n) if n.id.as_str() == "__name__"))
 }
 
-enum ImportNode {
+pub(crate) enum ImportNode {
     Import(rustpython_ast::StmtImport),
     ImportFrom(rustpython_ast::StmtImportFrom),
 }
@@ -205,7 +202,7 @@ impl Visitor for ModuleLevelImportCollector {
     }
 }
 
-fn module_level_imports(module_body: &[Stmt]) -> Vec<ImportNode> {
+pub(crate) fn module_level_imports(module_body: &[Stmt]) -> Vec<ImportNode> {
     let mut visitor = ModuleLevelImportCollector {
         imports: Vec::new(),
     };
@@ -213,207 +210,6 @@ fn module_level_imports(module_body: &[Stmt]) -> Vec<ImportNode> {
         visitor.visit_stmt(stmt.clone());
     }
     visitor.imports
-}
-
-/// The real intra-package import graph: module -> set of modules it
-/// imports, plus module -> its file. Shared by check_import_cycles_pkg and
-/// check_module_coupling_pkg so both see identical import resolution
-/// (relative imports, package-prefix resolution, TYPE_CHECKING exclusion —
-/// see `module_level_imports`) instead of duplicating it.
-///
-/// A module only appears as a `graph` key if it has at least one qualifying
-/// import; a module with zero intra-package imports is still present in
-/// `file_for_module`, just absent from `graph` (equivalent to an empty
-/// adjacency set — callers use `graph.get(module)`).
-fn build_import_graph<'a>(
-    files: &'a [ParsedFile],
-    pkg_root: &Path,
-) -> (HashMap<String, HashSet<String>>, HashMap<String, &'a Path>) {
-    let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut file_for_module: HashMap<String, &Path> = HashMap::new();
-    let prefix = package_prefix(pkg_root);
-    let stem = prefix.trim_end_matches('.');
-
-    // Every module name first, so `from pkg import name` can be resolved to
-    // the submodule `pkg.name` when that is what the import binds.
-    for f in files {
-        let (mod_name, _) = module_and_package_for(pkg_root, &f.path);
-        file_for_module.insert(mod_name, f.path.as_path());
-    }
-
-    for f in files {
-        let (mod_name, package) = module_and_package_for(pkg_root, &f.path);
-        for node in module_level_imports(module_body(&f.module)) {
-            match node {
-                ImportNode::ImportFrom(n) => {
-                    for resolved in import_targets(&package, &n, &file_for_module) {
-                        if resolved == stem || resolved.starts_with(&format!("{stem}.")) {
-                            graph.entry(mod_name.clone()).or_default().insert(resolved);
-                        }
-                    }
-                }
-                ImportNode::Import(n) => {
-                    for alias in &n.names {
-                        let name = alias.name.as_str();
-                        if name == stem || name.starts_with(&format!("{stem}.")) {
-                            graph
-                                .entry(mod_name.clone())
-                                .or_default()
-                                .insert(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    (graph, file_for_module)
-}
-
-pub fn check_import_cycles_pkg(
-    pkg_name: &str,
-    files: &[ParsedFile],
-    pkg_root: &Path,
-) -> Vec<Issue> {
-    let (graph, file_for_module) = build_import_graph(files, pkg_root);
-    if file_for_module.is_empty() {
-        return Vec::new();
-    }
-
-    let mut issues = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut reported: HashSet<Vec<String>> = HashSet::new();
-    // Sorted rather than raw `HashMap` iteration — Rust's hash-map order is
-    // randomized per-process, which made this rule's output (which module
-    // "wins" as the reported cycle's file, when adjacency order affects DFS
-    // discovery) non-reproducible across runs of the same binary on the
-    // same input. Found via a real repeatability check, not assumed.
-    let mut module_names: Vec<String> = graph.keys().cloned().collect();
-    module_names.sort();
-
-    for start in module_names {
-        if visited.contains(&start) {
-            continue;
-        }
-        // Explicit stack-based DFS (mirrors Python's recursive version,
-        // including its on_stack cycle-membership check) — avoids Rust
-        // recursion-depth concerns on a real import graph.
-        let mut stack: Vec<String> = vec![start.clone()];
-        let mut on_stack: HashSet<String> = HashSet::from([start.clone()]);
-        visited.insert(start.clone());
-        let neighbors_of = |graph: &HashMap<String, HashSet<String>>, m: &str| -> Vec<String> {
-            let mut v: Vec<String> = graph
-                .get(m)
-                .map(|s| s.iter().cloned().collect())
-                .unwrap_or_default();
-            v.sort();
-            v
-        };
-        let mut frames: Vec<Vec<String>> = vec![neighbors_of(&graph, &start)];
-
-        while let Some(frame) = frames.last_mut() {
-            let Some(neighbor) = frame.pop() else {
-                frames.pop();
-                let done = stack.pop().unwrap();
-                on_stack.remove(&done);
-                continue;
-            };
-            if on_stack.contains(&neighbor) {
-                let cycle_start = stack.iter().position(|m| m == &neighbor).unwrap();
-                let mut cycle: Vec<String> = stack[cycle_start..].to_vec();
-                cycle.push(neighbor.clone());
-                let mut key: Vec<String> = cycle.clone();
-                key.sort();
-                key.dedup();
-                if !reported.contains(&key) {
-                    reported.insert(key);
-                    if let Some(&loc) = file_for_module.get(&stack[cycle_start]) {
-                        issues.push(issue(
-                            loc,
-                            1,
-                            Severity::Error,
-                            "import-cycle",
-                            pkg_name,
-                            format!(
-                                "Circular import: {} — extract a shared abstraction (e.g. a \
-                                 typing.Protocol) both sides can depend on, and inject it \
-                                 instead of importing directly to break the cycle \
-                                 (Dependency Inversion Principle / Dependency Injection)",
-                                cycle.join(" \u{2192} ")
-                            ),
-                        ));
-                    }
-                }
-            } else if !visited.contains(&neighbor) {
-                visited.insert(neighbor.clone());
-                stack.push(neighbor.clone());
-                on_stack.insert(neighbor.clone());
-                frames.push(neighbors_of(&graph, &neighbor));
-            }
-        }
-    }
-
-    issues
-}
-
-/// Flags a module as an overloaded "hub" — reuses the same import graph as
-/// check_import_cycles_pkg, but measures fan-in/fan-out instead of cycles.
-///
-/// Only flagged when *both* fan-in and fan-out exceed their thresholds:
-/// high fan-in alone is often just a legitimately central util module (many
-/// things use it, by design), and high fan-out alone is often just a
-/// legitimately thin orchestrator (it wires many things together, by
-/// design). Both-high together is the real signal — a module that's both
-/// heavily depended-on and heavily dependent, so a change anywhere near it
-/// tends to ripple.
-pub fn check_module_coupling_pkg(
-    pkg_name: &str,
-    files: &[ParsedFile],
-    pkg_root: &Path,
-) -> Vec<Issue> {
-    let Thresholds {
-        max_module_fan_in,
-        max_module_fan_out,
-        ..
-    } = thresholds();
-    let (graph, file_for_module) = build_import_graph(files, pkg_root);
-    if file_for_module.is_empty() {
-        return Vec::new();
-    }
-
-    let mut fan_in: HashMap<String, usize> = HashMap::new();
-    for targets in graph.values() {
-        for target in targets {
-            *fan_in.entry(target.clone()).or_insert(0) += 1;
-        }
-    }
-
-    let mut module_names: Vec<&String> = file_for_module.keys().collect();
-    module_names.sort();
-
-    let mut issues = Vec::new();
-    for module in module_names {
-        let filepath = file_for_module[module];
-        let fan_out = graph.get(module).map(|s| s.len()).unwrap_or(0);
-        let module_fan_in = fan_in.get(module).copied().unwrap_or(0);
-        if module_fan_in > max_module_fan_in && fan_out > max_module_fan_out {
-            issues.push(issue(
-                filepath,
-                1,
-                Severity::Warning,
-                "high-coupling",
-                pkg_name,
-                format!(
-                    "module {module} has fan-in={module_fan_in} and fan-out={fan_out} \
-                     (max {max_module_fan_in}/{max_module_fan_out}) — other modules depend \
-                     on it heavily and it depends on other modules heavily; consider \
-                     splitting it or inverting some dependencies (Dependency Inversion \
-                     Principle)"
-                ),
-            ));
-        }
-    }
-    issues
 }
 
 // ── Orphan Interfaces (whole-package) ────────────────────────────────────────
@@ -695,80 +491,10 @@ pub fn check_sync_async_twins_pkg(
 }
 
 #[cfg(test)]
-mod module_coupling_tests {
-    use super::{ParsedFile, check_module_coupling_pkg};
-    use crate::config::MAX_MODULE_FAN_IN;
-    use std::path::{Path, PathBuf};
-
-    fn parsed_file(path: &str, source: &str) -> ParsedFile {
-        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, path)
-            .expect("test source must parse");
-        ParsedFile {
-            path: PathBuf::from(path),
-            source: source.to_string(),
-            module,
-        }
-    }
-
-    #[test]
-    fn flags_hub_module() {
-        let n = MAX_MODULE_FAN_IN + 1; // also > MAX_MODULE_FAN_OUT since both are equal
-        let mut files = Vec::new();
-        for i in 0..n {
-            files.push(parsed_file(&format!("/pkg/my_lib/dep{i}.py"), "x = 1\n"));
-        }
-        let hub_source: String = (0..n)
-            .map(|i| format!("from .dep{i} import x as x{i}\n"))
-            .collect();
-        files.push(parsed_file("/pkg/my_lib/hub.py", &hub_source));
-        for i in 0..n {
-            files.push(parsed_file(
-                &format!("/pkg/my_lib/user{i}.py"),
-                "from .hub import hub\n",
-            ));
-        }
-
-        let issues = check_module_coupling_pkg("my-lib", &files, Path::new("/pkg/my_lib"));
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].rule, "high-coupling");
-        assert!(issues[0].message.contains("my_lib.hub"));
-    }
-
-    #[test]
-    fn allows_high_fan_in_alone() {
-        // Sanity check: fan-in alone (a legitimately central util everyone
-        // imports) must not trigger — only both fan-in AND fan-out high does.
-        let n = MAX_MODULE_FAN_IN + 1;
-        let mut files = vec![parsed_file("/pkg/my_lib/util.py", "x = 1\n")];
-        for i in 0..n {
-            files.push(parsed_file(
-                &format!("/pkg/my_lib/user{i}.py"),
-                "from .util import x\n",
-            ));
-        }
-        let issues = check_module_coupling_pkg("my-lib", &files, Path::new("/pkg/my_lib"));
-        assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn clean() {
-        let files = vec![
-            parsed_file("/pkg/my_lib/a.py", "x = 1\n"),
-            parsed_file("/pkg/my_lib/b.py", "from .a import x\n"),
-        ];
-        let issues = check_module_coupling_pkg("my-lib", &files, Path::new("/pkg/my_lib"));
-        assert!(issues.is_empty());
-    }
-}
-
-#[cfg(test)]
 mod calibration_tests {
     //! Mirrors the package-level half of the Python repo's tests/test_calibration.py.
-    use super::{
-        ParsedFile, build_import_graph, check_duplicate_functions_pkg, check_import_cycles_pkg,
-    };
-    use std::collections::HashSet;
-    use std::path::{Path, PathBuf};
+    use super::{ParsedFile, check_duplicate_functions_pkg};
+    use std::path::PathBuf;
 
     const ROOT: &str = "/tmp/pkg";
 
@@ -789,48 +515,6 @@ mod calibration_tests {
             .collect();
         parsed.sort_by(|a, b| a.path.cmp(&b.path));
         parsed
-    }
-
-    #[test]
-    fn main_guard_imports_do_not_create_cycles() {
-        let files = pkg(&[
-            ("__init__.py", ""),
-            ("console.py", "from .pager import Pager\n"),
-            (
-                "pager.py",
-                "class Pager: ...\nif __name__ == \"__main__\":\n    from .console import Console\n",
-            ),
-        ]);
-        assert!(check_import_cycles_pkg("pkg", &files, Path::new(ROOT)).is_empty());
-    }
-
-    #[test]
-    fn init_reexport_of_submodules_is_not_a_cycle() {
-        // pkg/__init__ imports its submodules; a submodule does `from pkg
-        // import other` to reach a *sibling module*. That binds pkg.other,
-        // not pkg.
-        let files = pkg(&[
-            ("__init__.py", "from .a import A\nfrom .b import B\n"),
-            ("a.py", "from pkg import b\nclass A: ...\n"),
-            ("b.py", "class B: ...\n"),
-        ]);
-        let (graph, _) = build_import_graph(&files, Path::new(ROOT));
-        assert_eq!(graph["pkg.a"], HashSet::from(["pkg.b".to_string()]));
-        assert!(check_import_cycles_pkg("pkg", &files, Path::new(ROOT)).is_empty());
-    }
-
-    #[test]
-    fn real_cycle_is_still_reported() {
-        let files = pkg(&[
-            ("__init__.py", ""),
-            ("a.py", "from .b import B\n"),
-            ("b.py", "from .a import A\n"),
-        ]);
-        let rules: Vec<&str> = check_import_cycles_pkg("pkg", &files, Path::new(ROOT))
-            .iter()
-            .map(|i| i.rule)
-            .collect();
-        assert_eq!(rules, ["import-cycle"]);
     }
 
     #[test]
