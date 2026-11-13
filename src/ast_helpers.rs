@@ -4,11 +4,9 @@
 //! Python's native (lineno, end_lineno), so a `LineIndex` bridges the two:
 //! it's the equivalent of what Python's `ast` module gives you for free.
 
+use crate::pyast::Node;
 use rustpython_ast::text_size::{TextRange, TextSize};
-use rustpython_ast::{
-    Arguments, ExceptHandlerExceptHandler, Expr, Ranged, Stmt, StmtAsyncFor, StmtAsyncFunctionDef,
-    StmtFor, StmtFunctionDef, StmtIf, StmtTry, StmtWhile, StmtWith, Visitor,
-};
+use rustpython_ast::{Arguments, Expr, Ranged, Stmt};
 use std::collections::VecDeque;
 use std::sync::LazyLock;
 
@@ -252,57 +250,44 @@ pub fn collect_functions(module_body: &[Stmt]) -> Vec<FuncNode> {
     functions
 }
 
-struct FunctionWithClassContextCollector {
-    functions: Vec<(Option<String>, FuncNode)>,
-    class_stack: Vec<String>,
-}
-impl Visitor for FunctionWithClassContextCollector {
-    fn visit_stmt_class_def(&mut self, node: rustpython_ast::StmtClassDef) {
-        self.class_stack.push(node.name.to_string());
-        self.generic_visit_stmt_class_def(node);
-        self.class_stack.pop();
-    }
-    fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
-        self.functions.push((
-            self.class_stack.last().cloned(),
-            FuncNode {
-                name: node.name.as_str().to_string(),
-                start: node.range().start(),
-                stmt: Stmt::FunctionDef(node.clone()),
-            },
-        ));
-        self.generic_visit_stmt_function_def(node);
-    }
-    fn visit_stmt_async_function_def(&mut self, node: StmtAsyncFunctionDef) {
-        self.functions.push((
-            self.class_stack.last().cloned(),
-            FuncNode {
-                name: node.name.as_str().to_string(),
-                start: node.range().start(),
-                stmt: Stmt::AsyncFunctionDef(node.clone()),
-            },
-        ));
-        self.generic_visit_stmt_async_function_def(node);
-    }
-}
-
 /// Every FunctionDef/AsyncFunctionDef paired with its nearest enclosing
-/// class name (or `None` at module scope) — mirrors
-/// `_walk_with_class_context` filtered down to just the function/class-name
-/// pairs `sync-async-duplication` actually needs (that helper's general
-/// "yield every node with context" shape isn't needed elsewhere yet, so
-/// this collector is purpose-built rather than fully generic).
+/// class name (or `None` at module scope), in the pre-order of
+/// `_walk_with_class_context` — that helper filtered down to the
+/// function/class-name pairs `sync-async-duplication` needs.
 pub fn collect_functions_with_class_context(
     module_body: &[Stmt],
 ) -> Vec<(Option<String>, FuncNode)> {
-    let mut visitor = FunctionWithClassContextCollector {
-        functions: Vec::new(),
-        class_stack: Vec::new(),
-    };
-    for stmt in module_body {
-        visitor.visit_stmt(stmt.clone());
+    let mut functions = Vec::new();
+    let mut stack: Vec<(Node<'_>, Option<&str>)> = module_body
+        .iter()
+        .rev()
+        .map(|s| (Node::Stmt(s), None))
+        .collect();
+    while let Some((node, class_name)) = stack.pop() {
+        let mut child_class = class_name;
+        match node {
+            Node::Stmt(stmt @ Stmt::FunctionDef(f)) => functions.push((
+                class_name.map(str::to_string),
+                FuncNode {
+                    name: f.name.to_string(),
+                    start: f.range().start(),
+                    stmt: stmt.clone(),
+                },
+            )),
+            Node::Stmt(stmt @ Stmt::AsyncFunctionDef(f)) => functions.push((
+                class_name.map(str::to_string),
+                FuncNode {
+                    name: f.name.to_string(),
+                    start: f.range().start(),
+                    stmt: stmt.clone(),
+                },
+            )),
+            Node::Stmt(Stmt::ClassDef(c)) => child_class = Some(c.name.as_str()),
+            _ => {}
+        }
+        stack.extend(node.children().into_iter().rev().map(|c| (c, child_class)));
     }
-    visitor.functions
+    functions
 }
 
 /// Mirrors `ast_helpers.py::_is_trivial_body`: true for stub-like bodies
@@ -334,121 +319,6 @@ pub fn is_trivial_body(body: &[Stmt]) -> bool {
     false
 }
 
-// ── rustpython-ast Visitor gap: comprehensions are never descended into ─────
-//
-// `rustpython_ast::Visitor`'s generated `generic_visit_comprehension` is a
-// no-op stub (confirmed by reading `gen/visitor.rs` directly — it doesn't
-// walk `target`/`iter`/`ifs` at all, unlike every other `generic_visit_*`
-// method, which does visit all of its node's fields). Found via a real
-// conformance mismatch against this workspace's own code: two functions
-// where Python's `high-complexity` fired but the Rust port didn't, both
-// containing a comprehension with a multi-value `and` (`BoolOp`) inside its
-// `if` filter — invisible to any visitor relying on the crate's default
-// traversal. Any visitor here that needs true `ast.walk()`-equivalent
-// coverage (i.e. anything that must see every expression in a function,
-// not just statement-level constructs) MUST override `visit_comprehension`
-// and call this helper — the crate's own default silently won't do it.
-pub fn walk_comprehension_children<V: Visitor + ?Sized>(
-    visitor: &mut V,
-    node: rustpython_ast::Comprehension,
-) {
-    visitor.visit_expr(node.target);
-    visitor.visit_expr(node.iter);
-    for if_expr in node.ifs {
-        visitor.visit_expr(if_expr);
-    }
-}
-
-// ── Same gap, bigger scope: `Arguments`/`Arg` are never descended into ──────
-//
-// `generic_visit_arguments` and `generic_visit_arg` are *also* no-op stubs
-// (as are `generic_visit_keyword`/`generic_visit_alias`/
-// `generic_visit_withitem`/`generic_visit_match_case` — every "support"
-// struct in this crate version, not just `Comprehension`). Confirmed by a
-// second real gap: `def f(x=[i for i in range(10) if i > 5 and i < 8]):`
-// — Python's checks see the magic numbers and the `and` inside that default
-// value; the Rust port, before this fix, saw none of it, because
-// `generic_visit_stmt_function_def`'s call to `visit_arguments` silently
-// goes nowhere by default. Any visitor needing full `ast.walk()`-equivalent
-// coverage must override `visit_arguments` and call this helper too.
-pub fn walk_arguments_children<V: Visitor + ?Sized>(visitor: &mut V, node: Arguments) {
-    for arg in node
-        .posonlyargs
-        .into_iter()
-        .chain(node.args)
-        .chain(node.kwonlyargs)
-    {
-        if let Some(annotation) = arg.def.annotation {
-            visitor.visit_expr(*annotation);
-        }
-        if let Some(default) = arg.default {
-            visitor.visit_expr(*default);
-        }
-    }
-    if let Some(vararg) = node.vararg
-        && let Some(annotation) = vararg.annotation
-    {
-        visitor.visit_expr(*annotation);
-    }
-    if let Some(kwarg) = node.kwarg
-        && let Some(annotation) = kwarg.annotation
-    {
-        visitor.visit_expr(*annotation);
-    }
-}
-
-// ── Same gap, third instance: `Keyword` (call keyword-arguments) ───────────
-//
-// Found via a real conformance mismatch: `warnings.warn(msg, RuntimeWarning,
-// stacklevel=3)` (`boti/src/boti/core/logger.py:217`) — Python's
-// `magic-number` sees the `3` in `stacklevel=3`; the Rust port didn't,
-// because `generic_visit_expr_call` calls `self.visit_keyword(kw)` for each
-// keyword argument, but `visit_keyword`'s default `generic_visit_keyword` is
-// — like `Comprehension`/`Arguments` above — a no-op stub that never visits
-// `.value`. Same root cause also explained a `unused-import` false positive
-// (`started=perf_counter()` as a keyword argument was invisible to the
-// usage scan). Any visitor needing full traversal must override
-// `visit_keyword` and call this helper.
-pub fn walk_keyword_children<V: Visitor + ?Sized>(visitor: &mut V, node: rustpython_ast::Keyword) {
-    visitor.visit_expr(node.value);
-}
-
-// ── Same gap, fourth instance: `WithItem` (`with expr as x:`) ──────────────
-//
-// Not yet hit by a real conformance mismatch (found by inspection, applying
-// the same lesson pre-emptively rather than waiting to trip over it): only
-// `with` statement bodies are visited by default
-// (`generic_visit_stmt_with`/`generic_visit_stmt_async_with` call
-// `self.visit_withitem(item)`, but `visit_withitem`'s default is — same
-// pattern again — a no-op). A magic number or Name usage inside a `with`
-// statement's own context-manager expression (e.g. `with
-// open(path, encoding="utf-8") as f:`) would be invisible without this.
-/// `generic_visit_match_case` is a no-op in rustpython-ast 0.4, so a `match`
-/// arm's guard and body are invisible to every visitor unless walked by
-/// hand — `ast.walk` descends into them like any other statement list.
-pub fn walk_match_case_children<V: Visitor + ?Sized>(
-    visitor: &mut V,
-    node: rustpython_ast::MatchCase,
-) {
-    visitor.visit_pattern(node.pattern);
-    if let Some(guard) = node.guard {
-        visitor.visit_expr(*guard);
-    }
-    for stmt in node.body {
-        visitor.visit_stmt(stmt);
-    }
-}
-
-pub fn walk_withitem_children<V: Visitor + ?Sized>(
-    visitor: &mut V,
-    node: rustpython_ast::WithItem,
-) {
-    visitor.visit_expr(node.context_expr);
-    if let Some(vars) = node.optional_vars {
-        visitor.visit_expr(*vars);
-    }
-}
-
 // ── Cyclomatic complexity ────────────────────────────────────────────────────
 
 /// McCabe cyclomatic complexity of a function, as `radon cc` counts it —
@@ -458,121 +328,61 @@ pub fn cyclomatic_complexity(func: &FuncNode) -> i64 {
 }
 
 // ── Nesting depth ────────────────────────────────────────────────────────────
-//
-// Mirrors `ast_helpers.py::_nesting_depth`: also doesn't stop at nested def
-// boundaries, same reasoning as complexity above.
-struct NestingDepthVisitor {
-    current: usize,
-    max_depth: usize,
+
+/// The node kinds `_nesting_depth` / `_count_nested_returns` count as one
+/// level: `If`, `For`, `While`, `With`, `Try` and `ExceptHandler` — *not*
+/// their async forms, `TryStar` or `Match` (Python's `isinstance` tuple
+/// lists exactly these six classes).
+fn is_nesting_node(node: Node<'_>) -> bool {
+    matches!(
+        node,
+        Node::Stmt(Stmt::If(_) | Stmt::For(_) | Stmt::While(_) | Stmt::With(_) | Stmt::Try(_))
+            | Node::Handler(_)
+    )
 }
 
-impl NestingDepthVisitor {
-    fn descend(&mut self, f: impl FnOnce(&mut Self)) {
-        self.current += 1;
-        self.max_depth = self.max_depth.max(self.current);
-        f(self);
-        self.current -= 1;
-    }
-}
-
-impl Visitor for NestingDepthVisitor {
-    fn visit_stmt_if(&mut self, node: StmtIf) {
-        self.descend(|v| v.generic_visit_stmt_if(node));
-    }
-    fn visit_stmt_while(&mut self, node: StmtWhile) {
-        self.descend(|v| v.generic_visit_stmt_while(node));
-    }
-    fn visit_stmt_for(&mut self, node: StmtFor) {
-        self.descend(|v| v.generic_visit_stmt_for(node));
-    }
-    fn visit_stmt_async_for(&mut self, node: StmtAsyncFor) {
-        self.descend(|v| v.generic_visit_stmt_async_for(node));
-    }
-    fn visit_stmt_with(&mut self, node: StmtWith) {
-        self.descend(|v| v.generic_visit_stmt_with(node));
-    }
-    fn visit_stmt_try(&mut self, node: StmtTry) {
-        self.descend(|v| v.generic_visit_stmt_try(node));
-    }
-    fn visit_excepthandler_except_handler(&mut self, node: ExceptHandlerExceptHandler) {
-        self.descend(|v| v.generic_visit_excepthandler_except_handler(node));
-    }
-}
-
-/// Maximum nesting depth for a function (If/For/While/With/Try/Except).
+/// Mirrors `ast_helpers.py::_nesting_depth` on the function node, over the
+/// CPython-shaped tree (decorators, defaults and nested defs included, the
+/// way `ast.iter_child_nodes` reaches them). Iterative, so a pathological
+/// file cannot overflow the stack here.
 pub fn nesting_depth(func: &FuncNode) -> usize {
-    let mut visitor = NestingDepthVisitor {
-        current: 0,
-        max_depth: 0,
-    };
-    visitor.visit_stmt(func.stmt.clone());
-    visitor.max_depth
-}
-
-// ── Nested return-statement count ───────────────────────────────────────────
-//
-// Mirrors `ast_helpers.py::_count_nested_returns`: combines
-// NestingDepthVisitor's depth-tracking `descend()` with the nested
-// def/lambda stop condition previously used by `count_own_returns` — a
-// `Return` only counts when it occurs at depth >= 2, and returns inside a
-// nested function/lambda don't count at all.
-struct NestedReturnsVisitor {
-    current: usize,
-    count: i64,
-}
-
-impl NestedReturnsVisitor {
-    fn descend(&mut self, f: impl FnOnce(&mut Self)) {
-        self.current += 1;
-        f(self);
-        self.current -= 1;
-    }
-}
-
-impl Visitor for NestedReturnsVisitor {
-    fn visit_stmt_if(&mut self, node: StmtIf) {
-        self.descend(|v| v.generic_visit_stmt_if(node));
-    }
-    fn visit_stmt_while(&mut self, node: StmtWhile) {
-        self.descend(|v| v.generic_visit_stmt_while(node));
-    }
-    fn visit_stmt_for(&mut self, node: StmtFor) {
-        self.descend(|v| v.generic_visit_stmt_for(node));
-    }
-    fn visit_stmt_async_for(&mut self, node: StmtAsyncFor) {
-        self.descend(|v| v.generic_visit_stmt_async_for(node));
-    }
-    fn visit_stmt_with(&mut self, node: StmtWith) {
-        self.descend(|v| v.generic_visit_stmt_with(node));
-    }
-    fn visit_stmt_try(&mut self, node: StmtTry) {
-        self.descend(|v| v.generic_visit_stmt_try(node));
-    }
-    fn visit_excepthandler_except_handler(&mut self, node: ExceptHandlerExceptHandler) {
-        self.descend(|v| v.generic_visit_excepthandler_except_handler(node));
-    }
-    fn visit_stmt_return(&mut self, node: rustpython_ast::StmtReturn) {
-        if self.current >= 2 {
-            self.count += 1;
+    let mut max_depth = 0;
+    let mut stack = vec![(Node::Stmt(&func.stmt), 0usize)];
+    while let Some((node, current)) = stack.pop() {
+        max_depth = max_depth.max(current);
+        for child in node.children() {
+            let depth = current + usize::from(is_nesting_node(child));
+            stack.push((child, depth));
         }
-        self.generic_visit_stmt_return(node);
     }
-    fn visit_stmt_function_def(&mut self, _node: StmtFunctionDef) {}
-    fn visit_stmt_async_function_def(&mut self, _node: StmtAsyncFunctionDef) {}
-    fn visit_expr_lambda(&mut self, _node: rustpython_ast::ExprLambda) {}
+    max_depth
 }
 
+/// Mirrors `ast_helpers.py::_count_nested_returns`: `Return` statements at
+/// nesting depth >= 2, not descending into nested defs or lambdas.
 pub fn count_nested_returns(func: &FuncNode) -> i64 {
-    let mut visitor = NestedReturnsVisitor {
-        current: 0,
-        count: 0,
-    };
-    match &func.stmt {
-        Stmt::FunctionDef(n) => visitor.generic_visit_stmt_function_def(n.clone()),
-        Stmt::AsyncFunctionDef(n) => visitor.generic_visit_stmt_async_function_def(n.clone()),
-        _ => {}
+    let mut count = 0;
+    let mut stack = vec![(Node::Stmt(&func.stmt), 0usize)];
+    while let Some((node, current)) = stack.pop() {
+        for child in node.children() {
+            if matches!(
+                child,
+                Node::Stmt(Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_))
+                    | Node::Expr(Expr::Lambda(_))
+            ) {
+                continue;
+            }
+            if is_nesting_node(child) {
+                stack.push((child, current + 1));
+            } else {
+                if matches!(child, Node::Stmt(Stmt::Return(_))) && current >= 2 {
+                    count += 1;
+                }
+                stack.push((child, current));
+            }
+        }
     }
-    visitor.count
+    count
 }
 
 // ── Misc predicates ──────────────────────────────────────────────────────────

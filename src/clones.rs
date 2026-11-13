@@ -10,6 +10,7 @@
 //! more places, extended to its maximal length, is a clone group.
 
 use crate::ast_helpers::LineIndex;
+use crate::fstrings::FStringStarts;
 use crate::pyast::Node;
 use rustpython_ast::{Expr, Stmt};
 use std::collections::{BTreeSet, HashMap};
@@ -22,33 +23,38 @@ pub struct TokenStream {
     pub lines: Vec<usize>,
 }
 
-/// The normalised token stream of a module — mirrors `token_stream`.
-pub fn token_stream(body: &[Stmt], index: &LineIndex) -> TokenStream {
-    fn visit(node: Node<'_>, inherited: usize, index: &LineIndex, out: &mut TokenStream) {
-        let line = node
-            .start()
-            .map(|offset| index.line_number(offset))
-            .unwrap_or(inherited);
-        if matches!(node, Node::Expr(Expr::Constant(_))) {
-            out.names.push("LIT");
-            out.lines.push(line);
-            return;
-        }
-        out.names.push(node.py_name());
-        out.lines.push(line);
-        for _ in 0..node.identifier_count() {
-            out.names.push("ID");
-            out.lines.push(line);
-        }
-        for child in node.children() {
-            visit(child, line, index, out);
-        }
-    }
+/// The normalised token stream of a module — mirrors `token_stream`
+/// (pre-order, iterative so deep nesting cannot overflow the stack). Lines
+/// of f-string parts come from `FStringStarts`, matching CPython 3.12+.
+pub fn token_stream(body: &[Stmt], source: &str, index: &LineIndex) -> TokenStream {
+    let fstrings = FStringStarts::new(body, source);
     let mut out = TokenStream::default();
+    let mut stack: Vec<(Node<'_>, usize)> = Vec::new();
     for stmt in body {
         let node = Node::Stmt(stmt);
         let line = index.line_number(node.start().unwrap_or_default());
-        visit(node, line, index, &mut out);
+        stack.push((node, line));
+        while let Some((node, inherited)) = stack.pop() {
+            let start = match node {
+                Node::Expr(e) => fstrings.get(e).or_else(|| node.start()),
+                _ => node.start(),
+            };
+            let line = start
+                .map(|offset| index.line_number(offset))
+                .unwrap_or(inherited);
+            if matches!(node, Node::Expr(Expr::Constant(_))) {
+                out.names.push("LIT");
+                out.lines.push(line);
+                continue;
+            }
+            out.names.push(node.py_name());
+            out.lines.push(line);
+            for _ in 0..node.identifier_count() {
+                out.names.push("ID");
+                out.lines.push(line);
+            }
+            stack.extend(node.children().into_iter().rev().map(|c| (c, line)));
+        }
     }
     out
 }
@@ -383,7 +389,7 @@ mod tests {
         let Mod::Module(m) = module else {
             unreachable!()
         };
-        token_stream(&m.body, &LineIndex::new(source))
+        token_stream(&m.body, source, &LineIndex::new(source))
     }
 
     fn body(name: &str) -> String {

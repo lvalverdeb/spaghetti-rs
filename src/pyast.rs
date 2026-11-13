@@ -530,6 +530,33 @@ impl<'a> Node<'a> {
     }
 }
 
+/// `list(ast.walk(node))`: `node` itself, then every descendant in
+/// CPython's breadth-first order (a FIFO queue fed by `iter_child_nodes`).
+/// Checks that emit findings while iterating `ast.walk(tree)` must iterate
+/// this to report in the same order.
+pub fn walk<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+    let mut out = vec![node];
+    let mut i = 0;
+    while i < out.len() {
+        let children = out[i].children();
+        out.extend(children);
+        i += 1;
+    }
+    out
+}
+
+/// `list(ast.walk(tree))` for a module, minus the `Module` node itself.
+pub fn walk_module(body: &[Stmt]) -> Vec<Node<'_>> {
+    let mut out: Vec<Node<'_>> = body.iter().map(Node::Stmt).collect();
+    let mut i = 0;
+    while i < out.len() {
+        let children = out[i].children();
+        out.extend(children);
+        i += 1;
+    }
+    out
+}
+
 /// `ast.walk(node)` restricted to `node`'s descendants (not `node` itself):
 /// calls `f` on every descendant, pre-order. Order only matters to callers
 /// that count, so pre-order is as good as CPython's breadth-first walk.

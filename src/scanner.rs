@@ -99,7 +99,7 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
                 continue;
             }
         };
-        result.total_lines += source.lines().count();
+        result.total_lines += crate::pyast::py_splitlines(&source).len();
 
         all_issues.extend(text_per_file::check_long_file(&source, path, package));
         all_issues.extend(text_per_file::check_todo_markers(&source, path, package));
@@ -126,7 +126,7 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
                     .insert(path.to_path_buf(), collect_raw_imports(body, &line_index));
                 result
                     .token_streams
-                    .insert(path.to_path_buf(), token_stream(body, &line_index));
+                    .insert(path.to_path_buf(), token_stream(body, &source, &line_index));
                 parsed_files.push(ParsedFile {
                     path: path.to_path_buf(),
                     source: source.clone(),
@@ -167,7 +167,7 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
 
     let lines_by_file: HashMap<&Path, Vec<&str>> = source_by_file
         .iter()
-        .map(|(p, s)| (p.as_path(), s.lines().collect()))
+        .map(|(p, s)| (p.as_path(), crate::pyast::py_splitlines(s)))
         .collect();
     finalize(
         all_issues,
@@ -287,7 +287,7 @@ fn scan_workspace_with(
         }
         let lines_by_file: HashMap<&Path, Vec<&str>> = sources
             .iter()
-            .map(|(p, s)| (p.as_path(), s.lines().collect()))
+            .map(|(p, s)| (p.as_path(), crate::pyast::py_splitlines(s)))
             .collect();
         finalize(
             own,

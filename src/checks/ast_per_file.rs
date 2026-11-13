@@ -13,18 +13,18 @@
 //! (see §7.6/§10 of the proposal).
 
 use crate::ast_helpers::{
-    FuncNode, LineIndex, collect_classes_bfs, collect_except_handlers_bfs, collect_functions,
+    LineIndex, collect_classes_bfs, collect_except_handlers_bfs, collect_functions,
     count_nested_returns, cyclomatic_complexity, dump_stmts, is_private, is_test_file,
-    is_test_function, line_count, nesting_depth, walk_arguments_children,
-    walk_comprehension_children, walk_keyword_children, walk_match_case_children,
-    walk_withitem_children,
+    is_test_function, line_count, nesting_depth,
 };
 use crate::config::{
     TRANSPORT_MODULES, Thresholds, is_dunder, is_library_package, layer_rules, thresholds,
 };
 use crate::models::{Issue, Severity};
+use crate::pyast::{Node, walk, walk_module};
+use indexmap::IndexMap;
 use rustpython_ast::text_size::TextRange;
-use rustpython_ast::{Arguments, Constant, Expr, Mod, Ranged, Stmt, Visitor};
+use rustpython_ast::{Arguments, Constant, Expr, Mod, Ranged, Stmt};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
@@ -559,55 +559,26 @@ pub fn check_mutable_defaults(
 
 // ── Rule: Bare Except ─────────────────────────────────────────────────────────
 
-struct BareExceptVisitor<'a> {
-    line_index: &'a LineIndex,
-    filepath: &'a Path,
-    package: &'a str,
-    issues: Vec<Issue>,
-}
-
-impl<'a> Visitor for BareExceptVisitor<'a> {
-    fn visit_excepthandler_except_handler(
-        &mut self,
-        node: rustpython_ast::ExceptHandlerExceptHandler,
-    ) {
-        if node.type_.is_none() {
-            self.issues.push(issue_at(
-                self.filepath,
-                self.line_index,
-                node.range(),
-                Severity::Warning,
-                "bare-except",
-                self.package,
-                "Bare except clause — catch specific exceptions instead".to_string(),
-            ));
-        }
-        self.generic_visit_excepthandler_except_handler(node);
-    }
-}
-
 pub fn check_bare_except(module: &Mod, source: &str, filepath: &Path, package: &str) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
-    let mut visitor = BareExceptVisitor {
-        line_index: &line_index,
-        filepath,
-        package,
-        issues: Vec::new(),
-    };
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
-    }
-    visitor.issues
+    walk_module(module_body(module))
+        .into_iter()
+        .filter_map(|node| match node {
+            Node::Handler(h) if h.type_.is_none() => Some(issue_at(
+                filepath,
+                &line_index,
+                h.range(),
+                Severity::Warning,
+                "bare-except",
+                package,
+                "Bare except clause — catch specific exceptions instead".to_string(),
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
 // ── Rule: Missing Else ────────────────────────────────────────────────────────
-
-struct MissingElseVisitor<'a> {
-    line_index: &'a LineIndex,
-    filepath: &'a Path,
-    package: &'a str,
-    issues: Vec<Issue>,
-}
 
 const NON_TRIVIAL_BODY_THRESHOLD: usize = 2;
 
@@ -658,8 +629,18 @@ fn is_trailing_state_mutation(stmt: &Stmt) -> bool {
             .all(|t| matches!(t, Expr::Attribute(_) | Expr::Subscript(_)))
 }
 
-impl<'a> Visitor for MissingElseVisitor<'a> {
-    fn visit_stmt_if(&mut self, node: rustpython_ast::StmtIf) {
+pub fn check_missing_else(
+    module: &Mod,
+    source: &str,
+    filepath: &Path,
+    package: &str,
+) -> Vec<Issue> {
+    let line_index = LineIndex::new(source);
+    let mut issues = Vec::new();
+    for node in walk_module(module_body(module)) {
+        let Node::Stmt(Stmt::If(node)) = node else {
+            continue;
+        };
         // Skipped when the if body's last statement already terminates
         // control flow (return/raise/continue/break): the negative path is
         // either "the rest of the function" or "the next loop iteration",
@@ -674,101 +655,61 @@ impl<'a> Visitor for MissingElseVisitor<'a> {
             && !is_guard_delegation
             && !is_state_mutation
         {
-            self.issues.push(issue_at(
-                self.filepath,
-                self.line_index,
+            issues.push(issue_at(
+                filepath,
+                &line_index,
                 node.range(),
                 Severity::Info,
                 "missing-else",
-                self.package,
+                package,
                 format!(
                     "'if' block has {} statements but no else/elif — missing the negative path",
                     node.body.len()
                 ),
             ));
         }
-        self.generic_visit_stmt_if(node);
     }
-}
-
-pub fn check_missing_else(
-    module: &Mod,
-    source: &str,
-    filepath: &Path,
-    package: &str,
-) -> Vec<Issue> {
-    let line_index = LineIndex::new(source);
-    let mut visitor = MissingElseVisitor {
-        line_index: &line_index,
-        filepath,
-        package,
-        issues: Vec::new(),
-    };
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
-    }
-    visitor.issues
+    issues
 }
 
 // ── Rule: Unused Imports ─────────────────────────────────────────────────────
 
-/// Every name an `import`/`from ... import` statement binds, mapped to its
-/// position — mirrors Python's `imported[name] = node.lineno`: a plain dict
-/// assignment, so if the same name is imported twice, the *last* occurrence's
-/// position wins, not the first. `*` and `__future__` imports bind no real
-/// name; `_` is the conventional "I don't care about this" sink.
-fn collect_imported_names(module: &Mod) -> HashMap<String, rustpython_ast::text_size::TextSize> {
-    struct ImportCollector {
-        imported: HashMap<String, rustpython_ast::text_size::TextSize>,
+/// The local name an import alias binds, or `None` when it binds nothing
+/// worth tracking: `*`, the `_` sink, and the `X as X` re-export idiom —
+/// mirrors `_bound_name`.
+fn bound_name(alias: &rustpython_ast::Alias, split_dotted: bool) -> Option<String> {
+    if alias.name.as_str() == "*" || alias.asname.as_ref() == Some(&alias.name) {
+        return None;
     }
-    impl Visitor for ImportCollector {
-        fn visit_stmt_import(&mut self, node: rustpython_ast::StmtImport) {
-            let pos = node.range().start();
-            for alias in &node.names {
-                if alias.asname.as_ref() == Some(&alias.name) {
-                    continue; // `import x as x`: explicit re-export
-                }
-                let name = alias
-                    .asname
-                    .as_ref()
-                    .unwrap_or(&alias.name)
-                    .as_str()
-                    .split('.')
-                    .next()
-                    .unwrap()
-                    .to_string();
-                if name != "_" {
-                    self.imported.insert(name, pos);
-                }
-            }
-        }
-        fn visit_stmt_import_from(&mut self, node: rustpython_ast::StmtImportFrom) {
-            if node.module.as_deref() == Some("__future__") {
-                return;
-            }
-            let pos = node.range().start();
-            for alias in &node.names {
-                if alias.name.as_str() == "*" {
-                    continue;
-                }
-                if alias.asname.as_ref() == Some(&alias.name) {
-                    continue; // `from x import A as A`: the explicit re-export idiom
-                }
-                let name = alias.asname.as_ref().unwrap_or(&alias.name).to_string();
-                if name != "_" {
-                    self.imported.insert(name, pos);
-                }
-            }
-        }
+    let mut name = alias.asname.as_ref().unwrap_or(&alias.name).as_str();
+    if split_dotted {
+        name = name.split('.').next().unwrap_or(name);
     }
+    (name != "_").then(|| name.to_string())
+}
 
-    let mut collector = ImportCollector {
-        imported: HashMap::new(),
-    };
-    for stmt in module_body(module) {
-        collector.visit_stmt(stmt.clone());
+/// Every name an `import`/`from ... import` statement binds, mapped to its
+/// line — mirrors `_collect_imported_names`: a plain dict filled in
+/// `ast.walk` order, so a name keeps its *first* (breadth-first) position in
+/// the map but the *last* assignment's line.
+fn collect_imported_names(module: &Mod, line_index: &LineIndex) -> IndexMap<String, usize> {
+    let mut imported: IndexMap<String, usize> = IndexMap::new();
+    for node in walk_module(module_body(module)) {
+        let (names, split_dotted, start) = match node {
+            Node::Stmt(Stmt::Import(i)) => (&i.names, true, i.range().start()),
+            Node::Stmt(Stmt::ImportFrom(i)) if i.module.as_deref() != Some("__future__") => {
+                (&i.names, false, i.range().start())
+            }
+            _ => continue,
+        };
+        let line = line_index.line_number(start);
+        for alias in names {
+            if let Some(name) = bound_name(alias, split_dotted) {
+                imported.insert(name, line);
+            }
+        }
     }
-    collector.imported
+    imported
 }
 
 /// Names referenced by a forward-reference string, or nothing if it isn't
@@ -781,92 +722,52 @@ fn names_in_string_annotation(text: &str) -> HashSet<String> {
     let Ok(expr) = Expr::parse(text, "<annotation>") else {
         return HashSet::new();
     };
-    struct NameCollector {
-        names: HashSet<String>,
-    }
-    impl Visitor for NameCollector {
-        fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-            walk_comprehension_children(self, node);
-        }
-        fn visit_arguments(&mut self, node: Arguments) {
-            walk_arguments_children(self, node);
-        }
-        fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
-            walk_keyword_children(self, node);
-        }
-        fn visit_expr_name(&mut self, node: rustpython_ast::ExprName) {
-            self.names.insert(node.id.to_string());
-        }
-    }
-    let mut collector = NameCollector {
-        names: HashSet::new(),
-    };
-    collector.visit_expr(expr);
-    collector.names
+    walk(Node::Expr(&expr))
+        .into_iter()
+        .filter_map(|node| match node {
+            Node::Expr(Expr::Name(n)) => Some(n.id.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Every name referenced by the module — either directly, or listed in an
 /// `__all__ = [...]` re-export declaration, or inside a string annotation
-/// (`"Console"`, `"list[Foo]"`).
+/// (`"Console"`, `"list[Foo]"`) — mirrors `_collect_used_names`.
 fn collect_used_names(module: &Mod) -> HashSet<String> {
-    struct UsageCollector {
-        used: HashSet<String>,
-    }
-    impl Visitor for UsageCollector {
-        fn visit_expr_constant(&mut self, node: rustpython_ast::ExprConstant) {
-            if let Constant::Str(s) = &node.value {
-                self.used.extend(names_in_string_annotation(s));
+    let mut used = HashSet::new();
+    for node in walk_module(module_body(module)) {
+        match node {
+            Node::Expr(Expr::Name(n)) => {
+                used.insert(n.id.to_string());
             }
-        }
-        fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-            walk_comprehension_children(self, node);
-        }
-        fn visit_arguments(&mut self, node: Arguments) {
-            walk_arguments_children(self, node);
-        }
-        fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
-            walk_keyword_children(self, node);
-        }
-        fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
-            walk_withitem_children(self, node);
-        }
-        fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
-            walk_match_case_children(self, node);
-        }
-        fn visit_expr_name(&mut self, node: rustpython_ast::ExprName) {
-            self.used.insert(node.id.to_string());
-        }
-        fn visit_stmt_assign(&mut self, node: rustpython_ast::StmtAssign) {
-            let is_dunder_all = node
-                .targets
-                .iter()
-                .any(|t| matches!(t, Expr::Name(n) if n.id.as_str() == "__all__"));
-            if is_dunder_all {
-                let elts: Option<&[Expr]> = match node.value.as_ref() {
-                    Expr::List(l) => Some(&l.elts),
-                    Expr::Tuple(t) => Some(&t.elts),
-                    _ => None,
+            Node::Expr(Expr::Constant(c)) => {
+                if let Constant::Str(s) = &c.value {
+                    used.extend(names_in_string_annotation(s));
+                }
+            }
+            Node::Stmt(Stmt::Assign(a))
+                if a.targets
+                    .iter()
+                    .any(|t| matches!(t, Expr::Name(n) if n.id.as_str() == "__all__")) =>
+            {
+                let elts: &[Expr] = match a.value.as_ref() {
+                    Expr::List(l) => &l.elts,
+                    Expr::Tuple(t) => &t.elts,
+                    _ => continue,
                 };
-                if let Some(elts) = elts {
-                    for elt in elts {
-                        if let Expr::Constant(c) = elt
-                            && let Constant::Str(s) = &c.value
-                        {
-                            self.used.insert(s.clone());
-                        }
+                for elt in elts {
+                    if let Expr::Constant(c) = elt
+                        && let Constant::Str(s) = &c.value
+                    {
+                        used.insert(s.clone());
                     }
                 }
             }
-            self.generic_visit_stmt_assign(node);
+            _ => {}
         }
     }
-    let mut usage = UsageCollector {
-        used: HashSet::new(),
-    };
-    for stmt in module_body(module) {
-        usage.visit_stmt(stmt.clone());
-    }
-    usage.used
+    used
 }
 
 pub fn check_unused_imports(
@@ -878,25 +779,25 @@ pub fn check_unused_imports(
     if filepath.file_name().and_then(|n| n.to_str()) == Some("__init__.py") {
         return Vec::new();
     }
-
-    let imported = collect_imported_names(module);
+    let line_index = LineIndex::new(source);
+    let imported = collect_imported_names(module, &line_index);
     if imported.is_empty() {
         return Vec::new();
     }
     let used = collect_used_names(module);
 
-    let line_index = LineIndex::new(source);
-    let mut entries: Vec<(&String, &rustpython_ast::text_size::TextSize)> =
-        imported.iter().collect();
-    entries.sort_by_key(|(_, pos)| **pos);
+    // `sorted(imported.items(), key=line)`: stable, so names on one line
+    // keep their walk order.
+    let mut entries: Vec<(&String, &usize)> = imported.iter().collect();
+    entries.sort_by_key(|(_, line)| **line);
 
     entries
         .into_iter()
         .filter(|(name, _)| !used.contains(*name))
-        .map(|(name, pos)| {
+        .map(|(name, line)| {
             issue(
                 filepath,
-                line_index.line_number(*pos),
+                *line,
                 Severity::Warning,
                 "unused-import",
                 package,
@@ -983,7 +884,7 @@ pub fn check_swallowed_exceptions(
     package: &str,
 ) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
-    let source_lines: Vec<&str> = source.lines().collect();
+    let source_lines: Vec<&str> = crate::pyast::py_splitlines(source);
     let mut issues = Vec::new();
     // `ast.walk` order, not a depth-first visit: a handler nested inside an
     // earlier `try` must not jump ahead of a later sibling handler.
@@ -1029,54 +930,28 @@ pub fn check_star_imports(
     }
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
-    for stmt in module_body(module) {
-        collect_star_imports(stmt, &line_index, filepath, package, &mut issues);
-    }
-    issues
-}
-
-fn collect_star_imports(
-    stmt: &Stmt,
-    line_index: &LineIndex,
-    filepath: &Path,
-    package: &str,
-    issues: &mut Vec<Issue>,
-) {
-    struct StarImportVisitor<'a> {
-        line_index: &'a LineIndex,
-        filepath: &'a Path,
-        package: &'a str,
-        issues: Vec<Issue>,
-    }
-    impl<'a> Visitor for StarImportVisitor<'a> {
-        fn visit_stmt_import_from(&mut self, node: rustpython_ast::StmtImportFrom) {
-            for alias in &node.names {
-                if alias.name.as_str() == "*" {
-                    self.issues.push(issue_at(
-                        self.filepath,
-                        self.line_index,
-                        node.range(),
-                        Severity::Warning,
-                        "star-import",
-                        self.package,
-                        format!(
-                            "Star import from '{}' — import specific names instead",
-                            node.module.as_deref().unwrap_or("")
-                        ),
-                    ));
-                }
+    for node in walk_module(module_body(module)) {
+        let Node::Stmt(Stmt::ImportFrom(node)) = node else {
+            continue;
+        };
+        for alias in &node.names {
+            if alias.name.as_str() == "*" {
+                issues.push(issue_at(
+                    filepath,
+                    &line_index,
+                    node.range(),
+                    Severity::Warning,
+                    "star-import",
+                    package,
+                    format!(
+                        "Star import from '{}' — import specific names instead",
+                        node.module.as_deref().unwrap_or("")
+                    ),
+                ));
             }
-            self.generic_visit_stmt_import_from(node);
         }
     }
-    let mut visitor = StarImportVisitor {
-        line_index,
-        filepath,
-        package,
-        issues: Vec::new(),
-    };
-    visitor.visit_stmt(stmt.clone());
-    issues.append(&mut visitor.issues);
+    issues
 }
 
 // ── Rule: Global State Mutation ──────────────────────────────────────────────
@@ -1155,93 +1030,45 @@ fn py_isupper(s: &str) -> bool {
 // function/class boundaries, so an inner def's own globals/assignments
 // aren't misattributed to the outer function.
 
-#[derive(Default)]
-struct OwnScopeCollector {
-    global_names: HashSet<String>,
-    // (name, statement span, is_lazy_singleton_init)
-    assignments: Vec<(String, TextRange, bool)>,
+/// `_walk_own_scope`: pre-order descendants of `node`, not entering (nor
+/// yielding) nested function or class definitions.
+fn walk_own_scope(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut out = Vec::new();
+    let mut stack: Vec<Node<'_>> = node.children().into_iter().rev().collect();
+    while let Some(child) = stack.pop() {
+        if child.is_scope_def() {
+            continue;
+        }
+        out.push(child);
+        stack.extend(child.children().into_iter().rev());
+    }
+    out
 }
 
-/// `<name> is None` — the target of a lazy-singleton-init guard, if `test`
-/// has that exact shape.
-fn none_guard_target(test: &Expr) -> Option<&str> {
+/// `<target_name> is None` — mirrors `_is_none_guard_test`.
+fn is_none_guard_test(test: &Expr, target_name: &str) -> bool {
     let Expr::Compare(cmp) = test else {
-        return None;
+        return false;
     };
-    let Expr::Name(left) = cmp.left.as_ref() else {
-        return None;
-    };
-    if cmp.ops.len() != 1 || cmp.ops[0] != rustpython_ast::CmpOp::Is {
-        return None;
-    }
-    if cmp.comparators.len() != 1 {
-        return None;
-    }
-    match &cmp.comparators[0] {
-        Expr::Constant(c) if matches!(c.value, Constant::None) => Some(left.id.as_str()),
-        _ => None,
-    }
+    matches!(cmp.left.as_ref(), Expr::Name(n) if n.id.as_str() == target_name)
+        && cmp.ops.len() == 1
+        && cmp.ops[0] == rustpython_ast::CmpOp::Is
+        && cmp.comparators.len() == 1
+        && matches!(&cmp.comparators[0], Expr::Constant(c) if matches!(c.value, Constant::None))
 }
 
-impl Visitor for OwnScopeCollector {
-    fn visit_stmt_function_def(&mut self, _node: rustpython_ast::StmtFunctionDef) {}
-    fn visit_stmt_async_function_def(&mut self, _node: rustpython_ast::StmtAsyncFunctionDef) {}
-    fn visit_stmt_class_def(&mut self, _node: rustpython_ast::StmtClassDef) {}
-    fn visit_stmt_global(&mut self, node: rustpython_ast::StmtGlobal) {
-        self.global_names
-            .extend(node.names.iter().map(|n| n.to_string()));
-    }
-    fn visit_stmt_assign(&mut self, node: rustpython_ast::StmtAssign) {
-        for t in &node.targets {
-            if let Expr::Name(n) = t {
-                self.assignments
-                    .push((n.id.to_string(), node.range(), false));
-            }
-        }
-        self.generic_visit_stmt_assign(node);
-    }
-    fn visit_stmt_aug_assign(&mut self, node: rustpython_ast::StmtAugAssign) {
-        if let Expr::Name(n) = node.target.as_ref() {
-            self.assignments
-                .push((n.id.to_string(), node.range(), false));
-        }
-        self.generic_visit_stmt_aug_assign(node);
-    }
-    // Mirrors Python's `_is_lazy_singleton_init`: an assignment/aug-assign
-    // that sits *directly* in an `if <name> is None:` guard's body (not
-    // merely nested somewhere inside it — matching Python's exact
-    // `mutation in node.body` list-membership check) is the standard
-    // lazy-init idiom, not unconstrained global mutation.
-    fn visit_stmt_if(&mut self, node: rustpython_ast::StmtIf) {
-        let Some(guarded_name) = none_guard_target(&node.test) else {
-            self.generic_visit_stmt_if(node);
-            return;
-        };
-        for stmt in &node.body {
-            match stmt {
-                Stmt::Assign(a) => {
-                    for t in &a.targets {
-                        if let Expr::Name(n) = t {
-                            let is_guarded = n.id.as_str() == guarded_name;
-                            self.assignments
-                                .push((n.id.to_string(), a.range(), is_guarded));
-                        }
-                    }
-                }
-                Stmt::AugAssign(a) => {
-                    if let Expr::Name(n) = a.target.as_ref() {
-                        let is_guarded = n.id.as_str() == guarded_name;
-                        self.assignments
-                            .push((n.id.to_string(), a.range(), is_guarded));
-                    }
-                }
-                other => self.visit_stmt(other.clone()),
-            }
-        }
-        for stmt in &node.orelse {
-            self.visit_stmt(stmt.clone());
-        }
-    }
+/// The declared outer-scope name `stmt` assigns to, if any — mirrors
+/// `_assigned_outer_name`.
+fn assigned_outer_name<'a>(stmt: &'a Stmt, declared: &HashSet<&str>) -> Option<&'a str> {
+    let targets: Vec<&Expr> = match stmt {
+        Stmt::Assign(a) => a.targets.iter().collect(),
+        Stmt::AugAssign(a) => vec![a.target.as_ref()],
+        _ => return None,
+    };
+    targets.into_iter().find_map(|t| match t {
+        Expr::Name(n) if declared.contains(n.id.as_str()) => Some(n.id.as_str()),
+        _ => None,
+    })
 }
 
 pub fn check_scope_mutations(
@@ -1252,35 +1079,56 @@ pub fn check_scope_mutations(
 ) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
-    for func in collect_functions(module_body(module)) {
-        let mut collector = OwnScopeCollector::default();
-        for stmt in func.body() {
-            collector.visit_stmt(stmt.clone());
-        }
-        let outer_names = &collector.global_names;
-        if outer_names.is_empty() {
+    for node in walk_module(module_body(module)) {
+        let name = match node {
+            Node::Stmt(Stmt::FunctionDef(f)) => f.name.as_str(),
+            Node::Stmt(Stmt::AsyncFunctionDef(f)) => f.name.as_str(),
+            _ => continue,
+        };
+        let own = walk_own_scope(node);
+        // `nonlocal` is deliberately not counted: a closure updating its
+        // enclosing function's accumulator is scoped, idiomatic Python, not
+        // the module-wide shared state this rule exists to catch.
+        let declared: HashSet<&str> = own
+            .iter()
+            .filter_map(|n| match n {
+                Node::Stmt(Stmt::Global(g)) => Some(g.names.iter().map(|n| n.as_str())),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if declared.is_empty() {
             continue;
         }
-        if let Some((target_name, range, _)) =
-            collector
-                .assignments
-                .iter()
-                .find(|(name, _, is_lazy_singleton_init)| {
-                    outer_names.contains(name) && !is_lazy_singleton_init
-                })
-        {
+        for child in &own {
+            let Node::Stmt(stmt) = child else {
+                continue;
+            };
+            let Some(target_name) = assigned_outer_name(stmt, &declared) else {
+                continue;
+            };
+            // `_is_lazy_singleton_init`: the mutation sits directly in an
+            // `if <name> is None:` guard's body.
+            let is_lazy_init = own.iter().any(|n| {
+                matches!(n, Node::Stmt(Stmt::If(i))
+                    if is_none_guard_test(&i.test, target_name)
+                        && i.body.iter().any(|b| std::ptr::eq(b, *stmt)))
+            });
+            if is_lazy_init {
+                continue;
+            }
             issues.push(issue_at(
                 filepath,
                 &line_index,
-                *range,
+                stmt.range(),
                 Severity::Info,
                 "scope-mutation",
                 package,
                 format!(
-                    "{}() mutates outer-scope variable '{}' via global — shared mutable state makes control flow hard to trace",
-                    func.name, target_name
+                    "{name}() mutates outer-scope variable '{target_name}' via global — shared mutable state makes control flow hard to trace"
                 ),
             ));
+            break; // one finding per function is enough
         }
     }
     issues
@@ -1449,71 +1297,34 @@ pub fn check_excessive_decorators(
     package: &str,
 ) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
-
-    struct DecoratorVisitor<'a> {
-        line_index: &'a LineIndex,
-        filepath: &'a Path,
-        package: &'a str,
-        issues: Vec<Issue>,
-    }
-    impl<'a> DecoratorVisitor<'a> {
-        fn check(&mut self, kind: &str, name: &str, decorators: usize, range: TextRange) {
-            let max_decorators = thresholds().max_decorators;
-            if decorators > max_decorators {
-                self.issues.push(issue_at(
-                    self.filepath,
-                    self.line_index,
-                    range,
-                    Severity::Info,
-                    "excessive-decorators",
-                    self.package,
-                    format!(
-                        "{kind} '{name}' has {decorators} decorators (max {max_decorators}) — consider a wrapper or composition"
-                    ),
-                ));
+    let max_decorators = thresholds().max_decorators;
+    let mut issues = Vec::new();
+    for node in walk_module(module_body(module)) {
+        let (kind, name, decorators, range) = match node {
+            Node::Stmt(Stmt::FunctionDef(f)) => {
+                ("function", &f.name, f.decorator_list.len(), f.range())
             }
+            Node::Stmt(Stmt::AsyncFunctionDef(f)) => {
+                ("function", &f.name, f.decorator_list.len(), f.range())
+            }
+            Node::Stmt(Stmt::ClassDef(c)) => ("class", &c.name, c.decorator_list.len(), c.range()),
+            _ => continue,
+        };
+        if decorators > max_decorators {
+            issues.push(issue_at(
+                filepath,
+                &line_index,
+                range,
+                Severity::Info,
+                "excessive-decorators",
+                package,
+                format!(
+                    "{kind} '{name}' has {decorators} decorators (max {max_decorators}) — consider a wrapper or composition"
+                ),
+            ));
         }
     }
-    impl<'a> Visitor for DecoratorVisitor<'a> {
-        fn visit_stmt_function_def(&mut self, node: rustpython_ast::StmtFunctionDef) {
-            self.check(
-                "function",
-                node.name.as_str(),
-                node.decorator_list.len(),
-                node.range(),
-            );
-            self.generic_visit_stmt_function_def(node);
-        }
-        fn visit_stmt_async_function_def(&mut self, node: rustpython_ast::StmtAsyncFunctionDef) {
-            self.check(
-                "function",
-                node.name.as_str(),
-                node.decorator_list.len(),
-                node.range(),
-            );
-            self.generic_visit_stmt_async_function_def(node);
-        }
-        fn visit_stmt_class_def(&mut self, node: rustpython_ast::StmtClassDef) {
-            self.check(
-                "class",
-                node.name.as_str(),
-                node.decorator_list.len(),
-                node.range(),
-            );
-            self.generic_visit_stmt_class_def(node);
-        }
-    }
-
-    let mut visitor = DecoratorVisitor {
-        line_index: &line_index,
-        filepath,
-        package,
-        issues: Vec::new(),
-    };
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
-    }
-    visitor.issues
+    issues
 }
 
 // ── Rule: Lazy Class ──────────────────────────────────────────────────────────
@@ -1639,51 +1450,36 @@ fn is_lazy_class_exempt(node: &rustpython_ast::StmtClassDef) -> bool {
 
 pub fn check_lazy_class(module: &Mod, source: &str, filepath: &Path, package: &str) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
-
-    struct LazyClassVisitor<'a> {
-        line_index: &'a LineIndex,
-        filepath: &'a Path,
-        package: &'a str,
-        issues: Vec<Issue>,
-    }
-    impl<'a> Visitor for LazyClassVisitor<'a> {
-        fn visit_stmt_class_def(&mut self, node: rustpython_ast::StmtClassDef) {
-            let min_class_methods = thresholds().min_class_methods;
-            if !is_lazy_class_exempt(&node) {
-                let methods = node
-                    .body
-                    .iter()
-                    .filter(|s| matches!(s, Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_)))
-                    .count();
-                if methods < min_class_methods {
-                    self.issues.push(issue_at(
-                        self.filepath,
-                        self.line_index,
-                        node.range(),
-                        Severity::Info,
-                        "lazy-class",
-                        self.package,
-                        format!(
-                            "class '{}' has {methods} method(s) — consider a plain function or @dataclass",
-                            node.name
-                        ),
-                    ));
-                }
-            }
-            self.generic_visit_stmt_class_def(node);
+    let min_class_methods = thresholds().min_class_methods;
+    let mut issues = Vec::new();
+    for node in walk_module(module_body(module)) {
+        let Node::Stmt(Stmt::ClassDef(node)) = node else {
+            continue;
+        };
+        if is_lazy_class_exempt(node) {
+            continue;
+        }
+        let methods = node
+            .body
+            .iter()
+            .filter(|s| matches!(s, Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_)))
+            .count();
+        if methods < min_class_methods {
+            issues.push(issue_at(
+                filepath,
+                &line_index,
+                node.range(),
+                Severity::Info,
+                "lazy-class",
+                package,
+                format!(
+                    "class '{}' has {methods} method(s) — consider a plain function or @dataclass",
+                    node.name
+                ),
+            ));
         }
     }
-
-    let mut visitor = LazyClassVisitor {
-        line_index: &line_index,
-        filepath,
-        package,
-        issues: Vec::new(),
-    };
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
-    }
-    visitor.issues
+    issues
 }
 
 // ── Rule: Magic Numbers ───────────────────────────────────────────────────────
@@ -1733,7 +1529,14 @@ fn format_number_for_magic_check(c: &Constant) -> Option<(bool, String)> {
             Some((allowed, i.to_string()))
         }
         Constant::Float(f) => {
-            let allowed = *f == -1.0 || *f == 0.0 || *f == 1.0;
+            // `value in _ALLOWED` compares a float to the int set by value.
+            let allowed = *f == -1.0
+                || *f == 0.0
+                || *f == 1.0
+                || MAGIC_NUMBER_HTTP_STATUS_CODES
+                    .iter()
+                    .chain(MAGIC_NUMBER_WELL_KNOWN_PORTS)
+                    .any(|&n| *f == f64::from(n));
             Some((allowed, format!("{f:?}")))
         }
         _ => None,
@@ -1751,168 +1554,9 @@ fn source_segment(source: &str, range: rustpython_ast::text_size::TextRange) -> 
     source.get(start as usize..end as usize)
 }
 
-/// Mirrors Python's `for stmt in func.body: for child in ast.walk(stmt)`.
-///
-/// `ast.walk` is breadth-first, so the order two literals in one statement
-/// are reported in depends on their depth in the tree (`foo(5, bar(6), 7)`
-/// reports 5, 7, then 6). This visitor is depth-first, but tags every
-/// candidate with its `ast.walk` depth — every Python AST node on the way
-/// down counts one level, including the `keyword`/`arguments`/`arg`/
-/// `comprehension`/`withitem`/`ExceptHandler`/`match_case`/pattern wrapper
-/// nodes — and `check_magic_numbers` stable-sorts each statement's
-/// candidates by that depth, which turns pre-order into level order exactly
-/// (same-depth nodes are already in parent-then-sibling order).
-struct MagicNumberVisitor<'a> {
-    line_index: &'a LineIndex,
-    source: &'a str,
-    filepath: &'a Path,
-    package: &'a str,
-    depth: usize,
-    /// `(ast.walk depth, issue)` in pre-order.
-    found: Vec<(usize, Issue)>,
-    distinct: HashSet<String>,
-}
-
-/// `ast.iter_child_nodes(arguments)` order: `posonlyargs`, `args`, `vararg`,
-/// `kwonlyargs`, `kw_defaults`, `kwarg`, `defaults` — every `arg` first
-/// (whose annotation is one level deeper), then the default values.
-fn walk_arguments_in_ast_order(visitor: &mut MagicNumberVisitor<'_>, node: Arguments) {
-    let Arguments {
-        posonlyargs,
-        args,
-        vararg,
-        kwonlyargs,
-        kwarg,
-        ..
-    } = node;
-    let mut positional_defaults = Vec::new();
-    for arg in posonlyargs.into_iter().chain(args) {
-        visitor.visit_arg(arg.def);
-        if let Some(default) = arg.default {
-            positional_defaults.push(*default);
-        }
-    }
-    if let Some(vararg) = vararg {
-        visitor.visit_arg(*vararg);
-    }
-    let mut kw_defaults = Vec::new();
-    for arg in kwonlyargs {
-        visitor.visit_arg(arg.def);
-        if let Some(default) = arg.default {
-            kw_defaults.push(*default);
-        }
-    }
-    for default in kw_defaults {
-        visitor.visit_expr(default);
-    }
-    if let Some(kwarg) = kwarg {
-        visitor.visit_arg(*kwarg);
-    }
-    for default in positional_defaults {
-        visitor.visit_expr(default);
-    }
-}
-
-impl<'a> Visitor for MagicNumberVisitor<'a> {
-    fn visit_stmt(&mut self, node: Stmt) {
-        self.depth += 1;
-        self.generic_visit_stmt(node);
-        self.depth -= 1;
-    }
-    fn visit_expr(&mut self, node: Expr) {
-        self.depth += 1;
-        self.generic_visit_expr(node);
-        self.depth -= 1;
-    }
-    // A nested def's/lambda's signature *is* walked — Python's `ast.walk`
-    // over an enclosing body statement descends into it (the enclosing
-    // function's own signature isn't: `check_magic_numbers` only feeds this
-    // visitor `func.body`, like the original).
-    fn visit_arguments(&mut self, node: Arguments) {
-        self.depth += 1;
-        walk_arguments_in_ast_order(self, node);
-        self.depth -= 1;
-    }
-    fn visit_arg(&mut self, node: rustpython_ast::Arg) {
-        self.depth += 1;
-        if let Some(annotation) = node.annotation {
-            self.visit_expr(*annotation);
-        }
-        self.depth -= 1;
-    }
-    // A literal passed directly as `name=<literal>` (e.g. `stacklevel=2`) is
-    // already documented by the keyword name the same way a named constant
-    // would document it — skip only that direct value, but still walk into
-    // non-literal values so a magic number nested inside one (e.g.
-    // `timeout=compute(30)`) is still caught.
-    fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
-        if !matches!(node.value, Expr::Constant(_)) {
-            self.depth += 1;
-            self.visit_expr(node.value);
-            self.depth -= 1;
-        }
-    }
-    fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-        self.depth += 1;
-        walk_comprehension_children(self, node);
-        self.depth -= 1;
-    }
-    fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
-        self.depth += 1;
-        walk_withitem_children(self, node);
-        self.depth -= 1;
-    }
-    fn visit_excepthandler(&mut self, node: rustpython_ast::ExceptHandler) {
-        self.depth += 1;
-        self.generic_visit_excepthandler(node);
-        self.depth -= 1;
-    }
-    fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
-        self.depth += 1;
-        self.visit_pattern(node.pattern);
-        if let Some(guard) = node.guard {
-            self.visit_expr(*guard);
-        }
-        for stmt in node.body {
-            self.visit_stmt(stmt);
-        }
-        self.depth -= 1;
-    }
-    fn visit_pattern(&mut self, node: rustpython_ast::Pattern) {
-        self.depth += 1;
-        self.generic_visit_pattern(node);
-        self.depth -= 1;
-    }
-    fn visit_type_param(&mut self, node: rustpython_ast::TypeParam) {
-        self.depth += 1;
-        self.generic_visit_type_param(node);
-        self.depth -= 1;
-    }
-    fn visit_expr_constant(&mut self, node: rustpython_ast::ExprConstant) {
-        if let Some((allowed, repr)) = format_number_for_magic_check(&node.value)
-            && !allowed
-        {
-            let display = source_segment(self.source, node.range()).unwrap_or(&repr);
-            self.distinct.insert(display.to_string());
-            self.found.push((
-                self.depth,
-                issue_at(
-                    self.filepath,
-                    self.line_index,
-                    node.range(),
-                    Severity::Info,
-                    "magic-number",
-                    self.package,
-                    format!(
-                        "magic number {display} — extract to a named constant, or an \
-                         enum.IntEnum if it's one of a fixed set of status/category codes"
-                    ),
-                ),
-            ));
-        }
-    }
-}
-
+/// Mirrors Python's `for stmt in func.body: for child in ast.walk(stmt)`
+/// (breadth-first per body statement), skipping a literal that is directly
+/// some call keyword's value anywhere in the body (`stacklevel=2`).
 pub fn check_magic_numbers(
     module: &Mod,
     source: &str,
@@ -1922,28 +1566,48 @@ pub fn check_magic_numbers(
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     let mut distinct: HashSet<String> = HashSet::new();
-    for func in collect_functions(module_body(module)) {
-        if func.name == "__init__" {
+    for node in walk_module(module_body(module)) {
+        let (name, body) = match node {
+            Node::Stmt(Stmt::FunctionDef(f)) => (f.name.as_str(), &f.body),
+            Node::Stmt(Stmt::AsyncFunctionDef(f)) => (f.name.as_str(), &f.body),
+            _ => continue,
+        };
+        if name == "__init__" {
             continue;
         }
-        // Only the body — never the function's own signature, decorators or
-        // return annotation (a default like `base_delay: float = 0.5` is
-        // already named by its parameter). Each top-level statement is its
-        // own `ast.walk`, so candidates are ordered per statement.
-        for stmt in func.body() {
-            let mut visitor = MagicNumberVisitor {
-                line_index: &line_index,
-                source,
-                filepath,
-                package,
-                depth: 0,
-                found: Vec::new(),
-                distinct: HashSet::new(),
+        let walks: Vec<Vec<Node<'_>>> = body.iter().map(|s| walk(Node::Stmt(s))).collect();
+        let keyword_values: HashSet<*const Expr> = walks
+            .iter()
+            .flatten()
+            .filter_map(|n| match n {
+                Node::Keyword(k) => Some(&k.value as *const Expr),
+                _ => None,
+            })
+            .collect();
+        for child in walks.iter().flatten() {
+            let Node::Expr(expr @ Expr::Constant(c)) = child else {
+                continue;
             };
-            visitor.visit_stmt(stmt.clone());
-            visitor.found.sort_by_key(|(depth, _)| *depth);
-            issues.extend(visitor.found.into_iter().map(|(_, issue)| issue));
-            distinct.extend(visitor.distinct);
+            let Some((allowed, repr)) = format_number_for_magic_check(&c.value) else {
+                continue;
+            };
+            if allowed || keyword_values.contains(&(*expr as *const Expr)) {
+                continue;
+            }
+            let display = source_segment(source, c.range()).unwrap_or(&repr);
+            distinct.insert(display.to_string());
+            issues.push(issue_at(
+                filepath,
+                &line_index,
+                c.range(),
+                Severity::Info,
+                "magic-number",
+                package,
+                format!(
+                    "magic number {display} — extract to a named constant, or an \
+                     enum.IntEnum if it's one of a fixed set of status/category codes"
+                ),
+            ));
         }
     }
     if distinct.len() >= MAGIC_NUMBER_DENSE_FILE_MIN_DISTINCT {
@@ -2042,34 +1706,6 @@ fn magic_string_comparison(
     }
 }
 
-#[derive(Default)]
-struct MagicStringVisitor {
-    comparisons: Vec<(String, rustpython_ast::text_size::TextSize)>,
-}
-impl Visitor for MagicStringVisitor {
-    fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-        walk_comprehension_children(self, node);
-    }
-    fn visit_arguments(&mut self, node: Arguments) {
-        walk_arguments_children(self, node);
-    }
-    fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
-        walk_keyword_children(self, node);
-    }
-    fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
-        walk_withitem_children(self, node);
-    }
-    fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
-        walk_match_case_children(self, node);
-    }
-    fn visit_expr_compare(&mut self, node: rustpython_ast::ExprCompare) {
-        if let Some(result) = magic_string_comparison(&node) {
-            self.comparisons.push(result);
-        }
-        self.generic_visit_expr_compare(node);
-    }
-}
-
 /// Skipped entirely for test files: a value compared twice in one test
 /// function is normal arrange-then-assert structure, not a sign of a
 /// missing domain concept.
@@ -2083,18 +1719,21 @@ pub fn check_magic_strings(
         return Vec::new();
     }
     let line_index = LineIndex::new(source);
-    let mut visitor = MagicStringVisitor::default();
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
-    }
+    let comparisons: Vec<(String, rustpython_ast::text_size::TextSize)> =
+        walk_module(module_body(module))
+            .into_iter()
+            .filter_map(|node| match node {
+                Node::Expr(Expr::Compare(c)) => magic_string_comparison(c),
+                _ => None,
+            })
+            .collect();
 
     let mut counts: HashMap<&str, usize> = HashMap::new();
-    for (value, _) in &visitor.comparisons {
+    for (value, _) in &comparisons {
         *counts.entry(value.as_str()).or_insert(0) += 1;
     }
 
-    visitor
-        .comparisons
+    comparisons
         .iter()
         .filter(|(value, _)| counts[value.as_str()] >= MIN_MAGIC_STRING_OCCURRENCES)
         .map(|(value, pos)| {
@@ -2117,87 +1756,44 @@ pub fn check_magic_strings(
 
 // ── Rule: Untyped Dict ────────────────────────────────────────────────────────
 //
-// Mirrors Python's two-stage walk: collect every annotation expression in
-// the module (return annotations, param annotations, `AnnAssign`
-// annotations — deliberately not `TypeAlias`, a rare Python 3.12+ form
-// Python's own check only reaches via `getattr(ast, "TypeAlias", ...)`
-// defensively; skipped here too), then scan each one for a bare `dict`
-// (a `Name("dict")` not already inside a `dict[...]` subscript's own head).
+// Mirrors Python's walk exactly: every node of `ast.walk(tree)` (breadth
+// first — the order findings are emitted and fingerprinted in) that carries
+// a type expression (return, parameter, `AnnAssign`, `type X = ...`), each
+// scanned pre-order for a bare `dict`. Python 3.13 has `ast.TypeAlias`, so
+// `type X = dict` is checked too.
 
-#[derive(Default)]
-struct AnnotationCollector {
-    annotations: Vec<Expr>,
-}
-impl Visitor for AnnotationCollector {
-    fn visit_stmt_function_def(&mut self, node: rustpython_ast::StmtFunctionDef) {
-        if let Some(r) = &node.returns {
-            self.annotations.push((**r).clone());
-        }
-        self.generic_visit_stmt_function_def(node);
-    }
-    fn visit_stmt_async_function_def(&mut self, node: rustpython_ast::StmtAsyncFunctionDef) {
-        if let Some(r) = &node.returns {
-            self.annotations.push((**r).clone());
-        }
-        self.generic_visit_stmt_async_function_def(node);
-    }
-    fn visit_stmt_ann_assign(&mut self, node: rustpython_ast::StmtAnnAssign) {
-        self.annotations.push((*node.annotation).clone());
-        self.generic_visit_stmt_ann_assign(node);
-    }
-    fn visit_arguments(&mut self, node: Arguments) {
-        for arg in node
-            .posonlyargs
-            .iter()
-            .chain(&node.args)
-            .chain(&node.kwonlyargs)
-        {
-            if let Some(annotation) = &arg.def.annotation {
-                self.annotations.push((**annotation).clone());
-            }
-        }
-        if let Some(vararg) = &node.vararg
-            && let Some(annotation) = &vararg.annotation
-        {
-            self.annotations.push((**annotation).clone());
-        }
-        if let Some(kwarg) = &node.kwarg
-            && let Some(annotation) = &kwarg.annotation
-        {
-            self.annotations.push((**annotation).clone());
-        }
-        walk_arguments_children(self, node);
-    }
-    fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-        walk_comprehension_children(self, node);
+/// The type expression a node carries — mirrors `_annotation_of`.
+fn annotation_of(node: Node<'_>) -> Option<&Expr> {
+    match node {
+        Node::Stmt(Stmt::FunctionDef(f)) => f.returns.as_deref(),
+        Node::Stmt(Stmt::AsyncFunctionDef(f)) => f.returns.as_deref(),
+        Node::Arg(a) => a.annotation.as_deref(),
+        Node::Stmt(Stmt::AnnAssign(a)) => Some(&a.annotation),
+        Node::Stmt(Stmt::TypeAlias(t)) => Some(&t.value),
+        _ => None,
     }
 }
 
-#[derive(Default)]
-struct BareDictScanner {
-    names: Vec<TextRange>,
-}
-impl Visitor for BareDictScanner {
-    fn visit_expr_subscript(&mut self, node: rustpython_ast::ExprSubscript) {
-        if let Expr::Name(n) = node.value.as_ref()
+/// Every `dict` name in `annotation` that is not the head of a `dict[...]`
+/// subscript — mirrors `_bare_dict_names` (a pre-order walk).
+fn bare_dict_names(annotation: &Expr) -> Vec<TextRange> {
+    let mut found = Vec::new();
+    let mut stack = vec![Node::Expr(annotation)];
+    while let Some(node) = stack.pop() {
+        if let Node::Expr(Expr::Subscript(sub)) = node
+            && matches!(sub.value.as_ref(), Expr::Name(n) if n.id.as_str() == "dict")
+        {
+            stack.push(Node::Expr(&sub.slice));
+            continue;
+        }
+        if let Node::Expr(Expr::Name(n)) = node
             && n.id.as_str() == "dict"
         {
-            self.visit_expr(*node.slice);
-            return;
+            found.push(n.range());
         }
-        self.generic_visit_expr_subscript(node);
+        stack.extend(node.children().into_iter().rev());
     }
-    fn visit_expr_name(&mut self, node: rustpython_ast::ExprName) {
-        if node.id.as_str() == "dict" {
-            self.names.push(node.range());
-        }
-    }
-    fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-        walk_comprehension_children(self, node);
-    }
-    fn visit_arguments(&mut self, node: Arguments) {
-        walk_arguments_children(self, node);
-    }
+    found
 }
 
 pub fn check_untyped_dicts(
@@ -2207,25 +1803,20 @@ pub fn check_untyped_dicts(
     package: &str,
 ) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
-    let mut collector = AnnotationCollector::default();
-    for stmt in module_body(module) {
-        collector.visit_stmt(stmt.clone());
-    }
-
-    let mut scanner = BareDictScanner::default();
-    for annotation in collector.annotations {
-        scanner.visit_expr(annotation);
-    }
-
     // Python dedups with `{(i.line, i.rule): i for i in issues}` — one issue
     // per line, and the *last* bare `dict` on that line wins (so its
     // location is that name's), in first-seen line order.
     let mut by_line: Vec<(usize, TextRange)> = Vec::new();
-    for range in scanner.names {
-        let line = line_index.line_number(range.start());
-        match by_line.iter_mut().find(|(l, _)| *l == line) {
-            Some(slot) => slot.1 = range,
-            None => by_line.push((line, range)),
+    for node in walk_module(module_body(module)) {
+        let Some(annotation) = annotation_of(node) else {
+            continue;
+        };
+        for range in bare_dict_names(annotation) {
+            let line = line_index.line_number(range.start());
+            match by_line.iter_mut().find(|(l, _)| *l == line) {
+                Some(slot) => slot.1 = range,
+                None => by_line.push((line, range)),
+            }
         }
     }
 
@@ -2250,33 +1841,6 @@ pub fn check_untyped_dicts(
 
 // ── Rule: Duplicate If/Else Branches ─────────────────────────────────────────
 
-struct DuplicateBranchVisitor<'a> {
-    line_index: &'a LineIndex,
-    filepath: &'a Path,
-    package: &'a str,
-    issues: Vec<Issue>,
-}
-impl<'a> Visitor for DuplicateBranchVisitor<'a> {
-    fn visit_stmt_if(&mut self, node: rustpython_ast::StmtIf) {
-        let skip = node.orelse.is_empty()
-            || (node.orelse.len() == 1 && matches!(node.orelse[0], Stmt::If(_)))
-            || node.body.is_empty();
-        if !skip && dump_stmts(&node.body) == dump_stmts(&node.orelse) {
-            self.issues.push(issue_at(
-                self.filepath,
-                self.line_index,
-                node.range(),
-                Severity::Warning,
-                "duplicate-branch",
-                self.package,
-                "if/else branches are structurally identical — the condition has no effect"
-                    .to_string(),
-            ));
-        }
-        self.generic_visit_stmt_if(node);
-    }
-}
-
 pub fn check_duplicate_branches(
     module: &Mod,
     source: &str,
@@ -2284,16 +1848,28 @@ pub fn check_duplicate_branches(
     package: &str,
 ) -> Vec<Issue> {
     let line_index = LineIndex::new(source);
-    let mut visitor = DuplicateBranchVisitor {
-        line_index: &line_index,
-        filepath,
-        package,
-        issues: Vec::new(),
-    };
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
+    let mut issues = Vec::new();
+    for node in walk_module(module_body(module)) {
+        let Node::Stmt(Stmt::If(node)) = node else {
+            continue;
+        };
+        let skip = node.orelse.is_empty()
+            || (node.orelse.len() == 1 && matches!(node.orelse[0], Stmt::If(_)))
+            || node.body.is_empty();
+        if !skip && dump_stmts(&node.body) == dump_stmts(&node.orelse) {
+            issues.push(issue_at(
+                filepath,
+                &line_index,
+                node.range(),
+                Severity::Warning,
+                "duplicate-branch",
+                package,
+                "if/else branches are structurally identical — the condition has no effect"
+                    .to_string(),
+            ));
+        }
     }
-    visitor.issues
+    issues
 }
 
 // ── Rule: Encapsulation Violations ───────────────────────────────────────────
@@ -2304,11 +1880,11 @@ pub fn check_duplicate_branches(
 // class's own name/`super()`.
 
 /// The name of *args*'s first positional parameter, if any.
-fn first_param_name(args: &Arguments) -> Option<String> {
+fn first_param_name(args: &Arguments) -> Option<&str> {
     args.posonlyargs
         .first()
         .or_else(|| args.args.first())
-        .map(|a| a.def.arg.to_string())
+        .map(|a| a.def.arg.as_str())
 }
 
 /// True if *base* is `self`/`cls`/the enclosing class/`super()`, or the
@@ -2390,100 +1966,6 @@ fn reflective_private_access<'a>(
     Some((fname, attr_name.as_str()))
 }
 
-struct EncapsulationVisitor<'a> {
-    line_index: &'a LineIndex,
-    filepath: &'a Path,
-    package: &'a str,
-    class_stack: Vec<String>,
-    first_param_stack: Vec<Option<String>>,
-    /// Class name → the `self._x` attributes its own methods assign.
-    own_private_attrs: HashMap<String, HashSet<String>>,
-    issues: Vec<Issue>,
-}
-impl<'a> EncapsulationVisitor<'a> {
-    fn current_class(&self) -> Option<&str> {
-        self.class_stack.last().map(|s| s.as_str())
-    }
-    fn current_first_param(&self) -> Option<&str> {
-        self.first_param_stack.last().and_then(|p| p.as_deref())
-    }
-}
-impl<'a> Visitor for EncapsulationVisitor<'a> {
-    fn visit_stmt_class_def(&mut self, node: rustpython_ast::StmtClassDef) {
-        self.class_stack.push(node.name.to_string());
-        self.generic_visit_stmt_class_def(node);
-        self.class_stack.pop();
-    }
-    fn visit_stmt_function_def(&mut self, node: rustpython_ast::StmtFunctionDef) {
-        self.first_param_stack.push(first_param_name(&node.args));
-        self.generic_visit_stmt_function_def(node);
-        self.first_param_stack.pop();
-    }
-    fn visit_stmt_async_function_def(&mut self, node: rustpython_ast::StmtAsyncFunctionDef) {
-        self.first_param_stack.push(first_param_name(&node.args));
-        self.generic_visit_stmt_async_function_def(node);
-        self.first_param_stack.pop();
-    }
-    fn visit_expr_attribute(&mut self, node: rustpython_ast::ExprAttribute) {
-        if let Some(attr) =
-            direct_private_access(&node, self.current_class(), self.current_first_param())
-        {
-            // `other._x` inside class C where C itself assigns `self._x`:
-            // the same class reaching into another instance of itself
-            // (`__eq__`, `merge`, `copy`) is not an encapsulation break.
-            let own = self
-                .current_class()
-                .and_then(|c| self.own_private_attrs.get(c))
-                .is_some_and(|attrs| attrs.contains(attr));
-            if own {
-                self.generic_visit_expr_attribute(node);
-                return;
-            }
-            self.issues.push(issue_at(
-                self.filepath,
-                self.line_index,
-                node.range(),
-                Severity::Info,
-                "encapsulation-violation",
-                self.package,
-                format!("Accesses private member '.{attr}' through something other than self/cls"),
-            ));
-        }
-        self.generic_visit_expr_attribute(node);
-    }
-    fn visit_expr_call(&mut self, node: rustpython_ast::ExprCall) {
-        if let Some((fname, attr_name)) =
-            reflective_private_access(&node, self.current_class(), self.current_first_param())
-        {
-            self.issues.push(issue_at(
-                self.filepath,
-                self.line_index,
-                node.range(),
-                Severity::Info,
-                "encapsulation-violation",
-                self.package,
-                format!("{fname}(..., '{attr_name}', ...) reaches into a private attribute"),
-            ));
-        }
-        self.generic_visit_expr_call(node);
-    }
-    fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-        walk_comprehension_children(self, node);
-    }
-    fn visit_arguments(&mut self, node: Arguments) {
-        walk_arguments_children(self, node);
-    }
-    fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
-        walk_keyword_children(self, node);
-    }
-    fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
-        walk_withitem_children(self, node);
-    }
-    fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
-        walk_match_case_children(self, node);
-    }
-}
-
 pub fn check_encapsulation_violations(
     module: &Mod,
     source: &str,
@@ -2502,19 +1984,73 @@ pub fn check_encapsulation_violations(
             .collect();
         own_private_attrs.insert(class.name.to_string(), self_attrs_assigned(&methods));
     }
-    let mut visitor = EncapsulationVisitor {
-        line_index: &line_index,
-        filepath,
-        package,
-        class_stack: Vec::new(),
-        first_param_stack: Vec::new(),
-        own_private_attrs,
-        issues: Vec::new(),
-    };
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
+
+    // `_walk_with_encapsulation_context`: pre-order, each node paired with
+    // its *parent's* enclosing class and function first-parameter name.
+    let mut issues = Vec::new();
+    let mut stack: Vec<(Node<'_>, Option<&str>, Option<&str>)> = module_body(module)
+        .iter()
+        .rev()
+        .map(|s| (Node::Stmt(s), None, None))
+        .collect();
+    while let Some((node, class_name, first_param)) = stack.pop() {
+        match node {
+            Node::Expr(Expr::Attribute(attr_node)) => {
+                if let Some(attr) = direct_private_access(attr_node, class_name, first_param) {
+                    // `other._x` inside class C where C itself assigns `self._x`:
+                    // the same class reaching into another instance of itself
+                    // (`__eq__`, `merge`, `copy`) is not an encapsulation break.
+                    let own = class_name
+                        .and_then(|c| own_private_attrs.get(c))
+                        .is_some_and(|attrs| attrs.contains(attr));
+                    if !own {
+                        issues.push(issue_at(
+                            filepath,
+                            &line_index,
+                            attr_node.range(),
+                            Severity::Info,
+                            "encapsulation-violation",
+                            package,
+                            format!(
+                                "Accesses private member '.{attr}' through something other than self/cls"
+                            ),
+                        ));
+                    }
+                }
+            }
+            Node::Expr(Expr::Call(call)) => {
+                if let Some((fname, attr_name)) =
+                    reflective_private_access(call, class_name, first_param)
+                {
+                    issues.push(issue_at(
+                        filepath,
+                        &line_index,
+                        call.range(),
+                        Severity::Info,
+                        "encapsulation-violation",
+                        package,
+                        format!(
+                            "{fname}(..., '{attr_name}', ...) reaches into a private attribute"
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        let (child_class, child_param) = match node {
+            Node::Stmt(Stmt::ClassDef(c)) => (Some(c.name.as_str()), first_param),
+            Node::Stmt(Stmt::FunctionDef(f)) => (class_name, first_param_name(&f.args)),
+            Node::Stmt(Stmt::AsyncFunctionDef(f)) => (class_name, first_param_name(&f.args)),
+            _ => (class_name, first_param),
+        };
+        stack.extend(
+            node.children()
+                .into_iter()
+                .rev()
+                .map(|c| (c, child_class, child_param)),
+        );
     }
-    visitor.issues
+    issues
 }
 
 // ── Rule: God Class ───────────────────────────────────────────────────────────
@@ -2522,58 +2058,34 @@ pub fn check_encapsulation_violations(
 /// Every `self.<attr> = ...` target across `methods` — mirrors
 /// `_self_attrs_assigned`.
 fn self_attrs_assigned(methods: &[&Stmt]) -> HashSet<String> {
-    struct SelfAttrVisitor {
-        attrs: HashSet<String>,
-    }
-    impl Visitor for SelfAttrVisitor {
-        fn visit_expr_attribute(&mut self, node: rustpython_ast::ExprAttribute) {
-            if matches!(node.ctx, rustpython_ast::ExprContext::Store)
-                && matches!(node.value.as_ref(), Expr::Name(n) if n.id.as_str() == "self")
-            {
-                self.attrs.insert(node.attr.to_string());
-            }
-            self.generic_visit_expr_attribute(node);
-        }
-        fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-            walk_comprehension_children(self, node);
-        }
-        fn visit_arguments(&mut self, node: Arguments) {
-            walk_arguments_children(self, node);
-        }
-        fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
-            walk_keyword_children(self, node);
-        }
-        fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
-            walk_withitem_children(self, node);
-        }
-        fn visit_match_case(&mut self, node: rustpython_ast::MatchCase) {
-            walk_match_case_children(self, node);
-        }
-    }
-    let mut visitor = SelfAttrVisitor {
-        attrs: HashSet::new(),
-    };
+    let mut attrs = HashSet::new();
     for method in methods {
-        visitor.visit_stmt((*method).clone());
+        for node in walk(Node::Stmt(method)) {
+            if let Node::Expr(Expr::Attribute(a)) = node
+                && matches!(a.ctx, rustpython_ast::ExprContext::Store)
+                && matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == "self")
+            {
+                attrs.insert(a.attr.to_string());
+            }
+        }
     }
-    visitor.attrs
+    attrs
 }
 
-struct GodClassVisitor<'a> {
-    line_index: &'a LineIndex,
-    filepath: &'a Path,
-    package: &'a str,
-    issues: Vec<Issue>,
-}
-impl<'a> Visitor for GodClassVisitor<'a> {
-    fn visit_stmt_class_def(&mut self, node: rustpython_ast::StmtClassDef) {
-        let Thresholds {
-            max_class_methods,
-            max_class_attrs,
-            max_class_wmc,
-            error_escalation_multiplier,
-            ..
-        } = thresholds();
+pub fn check_god_class(module: &Mod, source: &str, filepath: &Path, package: &str) -> Vec<Issue> {
+    let line_index = LineIndex::new(source);
+    let Thresholds {
+        max_class_methods,
+        max_class_attrs,
+        max_class_wmc,
+        error_escalation_multiplier,
+        ..
+    } = thresholds();
+    let mut issues = Vec::new();
+    for node in walk_module(module_body(module)) {
+        let Node::Stmt(Stmt::ClassDef(node)) = node else {
+            continue;
+        };
         let methods: Vec<&Stmt> = node
             .body
             .iter()
@@ -2584,13 +2096,7 @@ impl<'a> Visitor for GodClassVisitor<'a> {
 
         let wmc: i64 = methods
             .iter()
-            .map(|m| {
-                cyclomatic_complexity(&FuncNode {
-                    name: String::new(),
-                    start: m.range().start(),
-                    stmt: (*m).clone(),
-                })
-            })
+            .map(|m| crate::metrics::cyclomatic_complexity(function_body(m)))
             .sum();
 
         if methods.len() > max_class_methods || attrs.len() > max_class_attrs || wmc > max_class_wmc
@@ -2604,13 +2110,13 @@ impl<'a> Visitor for GodClassVisitor<'a> {
             } else {
                 Severity::Warning
             };
-            self.issues.push(issue_at(
-                self.filepath,
-                self.line_index,
+            issues.push(issue_at(
+                filepath,
+                &line_index,
                 node.range(),
                 severity,
                 "god-class",
-                self.package,
+                package,
                 format!(
                     "class {} has {} methods, {} attributes, and total complexity (WMC) {} (max {max_class_methods}/{max_class_attrs}/{max_class_wmc}) — consider splitting responsibilities",
                     node.name,
@@ -2620,22 +2126,17 @@ impl<'a> Visitor for GodClassVisitor<'a> {
                 ),
             ));
         }
-        self.generic_visit_stmt_class_def(node);
     }
+    issues
 }
 
-pub fn check_god_class(module: &Mod, source: &str, filepath: &Path, package: &str) -> Vec<Issue> {
-    let line_index = LineIndex::new(source);
-    let mut visitor = GodClassVisitor {
-        line_index: &line_index,
-        filepath,
-        package,
-        issues: Vec::new(),
-    };
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
+/// The body of a `def`/`async def` statement.
+fn function_body(stmt: &Stmt) -> &[Stmt] {
+    match stmt {
+        Stmt::FunctionDef(f) => &f.body,
+        Stmt::AsyncFunctionDef(f) => &f.body,
+        _ => &[],
     }
-    visitor.issues
 }
 
 // ── Rule: Layer Violations ───────────────────────────────────────────────────
@@ -2661,45 +2162,33 @@ pub fn check_layer_violations(
     let rel_path_str = rel_path.to_string_lossy();
     let line_index = LineIndex::new(source);
 
-    struct ImportedModuleVisitor {
-        imports: Vec<(String, TextRange)>,
-    }
-    impl Visitor for ImportedModuleVisitor {
-        fn visit_stmt_import(&mut self, node: rustpython_ast::StmtImport) {
-            if let Some(alias) = node.names.first() {
-                self.imports.push((alias.name.to_string(), node.range()));
-            }
-        }
-        fn visit_stmt_import_from(&mut self, node: rustpython_ast::StmtImportFrom) {
-            // A bare relative import (`from . import x`) has no module: Python
-            // records it as the empty string, which only a `""` prefix matches.
-            let module = node.module.as_ref().map(|m| m.to_string());
-            self.imports
-                .push((module.unwrap_or_default(), node.range()));
-        }
-    }
-    let mut collector = ImportedModuleVisitor {
-        imports: Vec::new(),
-    };
-    for stmt in module_body(module) {
-        collector.visit_stmt(stmt.clone());
+    let forbidden: Vec<&String> = rules
+        .iter()
+        .filter(|(pattern, _)| rel_path_str.starts_with(pattern.as_str()))
+        .flat_map(|(_, prefixes)| prefixes.iter())
+        .collect();
+    if forbidden.is_empty() {
+        return Vec::new();
     }
 
     let mut issues = Vec::new();
-    for (pattern, forbidden_prefixes) in &rules {
-        if !rel_path_str.starts_with(pattern.as_str()) {
-            continue;
-        }
-        for (imported, range) in &collector.imports {
-            // One issue per matching prefix, like the Python loop.
-            for _prefix in forbidden_prefixes
-                .iter()
-                .filter(|prefix| imported.starts_with(prefix.as_str()))
-            {
+    for node in walk_module(module_body(module)) {
+        // `_imported_module`: the first alias for `import a, b`; a bare
+        // relative import (`from . import x`) names the empty string.
+        let (imported, range) = match node {
+            Node::Stmt(Stmt::ImportFrom(i)) => (i.module.as_deref().unwrap_or(""), i.range()),
+            Node::Stmt(Stmt::Import(i)) => (
+                i.names.first().map(|a| a.name.as_str()).unwrap_or(""),
+                i.range(),
+            ),
+            _ => continue,
+        };
+        for prefix in &forbidden {
+            if imported.starts_with(prefix.as_str()) {
                 issues.push(issue_at(
                     filepath,
                     &line_index,
-                    *range,
+                    range,
                     Severity::Error,
                     "layer-violation",
                     package,
@@ -2733,47 +2222,34 @@ pub fn check_transport_in_library(
     }
     let line_index = LineIndex::new(source);
 
-    struct TransportVisitor<'a> {
-        line_index: &'a LineIndex,
-        filepath: &'a Path,
-        package: &'a str,
-        issues: Vec<Issue>,
-    }
-    impl<'a> Visitor for TransportVisitor<'a> {
-        fn visit_stmt_import_from(&mut self, node: rustpython_ast::StmtImportFrom) {
-            if let Some(module) = &node.module {
-                let top = module.split('.').next().unwrap_or("");
-                if TRANSPORT_MODULES.contains(&top) {
-                    self.issues.push(issue_at(
-                        self.filepath,
-                        self.line_index,
-                        node.range(),
-                        Severity::Error,
-                        "transport-in-library",
-                        self.package,
-                        format!(
-                            "Library imports transport module '{top}' — violates G9; depend \
-                             on an abstraction (e.g. a typing.Protocol) instead of the \
-                             concrete transport, injected as a parameter rather than \
-                             imported directly (Dependency Inversion Principle / \
-                             Dependency Injection)"
-                        ),
-                    ));
-                }
-            }
-            self.generic_visit_stmt_import_from(node);
+    let mut issues = Vec::new();
+    for node in walk_module(module_body(module)) {
+        let Node::Stmt(Stmt::ImportFrom(node)) = node else {
+            continue;
+        };
+        let Some(module) = node.module.as_deref().filter(|m| !m.is_empty()) else {
+            continue;
+        };
+        let top = module.split('.').next().unwrap_or("");
+        if TRANSPORT_MODULES.contains(&top) {
+            issues.push(issue_at(
+                filepath,
+                &line_index,
+                node.range(),
+                Severity::Error,
+                "transport-in-library",
+                package,
+                format!(
+                    "Library imports transport module '{top}' — violates G9; depend \
+                     on an abstraction (e.g. a typing.Protocol) instead of the \
+                     concrete transport, injected as a parameter rather than \
+                     imported directly (Dependency Inversion Principle / \
+                     Dependency Injection)"
+                ),
+            ));
         }
     }
-    let mut visitor = TransportVisitor {
-        line_index: &line_index,
-        filepath,
-        package,
-        issues: Vec::new(),
-    };
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
-    }
-    visitor.issues
+    issues
 }
 
 // ── Rule: Circular Imports (per-file heuristic) ──────────────────────────────
@@ -2799,9 +2275,9 @@ pub fn check_circular_imports(
     let line_index = LineIndex::new(source);
 
     let mut issues = Vec::new();
-    for stmt in module_body(module) {
-        if let Stmt::ImportFrom(node) = stmt
-            && let Some(module_name) = &node.module
+    for node in walk_module(module_body(module)) {
+        if let Node::Stmt(Stmt::ImportFrom(node)) = node
+            && let Some(module_name) = node.module.as_deref().filter(|m| !m.is_empty())
         {
             let imp_parts: Vec<&str> = module_name.split('.').collect();
             if imp_parts.len() < parts.len()
@@ -2972,26 +2448,12 @@ pub fn check_deep_inheritance(
     let max_inheritance_depth = thresholds().max_inheritance_depth;
     let line_index = LineIndex::new(source);
 
-    // Python's version uses ast.walk(tree), which finds ClassDefs at any
-    // nesting level (module-level, inside functions, inside other classes),
-    // not just module-level ones — mirror that with an explicit recursive
-    // collection rather than relying on `collect_functions`-style tooling,
-    // since this needs ClassDefs specifically, not FunctionDefs.
-    fn collect_all_classes<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a str, &'a [Expr], TextRange)>) {
-        for stmt in stmts {
-            match stmt {
-                Stmt::ClassDef(c) => {
-                    out.push((c.name.as_str(), c.bases.as_slice(), c.range()));
-                    collect_all_classes(&c.body, out);
-                }
-                Stmt::FunctionDef(f) => collect_all_classes(&f.body, out),
-                Stmt::AsyncFunctionDef(f) => collect_all_classes(&f.body, out),
-                _ => {}
-            }
-        }
-    }
-    let mut all_classes_full = Vec::new();
-    collect_all_classes(module_body(module), &mut all_classes_full);
+    // Every ClassDef at any nesting level, in `ast.walk` order.
+    let all_classes_full: Vec<(&str, &[Expr], TextRange)> =
+        collect_classes_bfs(module_body(module))
+            .into_iter()
+            .map(|c| (c.name.as_str(), c.bases.as_slice(), c.range()))
+            .collect();
 
     // Indexed once so the BFS below does O(1) name lookups instead of
     // re-scanning every class in the module for each ancestor it discovers.
@@ -3041,97 +2503,36 @@ pub fn check_deep_inheritance(
 
 // ── Rule: Message Chains ──────────────────────────────────────────────────────
 //
-// The one rule in this port that genuinely depends on `ast.walk()`'s actual
-// traversal *order*, not just its coverage: Python scans each top-level
-// statement's subtree via `ast.walk` (confirmed from CPython's source: a
-// `deque`-based breadth-first walk) for the *first* Call/Attribute chain
-// exceeding the threshold, then `break`s — so at most one issue per
-// top-level statement, and *which* over-threshold chain gets reported (when
-// a subtree has more than one) depends on BFS proximity to the statement
-// root, not depth-first discovery order.
-//
-// Rather than hand-roll a real BFS queue over a node type this crate has no
-// generic "any node" representation for, this exploits a provable
-// equivalence: stable-sorting a depth-first-discovered node list by
-// "distance from root" reproduces exact BFS order (verified by hand on
-// small trees — whenever two nodes share a depth, DFS preorder and BFS
-// agree on their relative order, because DFS visits an entire subtree
-// before its next sibling, which is the same order BFS's queue processes
-// same-depth nodes in). So: one DFS pass (using the same `Visitor`
-// machinery as every other rule, including the comprehension/arguments/
-// keyword/withitem gap-fixes from §7.6, so hidden chains are still found)
-// records `(depth, chain_depth, position)` for every Call/Attribute;
-// stable-sorting by `depth` then taking the first over-threshold entry
-// gives the same answer `ast.walk` + `break` would.
-struct MessageChainVisitor {
-    current_depth: usize,
-    candidates: Vec<(usize, i64, TextRange, Option<String>)>,
-}
+// Python scans each top-level statement's subtree with `ast.walk` (breadth
+// first) for the *first* Call/Attribute chain over the threshold whose root
+// is not an imported name, then `break`s — at most one finding per
+// top-level statement, and which one depends on the walk order.
 
-fn chain_depth(expr: &Expr) -> i64 {
-    match expr {
-        Expr::Call(c) => chain_depth(&c.func),
-        Expr::Attribute(a) => 1 + chain_depth(&a.value),
-        _ => 0,
+fn chain_depth(mut expr: &Expr) -> i64 {
+    let mut depth = 0;
+    loop {
+        match expr {
+            Expr::Call(c) => expr = &c.func,
+            Expr::Attribute(a) => {
+                depth += 1;
+                expr = &a.value;
+            }
+            _ => return depth,
+        }
     }
 }
 
 /// The bare name a chain bottoms out at, e.g. `PostgresContainer` for
 /// `PostgresContainer(...).with_bind_ports(...).start()` — None if the
 /// chain bottoms out at anything else (a Subscript, a Constant, ...).
-fn chain_root_name(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Call(c) => chain_root_name(&c.func),
-        Expr::Attribute(a) => chain_root_name(&a.value),
-        Expr::Name(n) => Some(n.id.to_string()),
-        _ => None,
-    }
-}
-
-impl MessageChainVisitor {
-    fn record_if_candidate(&mut self, node: &Expr) {
-        if matches!(node, Expr::Call(_) | Expr::Attribute(_)) {
-            self.candidates.push((
-                self.current_depth,
-                chain_depth(node),
-                node.range(),
-                chain_root_name(node),
-            ));
+fn chain_root_name(mut expr: &Expr) -> Option<&str> {
+    loop {
+        match expr {
+            Expr::Call(c) => expr = &c.func,
+            Expr::Attribute(a) => expr = &a.value,
+            Expr::Name(n) => return Some(n.id.as_str()),
+            _ => return None,
         }
-    }
-}
-
-impl Visitor for MessageChainVisitor {
-    fn visit_stmt(&mut self, node: Stmt) {
-        self.current_depth += 1;
-        self.generic_visit_stmt(node);
-        self.current_depth -= 1;
-    }
-    fn visit_expr(&mut self, node: Expr) {
-        self.record_if_candidate(&node);
-        self.current_depth += 1;
-        self.generic_visit_expr(node);
-        self.current_depth -= 1;
-    }
-    fn visit_comprehension(&mut self, node: rustpython_ast::Comprehension) {
-        self.current_depth += 1;
-        walk_comprehension_children(self, node);
-        self.current_depth -= 1;
-    }
-    fn visit_arguments(&mut self, node: Arguments) {
-        self.current_depth += 1;
-        walk_arguments_children(self, node);
-        self.current_depth -= 1;
-    }
-    fn visit_keyword(&mut self, node: rustpython_ast::Keyword) {
-        self.current_depth += 1;
-        walk_keyword_children(self, node);
-        self.current_depth -= 1;
-    }
-    fn visit_withitem(&mut self, node: rustpython_ast::WithItem) {
-        self.current_depth += 1;
-        walk_withitem_children(self, node);
-        self.current_depth -= 1;
     }
 }
 
@@ -3144,35 +2545,32 @@ pub fn check_message_chains(
     let max_message_chain_depth = thresholds().max_message_chain_depth;
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
-    let imported = collect_imported_names(module);
+    let imported = collect_imported_names(module, &line_index);
 
     for stmt in module_body(module) {
-        let mut visitor = MessageChainVisitor {
-            current_depth: 0,
-            candidates: Vec::new(),
-        };
-        visitor.visit_stmt(stmt.clone());
-
-        // Stable sort by depth == BFS order (see block comment above).
-        visitor.candidates.sort_by_key(|(depth, _, _, _)| *depth);
-        if let Some((_, depth, range, _)) =
-            visitor.candidates.iter().find(|(_, chain_depth, _, root)| {
-                *chain_depth > max_message_chain_depth
-                    && !root.as_deref().is_some_and(|r| imported.contains_key(r))
-            })
-        {
+        for node in walk(Node::Stmt(stmt)) {
+            let Node::Expr(expr @ (Expr::Call(_) | Expr::Attribute(_))) = node else {
+                continue;
+            };
+            let depth = chain_depth(expr);
+            if depth <= max_message_chain_depth {
+                continue;
+            }
+            if chain_root_name(expr).is_some_and(|root| imported.contains_key(root)) {
+                continue;
+            }
             issues.push(issue_at(
                 filepath,
                 &line_index,
-                *range,
+                expr.range(),
                 Severity::Info,
                 "message-chain",
                 package,
                 format!(
-                    "method/attribute chain depth {depth} exceeds {} — split into intermediate variables",
-                    max_message_chain_depth
+                    "method/attribute chain depth {depth} exceeds {max_message_chain_depth} — split into intermediate variables"
                 ),
             ));
+            break;
         }
     }
     issues
@@ -3292,16 +2690,6 @@ struct PassThroughVisitor<'a> {
     package: &'a str,
     issues: Vec<Issue>,
 }
-impl<'a> Visitor for PassThroughVisitor<'a> {
-    fn visit_stmt_function_def(&mut self, node: rustpython_ast::StmtFunctionDef) {
-        self.check(node.name.as_str(), &node.body, node.range());
-        self.generic_visit_stmt_function_def(node);
-    }
-    fn visit_stmt_async_function_def(&mut self, node: rustpython_ast::StmtAsyncFunctionDef) {
-        self.check(node.name.as_str(), &node.body, node.range());
-        self.generic_visit_stmt_async_function_def(node);
-    }
-}
 impl<'a> PassThroughVisitor<'a> {
     fn check(&mut self, name: &str, body: &[Stmt], range: TextRange) {
         // Python's own check here is a plain `startswith("__") and
@@ -3353,8 +2741,14 @@ pub fn check_pass_through_methods(
         package,
         issues: Vec::new(),
     };
-    for stmt in module_body(module) {
-        visitor.visit_stmt(stmt.clone());
+    for node in walk_module(module_body(module)) {
+        match node {
+            Node::Stmt(Stmt::FunctionDef(f)) => visitor.check(f.name.as_str(), &f.body, f.range()),
+            Node::Stmt(Stmt::AsyncFunctionDef(f)) => {
+                visitor.check(f.name.as_str(), &f.body, f.range())
+            }
+            _ => {}
+        }
     }
     visitor.issues
 }
@@ -4430,5 +3824,48 @@ mod calibration_tests {
         let issues = check_scope_mutations(&parse(source), source, Path::new("f.py"), "pkg");
         assert_eq!(issues.len(), 1);
         assert!(issues[0].message.contains("via global"));
+    }
+}
+
+#[cfg(test)]
+mod walk_order_tests {
+    //! Findings come out in `ast.walk` (breadth-first) order, and the node
+    //! kinds counted as nesting are exactly Python's.
+    use super::{check_deep_nesting, check_lazy_class, check_untyped_dicts};
+    use std::path::Path;
+
+    fn lines(
+        check: fn(&rustpython_ast::Mod, &str, &Path, &str) -> Vec<crate::models::Issue>,
+        source: &str,
+    ) -> Vec<usize> {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        check(&module, source, Path::new("f.py"), "pkg")
+            .iter()
+            .map(|i| i.line)
+            .collect()
+    }
+
+    #[test]
+    fn untyped_dict_reports_breadth_first_and_sees_annotated_defaults() {
+        // The module-level AnnAssign (line 3) is shallower than the parameter
+        // annotation of the def on line 1; `Field(default_factory=dict)`
+        // inside `Annotated[...]` counts, as in Python.
+        let source = "def f(a: dict) -> None:\n    pass\nx: dict = {}\n\
+                      y: Annotated[dict[str, int], Field(default_factory=dict)]\n";
+        assert_eq!(lines(check_untyped_dicts, source), vec![3, 4, 1]);
+    }
+
+    #[test]
+    fn lazy_class_reports_nested_classes_after_shallower_ones() {
+        let source = "class A:\n    class Media:\n        pass\n    def m(self):\n        pass\nclass B:\n    pass\n";
+        assert_eq!(lines(check_lazy_class, source), vec![1, 6, 2]);
+    }
+
+    #[test]
+    fn async_for_and_async_with_do_not_count_as_nesting() {
+        let body = "async def f(xs):\n    if xs:\n        async for x in xs:\n            async with x:\n                for y in x:\n                    if y:\n                        while y:\n                            if y:\n                                pass\n";
+        // if / for / if / while / if = 5, not 7.
+        assert!(lines(check_deep_nesting, body).is_empty());
     }
 }

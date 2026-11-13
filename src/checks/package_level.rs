@@ -9,10 +9,11 @@ use crate::ast_helpers::{
 };
 use crate::config::{is_dunder, thresholds};
 use crate::models::{Issue, Severity, display_path};
+use crate::pyast::Node;
 use crate::similarity::sequence_matcher_ratio;
 use crate::unparse::unparse_function;
 use indexmap::IndexMap;
-use rustpython_ast::{Mod, Ranged, Stmt, Visitor};
+use rustpython_ast::{Mod, Ranged, Stmt};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -181,35 +182,25 @@ pub(crate) enum ImportNode {
 /// `_module_level_imports`: stops at nested function/lambda boundaries and
 /// skips `if TYPE_CHECKING:` and `if __name__ == "__main__":` guards
 /// entirely (no recursion into any of them).
-struct ModuleLevelImportCollector {
-    imports: Vec<ImportNode>,
-}
-impl Visitor for ModuleLevelImportCollector {
-    fn visit_stmt_function_def(&mut self, _node: rustpython_ast::StmtFunctionDef) {}
-    fn visit_stmt_async_function_def(&mut self, _node: rustpython_ast::StmtAsyncFunctionDef) {}
-    fn visit_expr_lambda(&mut self, _node: rustpython_ast::ExprLambda) {}
-    fn visit_stmt_if(&mut self, node: rustpython_ast::StmtIf) {
-        if is_type_checking_guard(&node.test) || is_main_guard(&node.test) {
-            return;
-        }
-        self.generic_visit_stmt_if(node);
-    }
-    fn visit_stmt_import(&mut self, node: rustpython_ast::StmtImport) {
-        self.imports.push(ImportNode::Import(node));
-    }
-    fn visit_stmt_import_from(&mut self, node: rustpython_ast::StmtImportFrom) {
-        self.imports.push(ImportNode::ImportFrom(node));
-    }
-}
-
 pub(crate) fn module_level_imports(module_body: &[Stmt]) -> Vec<ImportNode> {
-    let mut visitor = ModuleLevelImportCollector {
-        imports: Vec::new(),
-    };
-    for stmt in module_body {
-        visitor.visit_stmt(stmt.clone());
+    let mut found = Vec::new();
+    let mut stack: Vec<Node<'_>> = module_body.iter().rev().map(Node::Stmt).collect();
+    while let Some(child) = stack.pop() {
+        match child {
+            Node::Stmt(Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_))
+            | Node::Expr(rustpython_ast::Expr::Lambda(_)) => continue,
+            Node::Stmt(Stmt::If(i))
+                if is_type_checking_guard(&i.test) || is_main_guard(&i.test) =>
+            {
+                continue;
+            }
+            Node::Stmt(Stmt::Import(i)) => found.push(ImportNode::Import(i.clone())),
+            Node::Stmt(Stmt::ImportFrom(i)) => found.push(ImportNode::ImportFrom(i.clone())),
+            _ => {}
+        }
+        stack.extend(child.children().into_iter().rev());
     }
-    visitor.imports
+    found
 }
 
 // ── Orphan Interfaces (whole-package) ────────────────────────────────────────
@@ -437,6 +428,8 @@ pub fn check_sync_async_twins_pkg(
         .map(|f| (f.path.as_path(), LineIndex::new(&f.source)))
         .collect();
 
+    let files_by_path: HashMap<&Path, &ParsedFile> =
+        files.iter().map(|f| (f.path.as_path(), f)).collect();
     let mut issues = Vec::new();
     let mut reported: HashSet<Vec<(String, String)>> = HashSet::new();
 
@@ -464,8 +457,8 @@ pub fn check_sync_async_twins_pkg(
                     continue;
                 }
                 let ratio = sequence_matcher_ratio(
-                    &unparse_function(&func.stmt),
-                    &unparse_function(&other_func.stmt),
+                    &unparse_function(&func.stmt, &files_by_path[filepath].source),
+                    &unparse_function(&other_func.stmt, &files_by_path[filepath].source),
                 );
                 if ratio >= min_ratio {
                     reported.insert(pair_key);
