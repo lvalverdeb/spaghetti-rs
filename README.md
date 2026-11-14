@@ -29,7 +29,20 @@ AI-generated spaghetti code — often referred to as "slop code" — is extremel
 cargo install spaghetti
 ```
 
+Or a prebuilt binary from the [GitHub release](https://github.com/lvalverdeb/spaghetti-rs/releases/latest)
+(macOS arm64 and x86_64, Linux arm64 and x86_64, Windows x86_64):
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/lvalverdeb/spaghetti-rs/releases/latest/download/spaghetti-installer.sh | sh
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/lvalverdeb/spaghetti-rs/releases/latest/download/spaghetti-installer.ps1 | iex"
+```
+
 This installs a binary named `spaghetti` (matching the Python CLI's command name and the crate name).
+The current release is 2.6.1, byte-identical to spaghetti-detector 2.6.0 on PyPI; the two ports do
+not share a version number, since Rust-only fixes ship as patch releases here.
 
 ## Usage
 
@@ -329,10 +342,10 @@ files at different paths must not share findings. The entry JSON has the same sh
 
 - **Benchmark.** The Python repo's `scripts/bench.py --rust BIN` scans django, pandas and airflow
   (1.07 M lines, pinned in its `scripts/corpus.lock`). On an 11-core laptop the Rust port takes
-  8.2 s for all three in the published table ([docs/benchmark.md](https://github.com/lvalverdeb/spaghetti/blob/main/docs/benchmark.md)),
-  against 81.6 s for Python; scanning each package's files in parallel brought that to 3.5 s in
-  this release. CI runs it with `--rust-budget 15` (the ROADMAP budget: 15 s for Rust, 90 s for
-  Python, on the 4-core GitHub runner, where the first run measured 11.9 s).
+  2.0 s for all three in the published table ([docs/benchmark.md](https://github.com/lvalverdeb/spaghetti/blob/main/docs/benchmark.md)),
+  against 19.3 s for Python (5.4 s with a warm cache). CI runs it with `--rust-budget 15` (the
+  budget is 15 s for Rust and 120 s for Python on the 4-core GitHub runner, which measures about
+  7.7 s and 42 s).
 - **Limits.** A file over `max-file-bytes` (1 MiB) or nested past the point where the Python
   port's recursive checks hit CPython's recursion limit yields one `scan-limit` info finding
   instead of a stall; the Rust checks are iterative where depth is unbounded and the scanner runs
@@ -347,7 +360,9 @@ files at different paths must not share findings. The entry JSON has the same sh
   the findings Python reports. CI's fuzz job sets `SPAGHETTI_FUZZ_SECONDS=600`.
 - **Conformance.** CI checks out the Python port next to this one and runs its
   `scripts/conformance.py --rust target/release/spaghetti`, which fails on any byte difference in
-  `--json` or `--plan --json` over the whole corpus.
+  `--json` or `--plan --json` over the whole corpus. Beyond the corpus, both ports were run over
+  37 private repositories (576 k lines); the one difference found (a call's bare generator
+  argument starts at the call's `(` in CPython) became 2.6.1, and all 37 are identical since.
 
 ## Rules
 
