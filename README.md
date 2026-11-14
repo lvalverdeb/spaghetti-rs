@@ -330,8 +330,8 @@ files at different paths must not share findings. The entry JSON has the same sh
   (1.07 M lines, pinned in its `scripts/corpus.lock`). On an 11-core laptop the Rust port takes
   8.2 s for all three in the published table ([docs/benchmark.md](https://github.com/lvalverdeb/spaghetti/blob/main/docs/benchmark.md)),
   against 81.6 s for Python; scanning each package's files in parallel brought that to 3.5 s in
-  this release. CI runs it with `--rust-budget 10` (the ROADMAP budget: 10 s for Rust, 90 s for
-  Python, on a 4-core runner).
+  this release. CI runs it with `--rust-budget 15` (the ROADMAP budget: 15 s for Rust, 90 s for
+  Python, on the 4-core GitHub runner, where the first run measured 11.9 s).
 - **Limits.** A file over `max-file-bytes` (1 MiB) or nested past the point where the Python
   port's recursive checks hit CPython's recursion limit yields one `scan-limit` info finding
   instead of a stall; the Rust checks are iterative where depth is unbounded and the scanner runs

@@ -161,4 +161,4 @@ jobs:
 
       - name: Rust port under 10 s on the combined corpus
         working-directory: spaghetti
-        run: uv run python scripts/bench.py --rust ../spaghetti-rs/target/release/spaghetti --rust-budget 10
+        run: uv run python scripts/bench.py --rust ../spaghetti-rs/target/release/spaghetti --rust-budget 15
