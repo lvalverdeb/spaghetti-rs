@@ -184,7 +184,7 @@ pub const RULE_DOCS: &[(&str, RuleDoc)] = &[
     (
         "duplicate-code",
         RuleDoc {
-            why: "Type-2 clones (same structure, renamed identifiers and literals) are the duplication tools like PMD-CPD and Sonar report; renaming variables does not make a copy independent.",
+            why: "Type-2 clones (same structure, renamed identifiers and literals) are the duplication tools like PMD-CPD and Sonar report; renaming variables does not make a copy independent. Only clones containing logic count: import blocks, declaration tables and argument forwarding are not reported, and a clone never runs from one function or class into a differently named neighbour.",
             fix: "Extract the shared logic into one function parameterised by what differs; for test setup prefer fixtures or parametrisation over copied blocks.",
             equivalents: &["SonarQube duplicated blocks (CPD)", "PMD CPD", "jscpd"],
             thresholds: &["MIN_CLONE_TOKENS"],

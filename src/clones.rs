@@ -13,14 +13,64 @@ use crate::ast_helpers::LineIndex;
 use crate::fstrings::FStringStarts;
 use crate::pyast::Node;
 use rustpython_ast::{Expr, Stmt};
-use std::collections::{BTreeSet, HashMap};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Parallel lists: normalised token names and the 1-based line each came from.
+/// Every name is a static spelling except the definition boundary token,
+/// `"\0" + name`, which carries the function's or class's own name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TokenStream {
-    pub names: Vec<&'static str>,
+    pub names: Vec<Cow<'static, str>>,
     pub lines: Vec<usize>,
+}
+
+/// The prefix of a definition boundary token — mirrors the `"\x00"` in
+/// `token_stream`.
+pub const BOUNDARY_PREFIX: char = '\0';
+
+/// A clone must contain some of these to be duplicated *logic*. A window made
+/// only of calls, assignments, imports and literals is a declaration table, an
+/// import block or argument forwarding: the 2026-11 audit found every false
+/// positive of the rule in that shape (13 of 30 samples) and no true positive
+/// without a control-flow, comparison or comprehension token — mirrors `_LOGIC`.
+const LOGIC: &[&str] = &[
+    "If",
+    "IfExp",
+    "For",
+    "AsyncFor",
+    "While",
+    "Try",
+    "TryStar",
+    "With",
+    "AsyncWith",
+    "Match",
+    "Return",
+    "Raise",
+    "Assert",
+    "Yield",
+    "YieldFrom",
+    "Await",
+    "BoolOp",
+    "Compare",
+    "ListComp",
+    "SetComp",
+    "DictComp",
+    "GeneratorExp",
+    "Lambda",
+    "AugAssign",
+];
+
+/// The name of a `FunctionDef`, `AsyncFunctionDef` or `ClassDef` — mirrors
+/// `isinstance(node, _DEFS)` plus `node.name`.
+fn definition_name(node: Node<'_>) -> Option<&str> {
+    match node {
+        Node::Stmt(Stmt::FunctionDef(f)) => Some(f.name.as_str()),
+        Node::Stmt(Stmt::AsyncFunctionDef(f)) => Some(f.name.as_str()),
+        Node::Stmt(Stmt::ClassDef(c)) => Some(c.name.as_str()),
+        _ => None,
+    }
 }
 
 /// The normalised token stream of a module — mirrors `token_stream`
@@ -42,15 +92,25 @@ pub fn token_stream(body: &[Stmt], source: &str, index: &LineIndex) -> TokenStre
             let line = start
                 .map(|offset| index.line_number(offset))
                 .unwrap_or(inherited);
+            if let Some(name) = definition_name(node) {
+                // A boundary token carrying the definition's name: a window can
+                // only run from one definition into the next when both sides are
+                // entering a definition of the same name, so route handlers or
+                // visitor methods that merely sit next to each other never fuse
+                // into one clone.
+                out.names
+                    .push(Cow::Owned(format!("{BOUNDARY_PREFIX}{name}")));
+                out.lines.push(line);
+            }
             if matches!(node, Node::Expr(Expr::Constant(_))) {
-                out.names.push("LIT");
+                out.names.push(Cow::Borrowed("LIT"));
                 out.lines.push(line);
                 continue;
             }
-            out.names.push(node.py_name());
+            out.names.push(Cow::Borrowed(node.py_name()));
             out.lines.push(line);
             for _ in 0..node.identifier_count() {
-                out.names.push("ID");
+                out.names.push(Cow::Borrowed("ID"));
                 out.lines.push(line);
             }
             stack.extend(node.children().into_iter().rev().map(|c| (c, line)));
@@ -105,6 +165,8 @@ struct Index<'a> {
     files: Vec<&'a Path>,
     lines: Vec<&'a [usize]>,
     encoded: Vec<Vec<u32>>,
+    /// Vocabulary codes of the `LOGIC` token names present in the streams.
+    logic: HashSet<u32>,
     width: usize,
     hashes: Vec<Vec<u64>>,
     by_hash: HashMap<u64, Vec<Position>>,
@@ -137,7 +199,7 @@ fn window_hashes(encoded: &[u32], width: usize) -> Vec<u64> {
 
 impl<'a> Index<'a> {
     fn new(streams: &[(&'a Path, &'a TokenStream)], width: usize) -> Self {
-        let mut vocab: HashMap<&'static str, u32> = HashMap::new();
+        let mut vocab: HashMap<&str, u32> = HashMap::new();
         let files: Vec<&'a Path> = streams.iter().map(|(f, _)| *f).collect();
         let lines: Vec<&'a [usize]> = streams.iter().map(|(_, s)| s.lines.as_slice()).collect();
         let encoded: Vec<Vec<u32>> = streams
@@ -147,10 +209,15 @@ impl<'a> Index<'a> {
                     .iter()
                     .map(|name| {
                         let next = vocab.len() as u32 + 1;
-                        *vocab.entry(name).or_insert(next)
+                        *vocab.entry(name.as_ref()).or_insert(next)
                     })
                     .collect()
             })
+            .collect();
+        let logic: HashSet<u32> = vocab
+            .iter()
+            .filter(|(name, _)| LOGIC.contains(name))
+            .map(|(_, &code)| code)
             .collect();
         let hashes: Vec<Vec<u64>> = encoded
             .iter()
@@ -166,6 +233,7 @@ impl<'a> Index<'a> {
             files,
             lines,
             encoded,
+            logic,
             width,
             hashes,
             by_hash,
@@ -225,6 +293,10 @@ impl<'a> Index<'a> {
         let mut length = self.width;
         while self.same_token_everywhere(&members, length as isize) {
             length += 1;
+        }
+        let span = &self.encoded[first.0][first.1..first.1 + length];
+        if !span.iter().any(|code| self.logic.contains(code)) {
+            return None; // data, imports or argument forwarding, not logic
         }
         let kept = drop_overlapping(&members, length);
         if kept.len() < 2 {
@@ -414,6 +486,7 @@ mod tests {
         assert_eq!(
             s.names,
             [
+                "\0f",
                 "FunctionDef",
                 "ID",
                 "arguments",
@@ -465,7 +538,8 @@ mod tests {
         assert_eq!(files, [a, b]);
         assert_eq!(group.sites[0].start_line, 2);
         assert_eq!(group.sites[0].end_line, 13);
-        assert_eq!(group.tokens, sa.names.len());
+        // Everything but the definition-boundary token, which carries the (different) name.
+        assert_eq!(group.tokens, sa.names.len() - 1);
     }
 
     #[test]
@@ -559,5 +633,60 @@ mod tests {
             sites: vec![CloneSite::new(a, 10, 20), CloneSite::new(a, 16, 26)],
         }];
         assert!(duplicated_regions(&groups, &[a]).is_empty());
+    }
+
+    const LOGIC_BODY: &str = "    total = 0\n    for item in items:\n        if item.ok and item.value > limit:\n            total += item.value\n        elif item.retry:\n            total -= 1\n    return total\n";
+
+    #[test]
+    fn import_blocks_and_declaration_tables_are_not_clones() {
+        let imports: String = (0..30)
+            .map(|i| format!("from pkg.mod{i} import name{i}, other{i}\n"))
+            .collect();
+        let table = format!(
+            "TABLE = [\n{}]\n",
+            (0..20)
+                .map(|i| format!(
+                    "    Entry(key=Key('a{i}', 'b{i}'), renamed=Key('c{i}', 'd{i}'), note='n{i}'),\n"
+                ))
+                .collect::<String>()
+        );
+        let a = stream(&format!(
+            "{imports}{table}def f(items, limit):\n{LOGIC_BODY}"
+        ));
+        let b = stream(&format!(
+            "{imports}{table}def g(rows, cap):\n{}",
+            LOGIC_BODY.replace("item", "row")
+        ));
+        let groups = find_clone_groups(&[(Path::new("a.py"), &a), (Path::new("b.py"), &b)], 20);
+        // Only the function bodies survive: the import block and the table are data.
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].sites.iter().all(|site| site.start_line > 50));
+    }
+
+    #[test]
+    fn clones_do_not_run_across_differently_named_definitions() {
+        fn pair(n1: &str, n2: &str) -> String {
+            format!(
+                "class V:\n    def {n1}(self, node):\n        if node.kind == 'a':\n            return self.visit_default(node)\n        yield from self.line()\n    def {n2}(self, leaf):\n        if leaf.kind == 'b':\n            return self.visit_default(leaf)\n        yield from self.line()\n"
+            )
+        }
+        let (a, b) = (Path::new("a.py"), Path::new("b.py"));
+        let sa = stream(&pair("visit_semi", "visit_end"));
+        let sb = stream(&pair("visit_colon", "visit_dedent"));
+        let groups = find_clone_groups(&[(a, &sa), (b, &sb)], 12);
+        // Each method body is a legitimate clone of its counterpart, but no group
+        // spans the boundary between two methods with different names.
+        assert!(!groups.is_empty());
+        for site in groups.iter().flat_map(|g| &g.sites) {
+            assert!(!(site.start_line <= 5 && 5 <= site.end_line && site.end_line > 6));
+        }
+        let same = stream(&pair("visit_x", "visit_y"));
+        let merged = find_clone_groups(&[(a, &same), (b, &same)], 12);
+        assert!(
+            merged
+                .iter()
+                .flat_map(|g| &g.sites)
+                .any(|s| s.start_line <= 2 && s.end_line >= 9)
+        );
     }
 }

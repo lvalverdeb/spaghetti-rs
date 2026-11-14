@@ -32,6 +32,7 @@ use crate::rules::rule_meta;
 use crate::settings::Settings;
 use serde_json::{Map, Value, json};
 use sha1::{Digest, Sha1};
+use std::borrow::Cow;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -291,8 +292,15 @@ impl FileEntry {
                 let names = pair[0]
                     .as_array()?
                     .iter()
-                    .map(|n| crate::pyast::intern_token_name(n.as_str()?))
-                    .collect::<Option<Vec<&'static str>>>()?;
+                    .map(|n| {
+                        let name = n.as_str()?;
+                        if name.starts_with(crate::clones::BOUNDARY_PREFIX) {
+                            Some(Cow::Owned(name.to_owned()))
+                        } else {
+                            crate::pyast::intern_token_name(name).map(Cow::Borrowed)
+                        }
+                    })
+                    .collect::<Option<Vec<Cow<'static, str>>>>()?;
                 let lines = pair[1]
                     .as_array()?
                     .iter()
