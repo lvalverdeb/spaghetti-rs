@@ -308,12 +308,13 @@ spaghetti --cache-dir .cache/sp   # elsewhere (implies --cache); or `cache = tru
 
 Same design as the Python original: entries live under a directory named by a hash of the applied
 settings, the tool version and the Python language version, so a threshold change or an upgrade
-invalidates everything at once. A hit skips the thirty-odd per-file checks; the file is still
-parsed because the cross-file checks need the tree, and those always run. Writes are atomic (temp
+invalidates everything at once. An entry also holds the compact per-file facts the cross-file
+checks combine (function body hashes, class bases, sync/async twin similarity), so a hit needs no
+parse at all; the cross-file checks run over those facts and always run. Writes are atomic (temp
 file + rename), a damaged entry is a miss, never an error, and stderr reports
-`Cache: N hit(s), M miss(es) in DIR/KEY`. On the benchmark corpus (11-core laptop) a warm run
-takes 2.7 s against 3.5 s uncached and 4.4 s cold (writing the entries); the remainder is the
-workspace-wide clone detection, which always runs.
+`Cache: N hit(s), M miss(es) in DIR/KEY`. On pandas (4 threads) a warm run takes 0.5 s against
+2.1 s uncached and 2.3 s cold (writing the entries); the remainder is the workspace-wide clone
+detection, which always runs.
 
 Differences from the Python port, both deliberate: the configuration key has the same structure
 (`{"schema", "tool", "python", "overrides"}`, canonical JSON, first 16 hex digits of its SHA-1) but
@@ -322,7 +323,7 @@ its `tool` is `"<version>-rs"`, so the two ports never read each other's entries
 rather than the content alone, because several per-file checks depend on the path (test files,
 `__init__.py`, the module path behind `potential-circular-import`, layer rules) — two identical
 files at different paths must not share findings. The entry JSON has the same shape as Python's
-(`schema_version` 1), so either can be inspected the same way.
+(`schema_version` 2), so either can be inspected the same way.
 
 ## Performance, robustness and conformance
 

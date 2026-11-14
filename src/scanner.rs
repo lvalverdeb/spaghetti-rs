@@ -1,21 +1,20 @@
 //! Package scanning — mirrors `detector.py::scan_package`.
 //!
-//! Sequential for Phase 1-3 (proving the pipeline works); Phase 4 replaces
-//! the per-package loop with `rayon` per the port proposal's §4.3/§6.
-//!
-//! Rule overrides, column normalization, fingerprinting and suppression are
-//! each applied once, at the very end, over the combined per-file *and*
-//! package-level issue list — matching Python's own structure exactly
-//! (`scan_package` extends `result.issues` with every check's output first,
-//! then runs `_apply_rule_overrides`, `_normalize_columns`,
-//! `_assign_fingerprints` and `_apply_suppressions` in that order), since a package-level issue (e.g. `import-cycle`) is
-//! attributed to a file that isn't "the current file" in any per-file loop,
-//! so it needs the same final passes everything else gets.
+//! The per-file pass runs on rayon's pool. Each worker finishes its own
+//! file completely: the per-file checks, then rule overrides, column
+//! normalisation, fingerprints and inline suppressions for that file's
+//! findings (fingerprint occurrence counts are per file and rule, so a file
+//! can be finalized the moment it is scanned), and the compact `FileFacts`
+//! the package-level checks need. The tree and the source text are dropped
+//! in the worker. The sequential tail combines facts across files, runs the
+//! three package checks over them and finalizes those findings with the
+//! source of just the files they name — it never re-walks a tree or
+//! re-parses a file.
 
 use crate::ast_helpers::LineIndex;
 use crate::cache::{FileCache, FileEntry};
 use crate::checks::ast_per_file::Check;
-use crate::checks::package_level::{self, ParsedFile};
+use crate::checks::package_level::{self, FileFacts};
 use crate::checks::workspace_level::{
     PackageImports, build_import_graph, check_contracts_ws, check_duplicate_code_ws,
     check_import_cycles_ws, check_module_coupling_ws, collect_raw_imports, dependency_edges,
@@ -44,19 +43,16 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
         return result;
     }
 
-    let mut all_issues: Vec<Issue> = Vec::new();
-    let mut source_by_file: HashMap<PathBuf, String> = HashMap::new();
-    let mut parsed_files: Vec<ParsedFile> = Vec::new();
     let cache = config
         .cache_dir
         .as_ref()
         .map(|dir| FileCache::new(dir, &config.cache_key));
+    let overrides = rule_overrides();
 
     // Sorted, matching Python's `sorted(pkg_path.rglob("*.py"))` — the
-    // package-level checks' output (`sync-async-duplication`'s cross-file
-    // dedup in particular, since its `reported` key doesn't include the
-    // file path) depends on which file is processed first, so this can't
-    // be arbitrary directory-walk order.
+    // package-level checks' output (`duplicate-function-body`'s first
+    // location, which file a same-named `orphan-interface` is reported in)
+    // depends on file order, so this can't be arbitrary directory-walk order.
     //
     // `recursive=false` caps depth at 1 (root's direct children only) —
     // used for the synthetic "loose root scripts" package cwd
@@ -93,80 +89,57 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
         .par_iter()
         .map(|path| {
             let mut file = FileScan::default();
-            file.outcome = scan_one_file(
-                path,
-                package,
-                root,
-                &mut file.result,
-                &mut file.issues,
-                cache.as_ref(),
-            );
+            scan_one_file(path, package, root, &overrides, cache.as_ref(), &mut file);
             file
         })
         .collect();
+    let mut facts: Vec<(PathBuf, FileFacts)> = Vec::new();
     for (path, file) in files.iter().zip(scanned) {
         let FileScan {
             result: part,
-            issues,
-            outcome,
+            facts: file_facts,
         } = file;
+        result.issues.extend(part.issues);
         result.files_scanned += part.files_scanned;
         result.functions_scanned += part.functions_scanned;
         result.total_lines += part.total_lines;
+        result.suppressed += part.suppressed;
+        result.ignored.extend(part.ignored);
+        result.file_mi.extend(part.file_mi);
         result.cache_hits += part.cache_hits;
         result.cache_misses += part.cache_misses;
-        result.file_mi.extend(part.file_mi);
         result.raw_imports.extend(part.raw_imports);
         result.token_streams.extend(part.token_streams);
-        all_issues.extend(issues);
-        let Some((source, module)) = outcome else {
-            continue;
-        };
-        if let Some(module) = module {
-            parsed_files.push(ParsedFile {
-                path: path.clone(),
-                source: source.clone(),
-                module,
-            });
+        if let Some(file_facts) = file_facts {
+            facts.push((path.clone(), file_facts));
         }
-        source_by_file.insert(path.clone(), source);
     }
 
-    all_issues.extend(package_level::check_orphan_interfaces_pkg(
+    // The package-level half: the cross-file checks over the per-file facts,
+    // finalized with the source of just the files they name — mirrors
+    // `detector._assemble_package`.
+    let mut found = package_level::check_orphan_interfaces_pkg(package, &facts);
+    found.extend(package_level::check_duplicate_functions_pkg(
         package,
-        &parsed_files,
-    ));
-    all_issues.extend(package_level::check_duplicate_functions_pkg(
-        package,
-        &parsed_files,
+        &facts,
         config.min_duplicate_lines,
     ));
-    all_issues.extend(package_level::check_sync_async_twins_pkg(
+    found.extend(package_level::check_sync_async_twins_pkg(
         package,
-        &parsed_files,
+        &facts,
         config.twin_similarity,
     ));
-
-    let lines_by_file: HashMap<&Path, Vec<&str>> = source_by_file
-        .iter()
-        .map(|(p, s)| (p.as_path(), crate::pyast::py_splitlines(s)))
-        .collect();
-    finalize(
-        all_issues,
-        root,
-        &lines_by_file,
-        &rule_overrides(),
-        &mut result,
-    );
+    drop(facts);
+    finalize_from_disk(found, root, &overrides, &mut result);
     result
 }
 
-/// One file's share of a package scan, before it is folded in.
+/// One file's share of a package scan, before it is folded in: its
+/// finalized findings and counts, plus the facts the package checks combine.
 #[derive(Default)]
 struct FileScan {
     result: ScanResult,
-    issues: Vec<Issue>,
-    outcome: Option<(String, Option<Mod>)>,
+    facts: Option<FileFacts>,
 }
 
 /// A finding about the file itself (`syntax-error`, `unreadable-file`,
@@ -198,19 +171,18 @@ fn read_python_text(path: &Path) -> std::io::Result<String> {
     })
 }
 
-/// Run every per-file check on `path`, appending findings to `issues` —
-/// mirrors `detector._scan_one_file`. Returns `(source, tree)` — `tree` is
-/// `None` when the file failed to parse or was skipped for exceeding a
-/// limit — or `None` when the file could not be read at all.
+/// Run every per-file check on `path` and finalize its findings into
+/// `file.result` — mirrors `detector._scan_one_file`.
 fn scan_one_file(
     path: &Path,
     package: &str,
     root: &Path,
-    result: &mut ScanResult,
-    issues: &mut Vec<Issue>,
+    overrides: &BTreeMap<String, RuleSetting>,
     cache: Option<&FileCache>,
-) -> Option<(String, Option<Mod>)> {
-    result.files_scanned += 1;
+    file: &mut FileScan,
+) {
+    file.result.files_scanned += 1;
+    let mut issues = Vec::new();
     let source = match read_python_text(path) {
         Ok(source) => source,
         Err(e) => {
@@ -220,11 +192,27 @@ fn scan_one_file(
                 "unreadable-file",
                 format!("Failed to read file — {}", strerror(&e)),
             ));
-            return None;
+            finalize(issues, root, |_| None, overrides, &mut file.result);
+            return;
         }
     };
-    result.total_lines += crate::pyast::py_splitlines(&source).len();
+    let lines = crate::pyast::py_splitlines(&source);
+    file.result.total_lines += lines.len();
+    scan_source(&source, path, package, root, cache, file, &mut issues);
+    finalize(issues, root, |_| Some(&lines), overrides, &mut file.result);
+}
 
+/// Size limit, cache lookup, then the per-file checks (or the cached
+/// result) — mirrors `detector._scan_source`.
+fn scan_source(
+    source: &str,
+    path: &Path,
+    package: &str,
+    root: &Path,
+    cache: Option<&FileCache>,
+    file: &mut FileScan,
+    issues: &mut Vec<Issue>,
+) {
     let max_file_bytes = crate::config::thresholds().max_file_bytes;
     if source.len() > max_file_bytes {
         issues.push(infra_issue(
@@ -237,27 +225,26 @@ fn scan_one_file(
                 source.len()
             ),
         ));
-        return Some((source, None));
+        return;
     }
 
     if let Some(cache) = cache {
-        if let Some(entry) = cache.load(&source, path, package) {
-            result.cache_hits += 1;
-            apply_cached(path, result, issues, entry);
-            let module = parse_quietly(&source, path);
-            return Some((source, module));
+        if let Some(entry) = cache.load(source, path, package) {
+            file.result.cache_hits += 1;
+            apply_cached(path, file, issues, entry);
+            return;
         }
-        result.cache_misses += 1;
+        file.result.cache_misses += 1;
     }
 
-    let start = issues.len();
-    let functions_before = result.functions_scanned;
-    let Ok(module) = check_one_file(&source, path, package, root, result, issues) else {
-        issues.truncate(start);
-        result.functions_scanned = functions_before;
-        result.file_mi.shift_remove(path);
-        result.raw_imports.shift_remove(path);
-        result.token_streams.shift_remove(path);
+    let functions_before = file.result.functions_scanned;
+    let Ok(parsed) = check_one_file(source, path, package, root, file, issues) else {
+        issues.clear();
+        file.result.functions_scanned = functions_before;
+        file.result.file_mi.shift_remove(path);
+        file.result.raw_imports.shift_remove(path);
+        file.result.token_streams.shift_remove(path);
+        file.facts = None;
         issues.push(infra_issue(
             path,
             package,
@@ -265,39 +252,39 @@ fn scan_one_file(
             "File skipped — nesting deeper than the analysis limit; exclude it if generated"
                 .to_string(),
         ));
-        return Some((source, None));
+        return;
     };
     if let Some(cache) = cache {
         cache.store(
-            &source,
+            source,
             path,
             package,
             &FileEntry {
-                issues: issues[start..].to_vec(),
-                parsed: module.is_some(),
-                functions: result.functions_scanned - functions_before,
-                mi: result.file_mi.get(path).copied(),
-                raw_imports: result.raw_imports.get(path).cloned(),
-                tokens: result.token_streams.get(path).cloned(),
+                issues: issues.clone(),
+                parsed,
+                functions: file.result.functions_scanned - functions_before,
+                mi: file.result.file_mi.get(path).copied(),
+                raw_imports: file.result.raw_imports.get(path).cloned(),
+                tokens: file.result.token_streams.get(path).cloned(),
+                facts: file.facts.clone(),
             },
         );
     }
-    Some((source, module))
 }
 
 /// The analysis gave up on a file nested past Python's recursion limit.
 struct NestingLimit;
 
 /// Every per-file check, uncached — mirrors `detector._check_one_file`.
-/// `Ok(None)` on a syntax error.
+/// `Ok(false)` on a syntax error.
 fn check_one_file(
     source: &str,
     path: &Path,
     package: &str,
     root: &Path,
-    result: &mut ScanResult,
+    file: &mut FileScan,
     issues: &mut Vec<Issue>,
-) -> Result<Option<Mod>, NestingLimit> {
+) -> Result<bool, NestingLimit> {
     issues.extend(text_per_file::check_long_file(source, path, package));
     issues.extend(text_per_file::check_todo_markers(source, path, package));
 
@@ -316,7 +303,7 @@ fn check_one_file(
             "syntax-error",
             "Failed to parse file — syntax error".to_string(),
         ));
-        return Ok(None);
+        return Ok(false);
     };
     let body: &[Stmt] = match &module {
         Mod::Module(m) => &m.body,
@@ -326,6 +313,7 @@ fn check_one_file(
         return Err(NestingLimit);
     }
 
+    let result = &mut file.result;
     result.functions_scanned += ast_per_file::count_functions(&module);
     for check in ast_per_file::ALL_CHECKS {
         issues.extend(match check {
@@ -343,62 +331,47 @@ fn check_one_file(
     result
         .token_streams
         .insert(path.to_path_buf(), token_stream(body, source, &line_index));
-    Ok(Some(module))
+    file.facts = Some(package_level::collect_facts(body, source, &line_index));
+    Ok(true)
 }
 
-/// Fold a cache hit into `result` — mirrors `detector._apply_cached`.
-fn apply_cached(path: &Path, result: &mut ScanResult, issues: &mut Vec<Issue>, entry: FileEntry) {
+/// Fold a cache hit into `file` — mirrors `detector._apply_cached`.
+fn apply_cached(path: &Path, file: &mut FileScan, issues: &mut Vec<Issue>, entry: FileEntry) {
     issues.extend(entry.issues);
-    result.functions_scanned += entry.functions;
+    file.result.functions_scanned += entry.functions;
     if let Some(mi) = entry.mi {
-        result.file_mi.insert(path.to_path_buf(), mi);
+        file.result.file_mi.insert(path.to_path_buf(), mi);
     }
     if let Some(raw) = entry.raw_imports {
-        result.raw_imports.insert(path.to_path_buf(), raw);
+        file.result.raw_imports.insert(path.to_path_buf(), raw);
     }
     if let Some(tokens) = entry.tokens {
-        result.token_streams.insert(path.to_path_buf(), tokens);
+        file.result.token_streams.insert(path.to_path_buf(), tokens);
     }
-}
-
-/// The tree for the package-level checks on a cache hit; the syntax-error
-/// finding itself came from the cache — mirrors `detector._parse_quietly`.
-fn parse_quietly(source: &str, path: &Path) -> Option<Mod> {
-    if crate::limits::cpython_rejects(source) {
-        return None;
+    if let Some(facts) = entry.facts {
+        file.facts = Some(facts);
     }
-    let module = rustpython_parser::parse(
-        source,
-        rustpython_parser::Mode::Module,
-        &path.to_string_lossy(),
-    )
-    .ok()?;
-    let body: &[Stmt] = match &module {
-        Mod::Module(m) => &m.body,
-        _ => &[],
-    };
-    (!crate::limits::exceeds_nesting_limit(body)).then_some(module)
 }
 
 /// Rule overrides, character columns, fingerprints, inline suppressions —
 /// in that order, for every issue — then into `result` (mirrors
-/// `detector._finalize`).
-fn finalize(
+/// `detector._finalize_issues`). `lines_of` gives a file's source lines, or
+/// `None` for a file that could not be read: its findings are left as they
+/// are, like a file that was never read.
+fn finalize<'a>(
     issues: Vec<Issue>,
     root: &Path,
-    lines_by_file: &HashMap<&Path, Vec<&str>>,
+    mut lines_of: impl FnMut(&Path) -> Option<&'a Vec<&'a str>>,
     overrides: &BTreeMap<String, RuleSetting>,
     result: &mut ScanResult,
 ) {
     let mut issues = apply_rule_overrides(issues, overrides);
     for issue in &mut issues {
-        normalize_columns(issue, lines_by_file.get(issue.file.as_path()));
+        normalize_columns(issue, lines_of(&issue.file));
     }
     assign_fingerprints(&mut issues, root);
     for mut issue in issues {
-        let suppression = lines_by_file
-            .get(issue.file.as_path())
-            .and_then(|lines| is_suppressed(&issue, lines));
+        let suppression = lines_of(&issue.file).and_then(|lines| is_suppressed(&issue, lines));
         match suppression {
             Some(sup) => {
                 result.suppressed += 1;
@@ -408,6 +381,37 @@ fn finalize(
             None => result.issues.push(issue),
         }
     }
+}
+
+/// Finalize findings that arrive after the per-file pass has let go of the
+/// text, reading each named file at most once — mirrors `_finalize_issues`
+/// with `_SourceLines`.
+fn finalize_from_disk(
+    issues: Vec<Issue>,
+    root: &Path,
+    overrides: &BTreeMap<String, RuleSetting>,
+    result: &mut ScanResult,
+) {
+    if issues.is_empty() {
+        return;
+    }
+    let mut sources: HashMap<PathBuf, Option<String>> = HashMap::new();
+    for issue in &issues {
+        if !sources.contains_key(&issue.file) {
+            sources.insert(issue.file.clone(), read_python_text(&issue.file).ok());
+        }
+    }
+    let lines_by_file: HashMap<&Path, Vec<&str>> = sources
+        .iter()
+        .filter_map(|(p, s)| Some((p.as_path(), crate::pyast::py_splitlines(s.as_deref()?))))
+        .collect();
+    finalize(
+        issues,
+        root,
+        |path| lines_by_file.get(path),
+        overrides,
+        result,
+    );
 }
 
 /// Run the checks that need every package at once — import cycles and
@@ -466,7 +470,6 @@ fn scan_workspace_with(
         found
     };
 
-    let mut sources: HashMap<PathBuf, String> = HashMap::new();
     for (name, result) in per_package.iter_mut() {
         let own: Vec<Issue> = found
             .iter()
@@ -475,28 +478,7 @@ fn scan_workspace_with(
             .collect();
         result.raw_imports = IndexMap::new();
         result.token_streams = IndexMap::new();
-        if own.is_empty() {
-            continue;
-        }
-        for issue in &own {
-            if !sources.contains_key(&issue.file) {
-                let text = std::fs::read(&issue.file)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    .unwrap_or_default();
-                sources.insert(issue.file.clone(), text);
-            }
-        }
-        let lines_by_file: HashMap<&Path, Vec<&str>> = sources
-            .iter()
-            .map(|(p, s)| (p.as_path(), crate::pyast::py_splitlines(s)))
-            .collect();
-        finalize(
-            own,
-            &registry[name.as_str()],
-            &lines_by_file,
-            overrides,
-            result,
-        );
+        finalize_from_disk(own, &registry[name.as_str()], overrides, result);
     }
 }
 
@@ -638,6 +620,99 @@ mod recursive_flag_tests {
                 .iter()
                 .filter(|i| i.rule == "bare-except")
                 .all(|i| i.file == root.join("loose.py"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod pool_size_tests {
+    //! Mirrors tests/test_detector.py::test_chunked_parallel_scan_matches_the_sequential_scan:
+    //! however the files are spread over workers, the result is what one
+    //! worker would produce.
+    use super::scan_package;
+    use crate::models::ScanConfig;
+
+    #[test]
+    fn parallel_scan_matches_the_single_threaded_scan() {
+        let root = std::env::temp_dir().join(format!(
+            "spaghetti_rs_scan_pool_size_{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let body = "import os\n\
+                    class Base:\n\
+                    \x20   def run(self, x):\n\
+                    \x20       if x:\n\
+                    \x20           return os.getcwd()\n\
+                    \x20       if x is None:\n\
+                    \x20           raise ValueError(x)\n\
+                    \x20       for part in os.listdir('.'):\n\
+                    \x20           if part.startswith('.'):\n\
+                    \x20               continue\n\
+                    \x20       return None\n\
+                    def helper(a, b):\n\
+                    \x20   return a if a else b\n\
+                    def get(key):\n    value = store.read(key)\n    if value is None:\n        raise KeyError(key)\n    return decode(value)\n\
+                    async def aget(key):\n    value = await store.aread(key)\n    if value is None:\n        raise KeyError(key)\n    return decode(value)\n";
+        for i in 0..10 {
+            std::fs::write(
+                root.join(format!("m{i}.py")),
+                body.replace("Base", &format!("Base{i}")),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("sub").join(format!("n{i}.py")),
+                body.replace("helper", &format!("helper{i}")),
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join("broken.py"), "def (:\n").unwrap();
+        std::fs::write(root.join("huge.py"), "x = 1\n".repeat(400)).unwrap();
+        let config = ScanConfig {
+            exclude: vec![],
+            min_duplicate_lines: 5,
+            twin_similarity: 0.6,
+            recursive: true,
+            min_clone_tokens: 50,
+            cache_dir: None,
+            cache_key: String::new(),
+        };
+        let scan_with = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| scan_package("big", &root, &config))
+        };
+        let sequential = scan_with(1);
+        let parallel = scan_with(3);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(parallel.issues, sequential.issues);
+        assert_eq!(parallel.files_scanned, 22);
+        assert_eq!(sequential.files_scanned, 22);
+        assert_eq!(parallel.total_lines, sequential.total_lines);
+        assert_eq!(parallel.functions_scanned, sequential.functions_scanned);
+        assert_eq!(parallel.file_mi, sequential.file_mi);
+        assert_eq!(parallel.suppressed, sequential.suppressed);
+        let rules: std::collections::HashSet<&str> =
+            parallel.issues.iter().map(|i| i.rule).collect();
+        for rule in [
+            "syntax-error",
+            "duplicate-function-body",
+            "sync-async-duplication",
+        ] {
+            assert!(rules.contains(rule), "{rule} missing from {rules:?}");
+        }
+        // Twins are reported per file: each of the 20 modules has its own.
+        assert_eq!(
+            parallel
+                .issues
+                .iter()
+                .filter(|i| i.rule == "sync-async-duplication")
+                .count(),
+            20
         );
     }
 }

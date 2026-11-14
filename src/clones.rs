@@ -15,6 +15,7 @@ use crate::pyast::Node;
 use rustpython_ast::{Expr, Stmt};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Parallel lists: normalised token names and the 1-based line each came from.
@@ -160,6 +161,31 @@ fn is_periodic(window: &[u32]) -> bool {
     (1..=MAX_PERIOD.min(n / 2)).any(|period| (period..n).all(|i| window[i] == window[i - period]))
 }
 
+/// The window hashes are already well mixed 64-bit values, and the index is
+/// looked up once per window of every file; a one-multiply hasher (the
+/// `FxHasher` recipe) keeps that from being the cost of the whole check.
+/// Neither table is ever iterated, so the hasher cannot affect the output.
+#[derive(Default)]
+struct WindowHasher(u64);
+
+impl Hasher for WindowHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type WindowMap<V> = HashMap<u64, V, BuildHasherDefault<WindowHasher>>;
+
 /// Encoded token streams plus every window hashed, in file order.
 struct Index<'a> {
     files: Vec<&'a Path>,
@@ -169,7 +195,7 @@ struct Index<'a> {
     logic: HashSet<u32>,
     width: usize,
     hashes: Vec<Vec<u64>>,
-    by_hash: HashMap<u64, Vec<Position>>,
+    by_hash: WindowMap<Vec<Position>>,
 }
 
 /// Polynomial rolling hash of every `width`-token window; collisions are
@@ -223,10 +249,18 @@ impl<'a> Index<'a> {
             .iter()
             .map(|tokens| window_hashes(tokens, width))
             .collect();
-        let mut by_hash: HashMap<u64, Vec<Position>> = HashMap::new();
+        // Only a hash seen at least twice can start a group; counting first
+        // keeps the position index to the few windows that recur.
+        let mut counts: WindowMap<u32> = WindowMap::default();
+        for &h in hashes.iter().flatten() {
+            *counts.entry(h).or_insert(0) += 1;
+        }
+        let mut by_hash: WindowMap<Vec<Position>> = WindowMap::default();
         for (file_index, file_hashes) in hashes.iter().enumerate() {
             for (offset, &h) in file_hashes.iter().enumerate() {
-                by_hash.entry(h).or_default().push((file_index, offset));
+                if counts[&h] > 1 {
+                    by_hash.entry(h).or_default().push((file_index, offset));
+                }
             }
         }
         Index {
@@ -274,8 +308,8 @@ impl<'a> Index<'a> {
     /// The maximal clone group whose first site starts at `first`, or `None`
     /// if the window there is not the left-maximal start of one.
     fn group_at(&self, first: Position) -> Option<CloneGroup> {
-        let candidates = &self.by_hash[&self.hashes[first.0][first.1]];
-        if candidates.len() < 2 || candidates[0] != first {
+        let candidates = self.by_hash.get(&self.hashes[first.0][first.1])?;
+        if candidates[0] != first {
             return None; // a group is emitted once, from its first site
         }
         let window = self.window(first);

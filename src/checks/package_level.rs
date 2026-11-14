@@ -2,6 +2,14 @@
 //! `duplicate-function-body`, `sync-async-duplication`) plus the
 //! import-resolution helpers the workspace-level graph reuses — mirrors
 //! `spaghetti/checks/package_level.py`.
+//!
+//! The checks never see a tree. A worker that has just parsed a file records
+//! the little the checks need about its functions and classes (`FileFacts`)
+//! while the tree is in hand; the parent combines facts across files. Facts
+//! carry raw measurements (line counts, similarity ratios) and the checks
+//! apply the thresholds, so one set of facts serves any
+//! `--min-duplicate-lines` or `--twin-similarity` and can live in the file
+//! cache.
 
 use crate::ast_helpers::{
     FuncNode, LineIndex, NodeLoc, collect_classes_bfs, collect_functions,
@@ -13,24 +21,11 @@ use crate::pyast::Node;
 use crate::similarity::sequence_matcher_ratio;
 use crate::unparse::unparse_function;
 use indexmap::IndexMap;
-use rustpython_ast::{Mod, Ranged, Stmt};
+use rustpython_ast::{Ranged, Stmt};
+use serde_json::{Value, json};
+use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-
-/// One parsed file, as package-level checks need it: path, source (for
-/// byte-offset → line-number conversion), and the parsed module.
-pub struct ParsedFile {
-    pub path: PathBuf,
-    pub source: String,
-    pub module: Mod,
-}
-
-fn module_body(module: &Mod) -> &[Stmt] {
-    match module {
-        Mod::Module(m) => &m.body,
-        _ => &[],
-    }
-}
 
 fn issue(
     filepath: &Path,
@@ -203,7 +198,166 @@ pub(crate) fn module_level_imports(module_body: &[Stmt]) -> Vec<ImportNode> {
     found
 }
 
-// ── Orphan Interfaces (whole-package) ────────────────────────────────────────
+// ── Per-file facts ───────────────────────────────────────────────────────────
+
+/// A function worth comparing for duplication: not a stub, not a dunder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionFact {
+    pub name: String,
+    pub loc: NodeLoc,
+    pub lines: usize,
+    /// SHA-1 of the dumped body statements; equal bodies hash equal.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassFact {
+    pub name: String,
+    pub loc: NodeLoc,
+    pub bases: Vec<String>,
+    pub abstract_: bool,
+}
+
+/// `name` has a plausible sync/async counterpart in the same scope.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TwinFact {
+    pub name: String,
+    pub counterpart: String,
+    /// Enclosing class name, or `""` at module level.
+    pub scope: String,
+    pub line: usize,
+    /// Line count of `name`'s definition (the threshold applies to it alone).
+    pub lines: usize,
+    pub ratio: f64,
+}
+
+/// What the package-level checks need about one file — mirrors
+/// `package_level.FileFacts`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileFacts {
+    pub functions: Vec<FunctionFact>,
+    pub classes: Vec<ClassFact>,
+    pub twins: Vec<TwinFact>,
+}
+
+impl FileFacts {
+    /// The cache representation; the same shape as the Python port's.
+    pub fn to_json(&self) -> Value {
+        let functions: Vec<Value> = self
+            .functions
+            .iter()
+            .map(|f| {
+                json!([
+                    f.name,
+                    f.loc.line,
+                    f.loc.column,
+                    f.loc.end_line,
+                    f.loc.end_column,
+                    f.lines,
+                    f.body
+                ])
+            })
+            .collect();
+        let classes: Vec<Value> = self
+            .classes
+            .iter()
+            .map(|c| {
+                json!([
+                    c.name,
+                    c.loc.line,
+                    c.loc.column,
+                    c.loc.end_line,
+                    c.loc.end_column,
+                    c.bases,
+                    c.abstract_
+                ])
+            })
+            .collect();
+        let twins: Vec<Value> = self
+            .twins
+            .iter()
+            .map(|t| json!([t.name, t.counterpart, t.scope, t.line, t.lines, t.ratio]))
+            .collect();
+        json!({"functions": functions, "classes": classes, "twins": twins})
+    }
+
+    /// `None` for anything that does not have exactly the expected shape.
+    pub fn from_json(data: &Value) -> Option<FileFacts> {
+        fn int(v: &Value) -> Option<usize> {
+            usize::try_from(v.as_u64()?).ok()
+        }
+        fn loc(v: &[Value]) -> Option<NodeLoc> {
+            Some(NodeLoc {
+                line: int(&v[0])?,
+                column: int(&v[1])?,
+                end_line: int(&v[2])?,
+                end_column: int(&v[3])?,
+            })
+        }
+        let functions = data
+            .get("functions")?
+            .as_array()?
+            .iter()
+            .map(|f| {
+                let f = f.as_array()?;
+                if f.len() != 7 {
+                    return None;
+                }
+                Some(FunctionFact {
+                    name: f[0].as_str()?.to_string(),
+                    loc: loc(&f[1..5])?,
+                    lines: int(&f[5])?,
+                    body: f[6].as_str()?.to_string(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let classes = data
+            .get("classes")?
+            .as_array()?
+            .iter()
+            .map(|c| {
+                let c = c.as_array()?;
+                if c.len() != 7 {
+                    return None;
+                }
+                Some(ClassFact {
+                    name: c[0].as_str()?.to_string(),
+                    loc: loc(&c[1..5])?,
+                    bases: c[5]
+                        .as_array()?
+                        .iter()
+                        .map(|b| b.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()?,
+                    abstract_: c[6].as_bool()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let twins = data
+            .get("twins")?
+            .as_array()?
+            .iter()
+            .map(|t| {
+                let t = t.as_array()?;
+                if t.len() != 6 {
+                    return None;
+                }
+                Some(TwinFact {
+                    name: t[0].as_str()?.to_string(),
+                    counterpart: t[1].as_str()?.to_string(),
+                    scope: t[2].as_str()?.to_string(),
+                    line: int(&t[3])?,
+                    lines: int(&t[4])?,
+                    ratio: t[5].as_f64()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(FileFacts {
+            functions,
+            classes,
+            twins,
+        })
+    }
+}
 
 /// `base.id` for a `Name`, `base.attr` for an `Attribute`, else `None` —
 /// the two spellings the Python check recognises.
@@ -215,64 +369,100 @@ fn simple_name(expr: &rustpython_ast::Expr) -> Option<&str> {
     }
 }
 
+const ABSTRACT_BASES: [&str; 2] = ["ABC", "Protocol"];
+
+/// `_base_names_of`: the `Name`/`Attribute` bases, in order.
+fn base_names_of(class: &rustpython_ast::StmtClassDef) -> Vec<String> {
+    class
+        .bases
+        .iter()
+        .filter_map(simple_name)
+        .map(str::to_string)
+        .collect()
+}
+
+fn has_abc_metaclass(class: &rustpython_ast::StmtClassDef) -> bool {
+    class.keywords.iter().any(|keyword| {
+        keyword
+            .arg
+            .as_ref()
+            .is_some_and(|a| a.as_str() == "metaclass")
+            && simple_name(&keyword.value) == Some("ABCMeta")
+    })
+}
+
+/// Record the facts of one parsed file — mirrors `collect_facts`. Functions
+/// and classes come out in `ast.walk` (breadth-first) order, twins in the
+/// pre-order of `_walk_with_class_context`.
+pub fn collect_facts(module_body: &[Stmt], source: &str, line_index: &LineIndex) -> FileFacts {
+    let mut facts = FileFacts::default();
+    for func in collect_functions(module_body) {
+        if is_trivial_body(func.body()) || is_dunder(&func.name) {
+            continue; // `__repr__`/`__eq__` across sibling classes are protocol hooks
+        }
+        let digest = Sha1::digest(dump_stmts(func.body()).as_bytes());
+        facts.functions.push(FunctionFact {
+            name: func.name.clone(),
+            loc: line_index.node_loc(func.range()),
+            lines: line_count(line_index, func.start, func.end()),
+            body: digest.iter().map(|b| format!("{b:02x}")).collect(),
+        });
+    }
+    for class in collect_classes_bfs(module_body) {
+        let bases = base_names_of(class);
+        let abstract_ =
+            bases.iter().any(|b| ABSTRACT_BASES.contains(&b.as_str())) || has_abc_metaclass(class);
+        facts.classes.push(ClassFact {
+            name: class.name.to_string(),
+            loc: line_index.node_loc(class.range()),
+            bases,
+            abstract_,
+        });
+    }
+    facts.twins = twin_facts(module_body, source, line_index);
+    facts
+}
+
+// ── Rule: Orphan Interfaces ──────────────────────────────────────────────────
+
 /// Detect abstract classes with exactly one concrete implementation —
 /// mirrors `package_level.py::check_orphan_interfaces_pkg`.
 ///
 /// This is a classic 'Speculative Generality' code smell. If an interface
 /// only exists to be implemented by a single class, it is likely adding
 /// mental overhead without providing any polymorphic value.
-pub fn check_orphan_interfaces_pkg(pkg_name: &str, files: &[ParsedFile]) -> Vec<Issue> {
+pub fn check_orphan_interfaces_pkg(pkg_name: &str, files: &[(PathBuf, FileFacts)]) -> Vec<Issue> {
     // Insertion-ordered like Python's dict: a same-named interface in a
     // later file keeps the first file's position but takes its location.
-    let mut interfaces: IndexMap<&str, (&Path, &rustpython_ast::StmtClassDef, &str)> =
-        IndexMap::new();
+    let mut interfaces: IndexMap<&str, (&Path, &ClassFact)> = IndexMap::new();
     let mut implementations: HashMap<&str, Vec<&str>> = HashMap::new();
 
-    for file in files {
-        for class in collect_classes_bfs(module_body(&file.module)) {
-            let mut is_abstract = false;
-            for base in &class.bases {
-                match simple_name(base) {
-                    Some("ABC") | Some("Protocol") => is_abstract = true,
-                    Some(base_name) if !base_name.is_empty() => {
-                        implementations
-                            .entry(base_name)
-                            .or_default()
-                            .push(class.name.as_str());
-                    }
-                    _ => {}
+    for (filepath, facts) in files {
+        for class in &facts.classes {
+            for base_name in &class.bases {
+                if !ABSTRACT_BASES.contains(&base_name.as_str()) {
+                    implementations
+                        .entry(base_name.as_str())
+                        .or_default()
+                        .push(class.name.as_str());
                 }
             }
-            for keyword in &class.keywords {
-                if keyword
-                    .arg
-                    .as_ref()
-                    .is_some_and(|a| a.as_str() == "metaclass")
-                    && simple_name(&keyword.value) == Some("ABCMeta")
-                {
-                    is_abstract = true;
-                }
-            }
-            if is_abstract {
-                interfaces.insert(
-                    class.name.as_str(),
-                    (file.path.as_path(), class, file.source.as_str()),
-                );
+            if class.abstract_ {
+                interfaces.insert(class.name.as_str(), (filepath.as_path(), class));
             }
         }
     }
 
     let mut issues = Vec::new();
-    for (iface_name, (filepath, class, source)) in &interfaces {
+    for (iface_name, (filepath, class)) in &interfaces {
         let impls = implementations
             .get(iface_name)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         if let [impl_name] = impls {
-            let line_index = LineIndex::new(source);
             issues.push(issue_at(
                 filepath,
-                line_index.node_loc(class.range()),
+                class.loc,
                 Severity::Info,
                 "orphan-interface",
                 pkg_name,
@@ -291,32 +481,24 @@ pub fn check_orphan_interfaces_pkg(pkg_name: &str, files: &[ParsedFile]) -> Vec<
 // A body needs at least this many occurrences to be a "duplicate" at all.
 const MIN_DUPLICATE_OCCURRENCES: usize = 2;
 
+/// Finds functions/methods with byte-for-byte identical bodies anywhere in
+/// the package — mirrors `check_duplicate_functions_pkg`.
 pub fn check_duplicate_functions_pkg(
     pkg_name: &str,
-    files: &[ParsedFile],
+    files: &[(PathBuf, FileFacts)],
     min_lines: usize,
 ) -> Vec<Issue> {
     // Insertion-ordered like Python's dict: issues come out in the order each
-    // duplicate group was first seen, which (with `collect_functions` in
-    // `ast.walk` order) is the order the original reports them in.
-    let mut groups: IndexMap<String, Vec<(&Path, String, NodeLoc)>> = IndexMap::new();
-
-    for f in files {
-        let line_index = LineIndex::new(&f.source);
-        for func in collect_functions(module_body(&f.module)) {
-            let lines = line_count(&line_index, func.start, func.end());
-            if lines < min_lines || is_trivial_body(func.body()) {
-                continue;
+    // duplicate group was first seen.
+    let mut groups: IndexMap<&str, Vec<(&Path, &FunctionFact)>> = IndexMap::new();
+    for (filepath, facts) in files {
+        for func in &facts.functions {
+            if func.lines >= min_lines {
+                groups
+                    .entry(func.body.as_str())
+                    .or_default()
+                    .push((filepath.as_path(), func));
             }
-            if is_dunder(&func.name) {
-                continue; // `__repr__`/`__eq__` across sibling classes are protocol hooks
-            }
-            let key = dump_stmts(func.body());
-            groups.entry(key).or_default().push((
-                f.path.as_path(),
-                func.name.clone(),
-                line_index.node_loc(func.range()),
-            ));
         }
     }
 
@@ -326,16 +508,23 @@ pub fn check_duplicate_functions_pkg(
             continue;
         }
         occurrences.sort_by(|a, b| {
-            (a.0.to_string_lossy(), a.2.line).cmp(&(b.0.to_string_lossy(), b.2.line))
+            (a.0.to_string_lossy(), a.1.loc.line).cmp(&(b.0.to_string_lossy(), b.1.loc.line))
         });
         let locations: Vec<String> = occurrences
             .iter()
-            .map(|(fp, name, loc)| format!("{}:{} ({name})", display_path(fp, None), loc.line))
+            .map(|(fp, func)| {
+                format!(
+                    "{}:{} ({})",
+                    display_path(fp, None),
+                    func.loc.line,
+                    func.name
+                )
+            })
             .collect();
-        let (first_fp, _, first_loc) = occurrences[0];
+        let (first_fp, first) = occurrences[0];
         issues.push(issue_at(
             first_fp,
-            first_loc,
+            first.loc,
             Severity::Warning,
             "duplicate-function-body",
             pkg_name,
@@ -386,129 +575,145 @@ fn twin_candidates(name: &str) -> Vec<String> {
     candidates
 }
 
+/// Every (function, plausible counterpart) pair in one scope of the file,
+/// with how similar their source text is — mirrors `_twin_facts`. Scopes are
+/// visited in tree order, pairs in definition order, counterparts in sorted
+/// order, so the list is the same on every run.
+fn twin_facts(module_body: &[Stmt], source: &str, line_index: &LineIndex) -> Vec<TwinFact> {
+    // Insertion-ordered, matching Python's dict: a scope is keyed by class
+    // *name*, so two same-named classes in one file share a scope, and a
+    // redefined function keeps its first position but takes the later node.
+    let owned: Vec<(Option<String>, FuncNode)> = collect_functions_with_class_context(module_body);
+    let mut scopes: IndexMap<Option<&str>, IndexMap<&str, &FuncNode>> = IndexMap::new();
+    for (class_name, func) in &owned {
+        scopes
+            .entry(class_name.as_deref())
+            .or_default()
+            .insert(func.name.as_str(), func);
+    }
+    let mut facts = Vec::new();
+    for (class_name, by_name) in &scopes {
+        let scope = class_name.unwrap_or_default();
+        twins_in_scope(scope, by_name, source, line_index, &mut facts);
+    }
+    facts
+}
+
+fn twins_in_scope(
+    scope: &str,
+    by_name: &IndexMap<&str, &FuncNode>,
+    source: &str,
+    line_index: &LineIndex,
+    facts: &mut Vec<TwinFact>,
+) {
+    let mut text: HashMap<&str, String> = HashMap::new();
+    for (name, func) in by_name {
+        for counterpart in twin_candidates(name) {
+            if counterpart == *name {
+                continue;
+            }
+            let Some((counterpart, other)) = by_name.get_key_value(counterpart.as_str()) else {
+                continue;
+            };
+            // `ast.unparse` once per function, however many pairs name it.
+            for (key, node) in [(*name, *func), (*counterpart, *other)] {
+                text.entry(key)
+                    .or_insert_with(|| unparse_function(&node.stmt, source));
+            }
+            let ratio = sequence_matcher_ratio(&text[name], &text[counterpart]);
+            let line = line_index
+                .line_number(func.start)
+                .min(line_index.line_number(other.start));
+            facts.push(TwinFact {
+                name: name.to_string(),
+                counterpart: counterpart.to_string(),
+                scope: scope.to_string(),
+                line,
+                lines: line_count(line_index, func.start, func.end()),
+                ratio,
+            });
+        }
+    }
+}
+
+/// Flags function pairs that look like a sync/async "twin" (by name) and
+/// whose bodies are highly similar text — mirrors `check_sync_async_twins_pkg`.
 pub fn check_sync_async_twins_pkg(
     pkg_name: &str,
-    files: &[ParsedFile],
+    files: &[(PathBuf, FileFacts)],
     min_ratio: f64,
 ) -> Vec<Issue> {
     let min_twin_function_lines = thresholds().min_twin_function_lines;
-    // Insertion-ordered, matching Python's dict (insertion order = file-walk
-    // order, itself sorted by `scanner.rs`) — deliberately not a plain
-    // `HashMap`. `reported`'s dedup key doesn't include the file path (same
-    // as Python's own `pair_key`), so when two different files each define
-    // a same-named class with same-named twin methods (found for real:
-    // two separate `class FrameEnricher(Protocol)` definitions, in
-    // `enrichment/async_enricher.py` and `pipelines/base.py`, confirmed via
-    // the conformance diff), only the file processed *first* gets reported
-    // — a genuine Python quirk, not a bug to fix, but one that requires
-    // matching Python's deterministic insertion order to reproduce which
-    // file "wins", rather than an arbitrary hash-map iteration order.
-    let mut scope_functions: indexmap::IndexMap<
-        (&Path, Option<String>),
-        indexmap::IndexMap<String, &FuncNode>,
-    > = indexmap::IndexMap::new();
-    let mut owned_funcs: Vec<(&Path, Option<String>, FuncNode)> = Vec::new();
-
-    for f in files {
-        for (class_name, func) in collect_functions_with_class_context(module_body(&f.module)) {
-            owned_funcs.push((f.path.as_path(), class_name, func));
-        }
-    }
-    for (path, class_name, func) in &owned_funcs {
-        scope_functions
-            .entry((*path, class_name.clone()))
-            .or_default()
-            .insert(func.name.clone(), func);
-    }
-
-    // Need a LineIndex per file to compute line numbers for the min-4-lines
-    // filter and the reported position.
-    let line_indices: HashMap<&Path, LineIndex> = files
-        .iter()
-        .map(|f| (f.path.as_path(), LineIndex::new(&f.source)))
-        .collect();
-
-    let files_by_path: HashMap<&Path, &ParsedFile> =
-        files.iter().map(|f| (f.path.as_path(), f)).collect();
     let mut issues = Vec::new();
-    let mut reported: HashSet<Vec<(String, String)>> = HashSet::new();
-
-    for ((filepath, class_name), by_name) in &scope_functions {
-        let line_index = &line_indices[filepath];
-        for (name, func) in by_name {
-            let lines = line_count(line_index, func.start, func.end());
-            if lines < min_twin_function_lines {
+    for (filepath, facts) in files {
+        // A pair is one finding however it is reached (read → aread and
+        // aread → read). The scope is part of the key: Request.read/aread and
+        // Response.read/aread in one file are two twin pairs, not one.
+        let mut reported: HashSet<(&str, [&str; 2])> = HashSet::new();
+        for twin in &facts.twins {
+            if twin.lines < min_twin_function_lines {
                 continue;
             }
-            for candidate in twin_candidates(name) {
-                if &candidate == name {
-                    continue;
-                }
-                let Some(other_func) = by_name.get(&candidate) else {
-                    continue;
-                };
-                let class_key = class_name.clone().unwrap_or_default();
-                let mut pair_key = vec![
-                    (name.clone(), class_key.clone()),
-                    (candidate.clone(), class_key),
-                ];
-                pair_key.sort();
-                if reported.contains(&pair_key) {
-                    continue;
-                }
-                let ratio = sequence_matcher_ratio(
-                    &unparse_function(&func.stmt, &files_by_path[filepath].source),
-                    &unparse_function(&other_func.stmt, &files_by_path[filepath].source),
-                );
-                if ratio >= min_ratio {
-                    reported.insert(pair_key);
-                    let line = line_index
-                        .line_number(func.start)
-                        .min(line_index.line_number(other_func.start));
-                    issues.push(issue(
-                        filepath,
-                        line,
-                        Severity::Warning,
-                        "sync-async-duplication",
-                        pkg_name,
-                        format!(
-                            "{name}() and {candidate}() are {:.0}% similar — likely copy-pasted sync/async twins; extract a shared helper for the non-blocking parts",
-                            ratio * 100.0
-                        ),
-                    ));
-                }
+            let mut pair = [twin.name.as_str(), twin.counterpart.as_str()];
+            pair.sort_unstable();
+            let pair_key = (twin.scope.as_str(), pair);
+            if reported.contains(&pair_key) || twin.ratio < min_ratio {
+                continue;
             }
+            reported.insert(pair_key);
+            issues.push(issue(
+                filepath,
+                twin.line,
+                Severity::Warning,
+                "sync-async-duplication",
+                pkg_name,
+                format!(
+                    "{}() and {}() are {:.0}% similar — likely copy-pasted sync/async twins; extract a shared helper for the non-blocking parts",
+                    twin.name,
+                    twin.counterpart,
+                    twin.ratio * 100.0
+                ),
+            ));
         }
     }
     issues
 }
 
 #[cfg(test)]
-mod calibration_tests {
-    //! Mirrors the package-level half of the Python repo's tests/test_calibration.py.
-    use super::{ParsedFile, check_duplicate_functions_pkg};
+pub(crate) mod test_support {
+    use super::{FileFacts, collect_facts};
+    use crate::ast_helpers::LineIndex;
+    use rustpython_ast::Mod;
     use std::path::PathBuf;
 
-    const ROOT: &str = "/tmp/pkg";
+    /// The facts of `source` as a module.
+    pub(crate) fn facts_of(source: &str, name: &str) -> FileFacts {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, name)
+            .expect("test source must parse");
+        let Mod::Module(m) = module else {
+            unreachable!()
+        };
+        collect_facts(&m.body, source, &LineIndex::new(source))
+    }
 
-    fn pkg(files: &[(&str, &str)]) -> Vec<ParsedFile> {
-        let mut parsed: Vec<ParsedFile> = files
+    /// `(path, facts)` per file under `root`, in path order.
+    pub(crate) fn pkg(root: &str, files: &[(&str, &str)]) -> Vec<(PathBuf, FileFacts)> {
+        let mut parsed: Vec<(PathBuf, FileFacts)> = files
             .iter()
-            .map(|(name, source)| {
-                let path = PathBuf::from(ROOT).join(name);
-                let module =
-                    rustpython_parser::parse(source, rustpython_parser::Mode::Module, name)
-                        .expect("test source must parse");
-                ParsedFile {
-                    path,
-                    source: source.to_string(),
-                    module,
-                }
-            })
+            .map(|(name, source)| (PathBuf::from(root).join(name), facts_of(source, name)))
             .collect();
-        parsed.sort_by(|a, b| a.path.cmp(&b.path));
+        parsed.sort_by(|a, b| a.0.cmp(&b.0));
         parsed
     }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    //! Mirrors the package-level half of the Python repo's tests/test_calibration.py.
+    use super::check_duplicate_functions_pkg;
+    use super::test_support::pkg;
+
+    const ROOT: &str = "/tmp/pkg";
 
     #[test]
     fn duplicate_function_body_skips_dunder_protocol_hooks() {
@@ -516,42 +721,40 @@ mod calibration_tests {
                     return f'{a}{b}{c}'\n";
         let a = format!("class A:\n{body}");
         let b = format!("class B:\n{body}");
-        let files = pkg(&[("a.py", &a), ("b.py", &b)]);
+        let files = pkg(ROOT, &[("a.py", &a), ("b.py", &b)]);
         assert!(check_duplicate_functions_pkg("pkg", &files, 5).is_empty());
-        let files = pkg(&[
-            ("a.py", &a.replace("__repr__", "render")),
-            ("b.py", &b.replace("__repr__", "render")),
-        ]);
+        let files = pkg(
+            ROOT,
+            &[
+                ("a.py", &a.replace("__repr__", "render")),
+                ("b.py", &b.replace("__repr__", "render")),
+            ],
+        );
         assert_eq!(check_duplicate_functions_pkg("pkg", &files, 5).len(), 1);
     }
 }
 
 #[cfg(test)]
-mod twin_order_tests {
-    //! Mirrors tests/test_package_level.py::test_twin_pairs_are_reported_in_a_seed_independent_order.
-    use super::{ParsedFile, check_sync_async_twins_pkg};
-    use std::path::PathBuf;
+mod twin_tests {
+    //! Mirrors the twin tests in tests/test_package_level.py.
+    use super::test_support::pkg;
+    use super::{FileFacts, check_sync_async_twins_pkg};
+
+    fn body(kw: &str, name: &str, call: &str) -> String {
+        format!(
+            "{kw}def {name}(key):\n    value = {call}(key)\n    if value is None:\n        raise KeyError(key)\n    return decode(value)\n\n"
+        )
+    }
 
     #[test]
     fn twin_pairs_are_reported_in_sorted_candidate_order() {
-        let body = |kw: &str, name: &str, call: &str| {
-            format!(
-                "{kw}def {name}(key):\n    value = {call}(key)\n    if value is None:\n        raise KeyError(key)\n    return decode(value)\n\n"
-            )
-        };
         let source = format!(
             "{}{}{}",
             body("", "get", "store.read"),
             body("async ", "aget", "await store.aread"),
             body("async ", "get_async", "await store.aread"),
         );
-        let module =
-            rustpython_parser::parse(&source, rustpython_parser::Mode::Module, "m.py").unwrap();
-        let files = vec![ParsedFile {
-            path: PathBuf::from("/tmp/pkg/m.py"),
-            source,
-            module,
-        }];
+        let files = pkg("/tmp/pkg", &[("m.py", &source)]);
         let messages: Vec<String> = check_sync_async_twins_pkg("pkg", &files, 0.6)
             .into_iter()
             .map(|i| i.message)
@@ -562,5 +765,104 @@ mod twin_order_tests {
             messages[1].starts_with("get() and get_async()"),
             "{messages:?}"
         );
+    }
+
+    #[test]
+    fn twin_pairs_in_different_files_are_each_reported() {
+        // Mirrors test_twin_pairs_in_different_files_are_each_reported: the
+        // dedup key is per file, so module-level get/aget in two files are
+        // two findings, as are same-named methods of two classes.
+        let module = format!(
+            "{}{}",
+            body("", "get", "store.read"),
+            body("async ", "aget", "await store.aread")
+        );
+        let class = |name: &str| {
+            format!(
+                "class {name}:\n{}",
+                module
+                    .lines()
+                    .map(|l| if l.is_empty() {
+                        String::new()
+                    } else {
+                        format!("    {l}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        let files = pkg(
+            "/tmp/pkg",
+            &[
+                ("a.py", &module),
+                ("b.py", &module),
+                ("c.py", &format!("{}\n{}", class("Store"), class("Store"))),
+                ("d.py", &class("Store")),
+            ],
+        );
+        let issues = check_sync_async_twins_pkg("pkg", &files, 0.6);
+        let files_reported: Vec<String> = issues
+            .iter()
+            .map(|i| i.file.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Two same-named classes in one file share a scope: one finding.
+        assert_eq!(files_reported, ["a.py", "b.py", "c.py", "d.py"]);
+        assert!(
+            issues
+                .iter()
+                .all(|i| i.message.starts_with("get() and aget()"))
+        );
+    }
+
+    #[test]
+    fn facts_round_trip_through_json() {
+        // Mirrors test_facts_round_trip_through_json.
+        let source = "from abc import ABC\n\
+                      class Base(ABC):\n    pass\n\
+                      class Impl(Base):\n    pass\n\
+                      def f(x):\n    y = x + 1\n    z = y * 2\n    return z\n\
+                      async def af(x):\n    y = x + 1\n    z = y * 2\n    return z\n";
+        let facts = super::test_support::facts_of(source, "m.py");
+        let names = |v: &[String]| v.to_vec();
+        assert_eq!(
+            names(
+                &facts
+                    .classes
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>()
+            ),
+            ["Base", "Impl"]
+        );
+        assert!(facts.classes[0].abstract_ && !facts.classes[1].abstract_);
+        assert_eq!(facts.classes[1].bases, ["Base"]);
+        assert_eq!(
+            facts
+                .functions
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["f", "af"]
+        );
+        assert_eq!(facts.functions[0].body, facts.functions[1].body);
+        assert_eq!(facts.functions[0].lines, 4);
+        let pairs: std::collections::HashSet<(&str, &str)> = facts
+            .twins
+            .iter()
+            .map(|t| (t.name.as_str(), t.counterpart.as_str()))
+            .collect();
+        assert_eq!(pairs, [("f", "af"), ("af", "f")].into_iter().collect());
+        assert!(
+            facts
+                .twins
+                .iter()
+                .all(|t| t.scope.is_empty() && t.line == 6)
+        );
+        let back = FileFacts::from_json(&facts.to_json()).expect("facts parse back");
+        assert_eq!(back, facts);
+        let text = facts.to_json().to_string();
+        let reparsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(FileFacts::from_json(&reparsed).unwrap(), facts);
+        assert!(FileFacts::from_json(&serde_json::json!({"functions": []})).is_none());
     }
 }

@@ -24,7 +24,7 @@ impl Severity {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Issue {
     pub file: PathBuf,
     pub line: usize,

@@ -111,7 +111,7 @@ fn cache_hit_reproduces_the_uncached_result_exactly() {
     assert_eq!(stored.len(), 2);
     let data: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&stored[0]).unwrap()).unwrap();
-    assert_eq!(data["schema_version"], 1);
+    assert_eq!(data["schema_version"], 2);
     for key in [
         "issues",
         "parsed",
@@ -119,6 +119,7 @@ fn cache_hit_reproduces_the_uncached_result_exactly() {
         "mi",
         "raw_imports",
         "tokens",
+        "facts",
     ] {
         assert!(data.get(key).is_some(), "{key}");
     }

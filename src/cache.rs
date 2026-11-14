@@ -7,23 +7,24 @@
 //! settings, the tool version and the Python language version the checks
 //! model — so changing a threshold or upgrading invalidates everything at
 //! once without a manifest. An entry holds exactly what the scanner produces
-//! for a file before the package-wide finalisation: raw findings (byte-offset
-//! columns, no fingerprints), the Maintainability Index, the function count,
-//! and the two workspace transports (raw imports, token stream). On a hit
-//! the file is still parsed, because the package-level checks need the tree.
+//! for a file before finalisation: raw findings (byte-offset columns, no
+//! fingerprints), the Maintainability Index, the function count, the two
+//! workspace transports (raw imports, token stream) and the per-file facts
+//! the package-level checks combine. A hit therefore needs no parse at all.
 //!
 //! Entries are written atomically (temp file + rename) so concurrent package
 //! scans can share one directory, and any unreadable or mismatching entry is
 //! a miss, never an error.
 //!
 //! The entry JSON has the same shape as the Python port's (`schema_version`
-//! 1), so either can be inspected the same way. The configuration key has the
+//! 2), so either can be inspected the same way. The configuration key has the
 //! same structure (`{"schema", "tool", "python", "overrides"}`, canonical
 //! JSON, first 16 hex digits of its SHA-1) but is deliberately never equal to
 //! Python's: `tool` is `"<version>-rs"`, and the overrides are this port's
 //! own serialisation. The two tools therefore never read each other's
 //! entries, even when pointed at the same `.spaghetti/cache`.
 
+use crate::checks::package_level::FileFacts;
 use crate::checks::workspace_level::RawImport;
 use crate::clones::TokenStream;
 use crate::config::{RuleSetting, ThresholdValue};
@@ -37,7 +38,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const CACHE_SCHEMA_VERSION: u64 = 1;
+pub const CACHE_SCHEMA_VERSION: u64 = 2;
 pub const DEFAULT_CACHE_DIR: &str = ".spaghetti/cache";
 /// The Python version whose `ast` semantics the checks reproduce.
 pub const PYTHON_VERSION: [u64; 2] = [3, 13];
@@ -170,6 +171,7 @@ pub struct FileEntry {
     pub mi: Option<f64>,
     pub raw_imports: Option<Vec<RawImport>>,
     pub tokens: Option<TokenStream>,
+    pub facts: Option<FileFacts>,
 }
 
 impl FileEntry {
@@ -208,6 +210,7 @@ impl FileEntry {
             "mi": self.mi,
             "raw_imports": raw_imports,
             "tokens": tokens,
+            "facts": self.facts.as_ref().map(FileFacts::to_json),
         })
     }
 
@@ -316,6 +319,10 @@ impl FileEntry {
             Value::Null => None,
             v => Some(v.as_f64()?),
         };
+        let facts = match data.get("facts")? {
+            Value::Null => None,
+            v => Some(FileFacts::from_json(v)?),
+        };
         Some(FileEntry {
             issues,
             parsed: data.get("parsed")?.as_bool()?,
@@ -323,6 +330,7 @@ impl FileEntry {
             mi,
             raw_imports,
             tokens,
+            facts,
         })
     }
 }
