@@ -74,7 +74,7 @@ pub const RULE_DOCS: &[(&str, RuleDoc)] = &[
     (
         "deep-nesting",
         RuleDoc {
-            why: "Every nesting level is a precondition the reader must carry; past four or five the indentation itself hides which branch a line belongs to.",
+            why: "Every nesting level is a precondition the reader must carry; past four or five the indentation itself hides which branch a line belongs to. Depth is counted the way the code is indented: `if`, `for`, `while`, `with`, `try`, `match` and `case` (and their `async` forms) each add a level; `elif`, `except`, `else` and `finally` are siblings of the block they follow and add none.",
             fix: "Invert conditions into guard clauses that `return`/`continue` early, extract the inner block into a named function, or replace nested loops with a comprehension.",
             equivalents: &[
                 "Pylint R1702 too-many-nested-blocks",

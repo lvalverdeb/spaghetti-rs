@@ -329,38 +329,73 @@ pub fn cyclomatic_complexity(func: &FuncNode) -> i64 {
 
 // ── Nesting depth ────────────────────────────────────────────────────────────
 
-/// The node kinds `_nesting_depth` / `_count_nested_returns` count as one
-/// level: `If`, `For`, `While`, `With`, `Try` and `ExceptHandler` — *not*
-/// their async forms, `TryStar` or `Match` (Python's `isinstance` tuple
-/// lists exactly these six classes).
+/// Mirrors `ast_helpers.py::_NESTING_NODES`: the compound statements whose
+/// body is indented one level deeper than they are. `match` and each `case`
+/// both count, so a case body sits two levels inside the enclosing block.
+/// `except`/`else`/`finally` bodies are siblings of the `try` body, and an
+/// `elif` is a sibling of its `if`, so neither adds a level — see
+/// [`child_depth`].
 fn is_nesting_node(node: Node<'_>) -> bool {
     matches!(
         node,
-        Node::Stmt(Stmt::If(_) | Stmt::For(_) | Stmt::While(_) | Stmt::With(_) | Stmt::Try(_))
-            | Node::Handler(_)
+        Node::Stmt(
+            Stmt::If(_)
+                | Stmt::For(_)
+                | Stmt::AsyncFor(_)
+                | Stmt::While(_)
+                | Stmt::With(_)
+                | Stmt::AsyncWith(_)
+                | Stmt::Try(_)
+                | Stmt::TryStar(_)
+                | Stmt::Match(_)
+        ) | Node::MatchCase(_)
     )
 }
 
-/// Mirrors `ast_helpers.py::_nesting_depth` on the function node, over the
+/// Mirrors `ast_helpers.py::_child_depth`: the nesting depth of `child`'s
+/// own body given that `parent`'s body is at `current` — one deeper for a
+/// compound statement, the same for an `elif` or anything else. An `elif` is
+/// the sole `orelse` of its `if` *and* starts in the same column (CPython and
+/// rustpython-parser both give the nested `If` the column of the `elif`
+/// keyword); `else:` followed by an indented `if` has the same tree shape but
+/// sits one column level deeper, which is exactly the level the reader sees.
+fn child_depth(parent: Node<'_>, child: Node<'_>, current: usize, index: &LineIndex) -> usize {
+    if !is_nesting_node(child) {
+        return current;
+    }
+    if let (Node::Stmt(Stmt::If(p)), Node::Stmt(c @ Stmt::If(ci))) = (parent, child) {
+        let is_elif = p.orelse.len() == 1
+            && std::ptr::eq(&p.orelse[0], c)
+            && index.column(ci.range.start()) == index.column(p.range.start());
+        if is_elif {
+            return current;
+        }
+    }
+    current + 1
+}
+
+/// Mirrors `ast_helpers.py::_nesting_depth` on the function node: the
+/// maximum block nesting depth inside it — the number of indentation levels
+/// a reader must carry, counting every compound statement once. Walks the
 /// CPython-shaped tree (decorators, defaults and nested defs included, the
 /// way `ast.iter_child_nodes` reaches them). Iterative, so a pathological
 /// file cannot overflow the stack here.
-pub fn nesting_depth(func: &FuncNode) -> usize {
+pub fn nesting_depth(func: &FuncNode, index: &LineIndex) -> usize {
     let mut max_depth = 0;
     let mut stack = vec![(Node::Stmt(&func.stmt), 0usize)];
     while let Some((node, current)) = stack.pop() {
         max_depth = max_depth.max(current);
         for child in node.children() {
-            let depth = current + usize::from(is_nesting_node(child));
-            stack.push((child, depth));
+            stack.push((child, child_depth(node, child, current, index)));
         }
     }
     max_depth
 }
 
 /// Mirrors `ast_helpers.py::_count_nested_returns`: `Return` statements at
-/// nesting depth >= 2, not descending into nested defs or lambdas.
-pub fn count_nested_returns(func: &FuncNode) -> i64 {
+/// nesting depth >= 2 (the same [`child_depth`] as [`nesting_depth`]), not
+/// descending into nested defs or lambdas.
+pub fn count_nested_returns(func: &FuncNode, index: &LineIndex) -> i64 {
     let mut count = 0;
     let mut stack = vec![(Node::Stmt(&func.stmt), 0usize)];
     while let Some((node, current)) = stack.pop() {
@@ -372,14 +407,10 @@ pub fn count_nested_returns(func: &FuncNode) -> i64 {
             ) {
                 continue;
             }
-            if is_nesting_node(child) {
-                stack.push((child, current + 1));
-            } else {
-                if matches!(child, Node::Stmt(Stmt::Return(_))) && current >= 2 {
-                    count += 1;
-                }
-                stack.push((child, current));
+            if matches!(child, Node::Stmt(Stmt::Return(_))) && current >= 2 {
+                count += 1;
             }
+            stack.push((child, child_depth(node, child, current, index)));
         }
     }
     count
@@ -510,4 +541,75 @@ pub fn walk_stmts_bfs(module_body: &[Stmt]) -> Vec<WalkNode<'_>> {
         }
     }
     visited
+}
+
+#[cfg(test)]
+mod nesting_tests {
+    use super::{LineIndex, collect_functions, count_nested_returns, nesting_depth};
+    use rustpython_ast::Mod;
+
+    fn first_func_metric(
+        source: &str,
+        metric: impl Fn(&super::FuncNode, &LineIndex) -> usize,
+    ) -> usize {
+        let module = rustpython_parser::parse(source, rustpython_parser::Mode::Module, "f.py")
+            .expect("test source must parse");
+        let Mod::Module(m) = &module else {
+            unreachable!("Mode::Module parses to Mod::Module")
+        };
+        let funcs = collect_functions(&m.body);
+        metric(&funcs[0], &LineIndex::new(source))
+    }
+
+    fn depth(body: &str) -> usize {
+        first_func_metric(&format!("async def f(x):\n{body}"), nesting_depth)
+    }
+
+    /// Mirrors `test_nesting_depth_follows_indentation`.
+    #[test]
+    fn nesting_depth_follows_indentation() {
+        // Every compound statement adds one level, including the async forms,
+        // try*, match and case.
+        assert_eq!(depth("    if x:\n        pass\n"), 1);
+        assert_eq!(
+            depth("    async for a in x:\n        async with a:\n            pass\n"),
+            2
+        );
+        assert_eq!(
+            depth("    try:\n        pass\n    except* ValueError:\n        pass\n"),
+            1
+        );
+        assert_eq!(
+            depth("    match x:\n        case 1:\n            if x:\n                pass\n"),
+            3
+        );
+        // Siblings of a block add nothing: elif chains, except/else/finally bodies.
+        assert_eq!(
+            depth(
+                "    if x:\n        pass\n    elif x:\n        pass\n    elif x:\n        pass\n"
+            ),
+            1
+        );
+        assert_eq!(
+            depth("    if x:\n        pass\n    else:\n        if x:\n            pass\n"),
+            2
+        );
+        assert_eq!(
+            depth(
+                "    try:\n        pass\n    except ValueError:\n        if x:\n            pass\n"
+            ),
+            2
+        );
+        assert_eq!(
+            depth("    try:\n        pass\n    finally:\n        if x:\n            pass\n"),
+            2
+        );
+        // Nested returns use the same depth: an except body is at the try's level.
+        let returns = first_func_metric(
+            "def f(x):\n    for a in x:\n        try:\n            return 1\n\
+             \x20       except ValueError:\n            return 2\n        else:\n            return 3\n",
+            |f, i| usize::try_from(count_nested_returns(f, i)).unwrap(),
+        );
+        assert_eq!(returns, 3);
+    }
 }

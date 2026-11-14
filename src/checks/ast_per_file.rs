@@ -86,7 +86,9 @@ pub fn check_long_functions(
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
         let lines = line_count(&line_index, func.start, func.end());
-        if lines > max_function_lines && nesting_depth(&func) > long_function_flat_nesting_max {
+        if lines > max_function_lines
+            && nesting_depth(&func, &line_index) > long_function_flat_nesting_max
+        {
             issues.push(issue_at(
                 filepath,
                 &line_index,
@@ -369,7 +371,7 @@ pub fn check_excessive_returns(
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
-        let n = count_nested_returns(&func);
+        let n = count_nested_returns(&func, &line_index);
         if n > max_returns as i64 {
             issues.push(issue_at(
                 filepath,
@@ -489,7 +491,7 @@ pub fn check_deep_nesting(
     let line_index = LineIndex::new(source);
     let mut issues = Vec::new();
     for func in collect_functions(module_body(module)) {
-        let depth = nesting_depth(&func);
+        let depth = nesting_depth(&func, &line_index);
         if depth > max_nesting_depth {
             issues.push(issue_at(
                 filepath,
@@ -3821,9 +3823,10 @@ mod walk_order_tests {
     }
 
     #[test]
-    fn async_for_and_async_with_do_not_count_as_nesting() {
+    fn async_for_and_async_with_count_as_nesting() {
         let body = "async def f(xs):\n    if xs:\n        async for x in xs:\n            async with x:\n                for y in x:\n                    if y:\n                        while y:\n                            if y:\n                                pass\n";
-        // if / for / if / while / if = 5, not 7.
-        assert!(lines(check_deep_nesting, body).is_empty());
+        // if / async for / async with / for / if / while / if = 7: every
+        // compound statement counts, as the code is indented.
+        assert_eq!(lines(check_deep_nesting, body), vec![1]);
     }
 }
