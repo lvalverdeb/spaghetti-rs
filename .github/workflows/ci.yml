@@ -159,6 +159,6 @@ jobs:
           path: spaghetti/.spaghetti/corpus
           key: corpus-${{ hashFiles('spaghetti/scripts/corpus.lock') }}
 
-      - name: Rust port under 10 s on the combined corpus
+      - name: Rust port under 15 s on the combined corpus
         working-directory: spaghetti
         run: uv run python scripts/bench.py --rust ../spaghetti-rs/target/release/spaghetti --rust-budget 15
