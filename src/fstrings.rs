@@ -40,6 +40,7 @@ impl FStringStarts {
         while let Some(node) = stack.pop() {
             if let Node::Expr(e) = node {
                 match e {
+                    Expr::Call(call) => starts.note_bare_generator(call, source),
                     Expr::JoinedStr(_) => joined.push(e),
                     Expr::FormattedValue(f) => {
                         if let Some(spec) = &f.format_spec {
@@ -67,7 +68,35 @@ impl FStringStarts {
         starts
     }
 
-    /// The CPython start offset for `expr` if it is an f-string part.
+    /// `f(x for x in y)`: CPython's `GeneratorExp` starts at the call's
+    /// `(`, which doubles as the generator's parenthesis; rustpython's starts
+    /// at the element, a line late when the call breaks after `(`.
+    fn note_bare_generator(&mut self, call: &rustpython_ast::ExprCall, source: &str) {
+        let [generator @ Expr::GeneratorExp(_)] = call.args.as_slice() else {
+            return;
+        };
+        if !call.keywords.is_empty() {
+            return;
+        }
+        let range = generator.range();
+        let (lo, hi) = (usize::from(range.start()), usize::from(range.end()));
+        let Some(text) = source.get(lo..hi) else {
+            return;
+        };
+        if is_parenthesized(text.as_bytes()) {
+            return; // `f((x for x in y))`: the range already has its own parens
+        }
+        let func_end = usize::from(call.func.range().end());
+        let Some(between) = source.get(func_end..lo) else {
+            return;
+        };
+        if let Some(at) = between.find('(') {
+            self.0.insert(addr(generator), offset(func_end + at));
+        }
+    }
+
+    /// The CPython start offset for `expr` if it is an f-string part or a
+    /// call's bare generator argument.
     pub fn get(&self, expr: &Expr) -> Option<TextSize> {
         self.0.get(&addr(expr)).copied()
     }
@@ -95,6 +124,44 @@ impl FStringStarts {
             }
         }
     }
+}
+
+/// True if `text` is one parenthesised group: its first `(` closes at its
+/// last byte (strings skipped).
+fn is_parenthesized(text: &[u8]) -> bool {
+    if text.first() != Some(&b'(') || text.last() != Some(&b')') {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < text.len() {
+        match text[i] {
+            q @ (b'\'' | b'"') => {
+                let triple = text.len() >= i + 3 && text[i + 1] == q && text[i + 2] == q;
+                let len = if triple { 3 } else { 1 };
+                match find_close(text, i + len, q, triple) {
+                    Some(close) => i = close + len,
+                    None => return false,
+                }
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i == text.len() - 1;
+                }
+            }
+            b'#' => {
+                while i < text.len() && text[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn addr(e: &Expr) -> usize {
@@ -333,7 +400,7 @@ mod tests {
     use super::FStringStarts;
     use crate::ast_helpers::LineIndex;
     use crate::pyast::Node;
-    use rustpython_ast::{Expr, Mod};
+    use rustpython_ast::{Expr, Mod, Ranged};
 
     fn part_lines(src: &str) -> Vec<(String, usize)> {
         let Mod::Module(m) =
@@ -375,6 +442,30 @@ mod tests {
                 ("FormattedValue".into(), 3),
             ]
         );
+    }
+
+    #[test]
+    fn a_bare_generator_argument_starts_at_the_calls_parenthesis() {
+        // CPython 3.13: the GeneratorExp of `tuple(\n    x\n    for ...)` is on line 1.
+        let src = "t = tuple(\n    x\n    for x in y)\nu = f((x for x in y))\nv = f((a, b) for a, b in z)\n";
+        let Mod::Module(m) =
+            rustpython_parser::parse(src, rustpython_parser::Mode::Module, "<t>").unwrap()
+        else {
+            unreachable!()
+        };
+        let starts = FStringStarts::new(&m.body, src);
+        let index = LineIndex::new(src);
+        let mut found = Vec::new();
+        let mut stack: Vec<Node<'_>> = m.body.iter().map(Node::Stmt).collect();
+        while let Some(node) = stack.pop() {
+            if let Node::Expr(e @ Expr::GeneratorExp(_)) = node {
+                let at = starts.get(e).unwrap_or(e.range().start());
+                found.push((index.line_number(at), usize::from(at)));
+            }
+            stack.extend(node.children());
+        }
+        found.sort();
+        assert_eq!(found, vec![(1, 9), (4, 39), (5, 60)]);
     }
 
     #[test]
