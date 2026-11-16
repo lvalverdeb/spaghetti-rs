@@ -41,7 +41,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/lvalverdeb/spaghet
 ```
 
 This installs a binary named `spaghetti` (matching the Python CLI's command name and the crate name).
-The current release is 2.6.1, byte-identical to spaghetti-detector 2.6.0 on PyPI; the two ports do
+The current release is 2.6.2, byte-identical to spaghetti-detector 2.6.1 on PyPI; the two ports do
 not share a version number, since Rust-only fixes ship as patch releases here.
 
 ## Usage
