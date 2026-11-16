@@ -971,6 +971,7 @@ pub fn run(args: Args) -> i32 {
             None => String::new(),
         },
         cache_dir: cache_dir.clone(),
+        workspace_root: workspace_root.clone(),
     };
     let scanned: Vec<(String, ScanResult)> = selected
         .par_iter()

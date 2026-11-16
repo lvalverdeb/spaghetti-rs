@@ -45,6 +45,7 @@ fn config(cache_dir: Option<PathBuf>, key: &str) -> ScanConfig {
         min_clone_tokens: 50,
         cache_dir,
         cache_key: key.to_string(),
+        workspace_root: None,
     }
 }
 

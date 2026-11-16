@@ -32,6 +32,7 @@ fn config() -> ScanConfig {
         min_clone_tokens: 50,
         cache_dir: None,
         cache_key: String::new(),
+        workspace_root: None,
     }
 }
 

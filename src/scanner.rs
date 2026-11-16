@@ -123,6 +123,7 @@ pub fn scan_package(package: &str, root: &Path, config: &ScanConfig) -> ScanResu
         package,
         &facts,
         config.min_duplicate_lines,
+        config.workspace_root.as_deref(),
     ));
     found.extend(package_level::check_sync_async_twins_pkg(
         package,
@@ -609,6 +610,7 @@ mod recursive_flag_tests {
             min_clone_tokens: 50,
             cache_dir: None,
             cache_key: String::new(),
+            workspace_root: None,
         };
         let result = scan_package("root", &root, &config);
 
@@ -677,6 +679,7 @@ mod pool_size_tests {
             min_clone_tokens: 50,
             cache_dir: None,
             cache_key: String::new(),
+            workspace_root: None,
         };
         let scan_with = |threads: usize| {
             rayon::ThreadPoolBuilder::new()
@@ -731,6 +734,7 @@ mod unreadable_file_tests {
             min_clone_tokens: 50,
             cache_dir: None,
             cache_key: String::new(),
+            workspace_root: None,
         }
     }
 
@@ -801,6 +805,7 @@ mod location_and_fingerprint_tests {
             min_clone_tokens: 50,
             cache_dir: None,
             cache_key: String::new(),
+            workspace_root: None,
         }
     }
 
@@ -998,6 +1003,7 @@ mod workspace_tests {
             min_clone_tokens: 30,
             cache_dir: None,
             cache_key: String::new(),
+            workspace_root: None,
         }
     }
 

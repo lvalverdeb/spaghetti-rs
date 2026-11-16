@@ -101,6 +101,10 @@ pub struct ScanConfig {
     /// Root of the incremental per-file cache (see `cache`); `None` disables it.
     pub cache_dir: Option<PathBuf>,
     pub cache_key: String,
+    /// The uv workspace enclosing the working directory, if any: paths
+    /// quoted inside messages are shown relative to it — mirrors
+    /// `config.py::workspace_root()`.
+    pub workspace_root: Option<PathBuf>,
 }
 
 /// A single prioritized remediation action — mirrors `models.py`'s

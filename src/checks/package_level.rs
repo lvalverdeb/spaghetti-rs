@@ -487,6 +487,7 @@ pub fn check_duplicate_functions_pkg(
     pkg_name: &str,
     files: &[(PathBuf, FileFacts)],
     min_lines: usize,
+    workspace_root: Option<&Path>,
 ) -> Vec<Issue> {
     // Insertion-ordered like Python's dict: issues come out in the order each
     // duplicate group was first seen.
@@ -515,7 +516,7 @@ pub fn check_duplicate_functions_pkg(
             .map(|(fp, func)| {
                 format!(
                     "{}:{} ({})",
-                    display_path(fp, None),
+                    display_path(fp, workspace_root),
                     func.loc.line,
                     func.name
                 )
@@ -722,7 +723,7 @@ mod calibration_tests {
         let a = format!("class A:\n{body}");
         let b = format!("class B:\n{body}");
         let files = pkg(ROOT, &[("a.py", &a), ("b.py", &b)]);
-        assert!(check_duplicate_functions_pkg("pkg", &files, 5).is_empty());
+        assert!(check_duplicate_functions_pkg("pkg", &files, 5, None).is_empty());
         let files = pkg(
             ROOT,
             &[
@@ -730,7 +731,17 @@ mod calibration_tests {
                 ("b.py", &b.replace("__repr__", "render")),
             ],
         );
-        assert_eq!(check_duplicate_functions_pkg("pkg", &files, 5).len(), 1);
+        let issues = check_duplicate_functions_pkg("pkg", &files, 5, None);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("/tmp/pkg/a.py:"));
+        // Inside a workspace the quoted locations are workspace-relative.
+        let root = std::path::Path::new("/tmp");
+        let relative = check_duplicate_functions_pkg("pkg", &files, 5, Some(root));
+        assert!(
+            relative[0].message.contains(" pkg/a.py:"),
+            "{}",
+            relative[0].message
+        );
     }
 }
 
