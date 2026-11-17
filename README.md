@@ -360,9 +360,12 @@ files at different paths must not share findings. The entry JSON has the same sh
   the findings Python reports. CI's fuzz job sets `SPAGHETTI_FUZZ_SECONDS=600`.
 - **Conformance.** CI checks out the Python port next to this one and runs its
   `scripts/conformance.py --rust target/release/spaghetti`, which fails on any byte difference in
-  `--json` or `--plan --json` over the whole corpus. Beyond the corpus, both ports were run over
-  37 private repositories (576 k lines); the one difference found (a call's bare generator
-  argument starts at the call's `(` in CPython) became 2.6.1, and all 37 are identical since.
+  `--json` or `--plan --json` over the whole corpus, including one case scanned from inside a
+  throwaway uv workspace by a relative path so workspace-relative path display is compared too.
+  Beyond the corpus, both ports were run over 37 private repositories (576 k lines); the
+  differences found became 2.6.1 (a call's bare generator argument starts at the call's `(` in
+  CPython) and 2.6.2 (the duplicate-function-body message quotes workspace-relative paths), and
+  all 37 are identical since.
 
 ## Rules
 
